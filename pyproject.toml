@@ -1,0 +1,28 @@
+[project]
+name = "ekd"
+version = "0.1.0"
+description = "Entropy-guided Knowledge-Distillation (EKD) for LLM reasoning"
+authors = [
+    {name = "Almog Tavor", email = "almogt@mail.tau.ac.il"},
+    {name = "Neil Cnaan", email = "neilcnaan@mail.tau.ac.il"},
+    {name = "Itay Ebenspanger", email = "ebenspanger@mail.tau.ac.il"},
+]
+dependencies = [
+    "torch>=2.2",
+    "transformers==4.41.0",
+    "datasets",
+    "accelerate",
+    "bitsandbytes",
+    "sentencepiece",
+    "rich",
+    "tiktoken",
+    "ollama",
+]
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ekd"] 
