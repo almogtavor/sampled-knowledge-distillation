@@ -9,14 +9,15 @@ authors = [
 ]
 dependencies = [
     "torch>=2.2",
-    "transformers==4.41.0",
+    "transformers>=4.50.0",
     "datasets",
     "accelerate",
     "bitsandbytes",
     "sentencepiece",
     "rich",
     "tiktoken",
-    "ollama",
+    "ollama>=0.5.1",
+    "qwen>=0.1.1",
 ]
 requires-python = ">=3.10"
 

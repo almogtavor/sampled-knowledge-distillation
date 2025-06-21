@@ -26,7 +26,8 @@ class Distiller:
         alpha_aux_ce: float = 0.1,
         device: str = "cuda",
     ):
-        self.teacher = teacher_model.eval()  # frozen
+        # self.teacher = teacher_model.eval()  # frozen
+        self.teacher = teacher_model # todo: is it okay?
         self.student = student_model.train()
         self.tok = tokenizer
         self.dl = dataloader
