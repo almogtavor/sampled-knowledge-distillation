@@ -1,0 +1,4 @@
+{
+    "latex-workshop.latex.outDir": "%WORKSPACE_FOLDER%/.latex_out",
+    "latex-workshop.latex.autoBuild.run": "onSave"
+}
