@@ -38,7 +38,8 @@ def main():
 
     print("Loading student...")
     student, _ = load_model(args.student_model, device_map="auto")
-    student.resize_token_embeddings(len(tok))  # align vocab if needed
+    # student.resize_token_embeddings(len(tok))  # align vocab if needed
+    student.resize_token_embeddings(len(teacher.tokenizer)) #TODO: verify its safe to do!!
 
     # build DataLoader
     if all(p.endswith(".jsonl") for p in args.datasets):
