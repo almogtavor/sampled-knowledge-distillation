@@ -4,7 +4,7 @@ Knowledge distillation for LLMs that focuses on high-entropy "fork" tokens where
 
 ## Quick Start
 
-1. Install dependencies:
+1. Install dependencies (you have to install [uv](https://docs.astral.sh/uv/) first):
 ```bash
 uv venv
 # Linux:

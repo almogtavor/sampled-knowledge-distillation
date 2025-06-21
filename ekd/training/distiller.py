@@ -36,7 +36,7 @@ class Distiller:
         self.device = device
 
     def _kl_loss(self, log_p: torch.Tensor, log_q: torch.Tensor):
-        """KL(P‖Q) where log_p are teacher log‑probs, log_q student log‑probs."""
+        """KL(P||Q) where log_p are teacher log‑probs, log_q are student log‑probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
     def _forward_batch(self, batch):
@@ -45,18 +45,18 @@ class Distiller:
 
         with torch.no_grad():
             t_out = self.teacher(input_ids, attention_mask=attention, output_hidden_states=False)
-            t_logits = t_out.logits  # [B, L, V]
+            t_logits = t_out.logits # [B, L, V]
             t_log_probs = torch.log_softmax(t_logits, dim=-1)
-            ent = token_entropy(t_logits)  # [B, L]
+            ent = token_entropy(t_logits) # [B, L]
 
         s_out = self.student(input_ids, attention_mask=attention)
         s_logits = s_out.logits
         s_log_probs = torch.log_softmax(s_logits, dim=-1)
 
         if self.type == "vanilla":
-            kl = self._kl_loss(t_log_probs, s_log_probs)  # [B, L]
+            kl = self._kl_loss(t_log_probs, s_log_probs) # [B, L]
             kd_loss = kl.mean()
-        else:  # EKD
+        else: # EKD
             # mask top‑k% entropy tokens per example
             kd_losses = []
             for i in range(ent.size(0)):
