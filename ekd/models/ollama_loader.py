@@ -1,16 +1,14 @@
-"""Ollama model loading and inference utilities."""
-
-import json
 import logging
-from typing import Dict, List, Optional
+from typing import Optional
 
 import torch
-from transformers import AutoTokenizer
 from ollama import Client
+from transformers import AutoTokenizer
+
 
 class OllamaModel:
     """Wrapper for Ollama models to match HuggingFace interface."""
-    
+
     def __init__(self, model_name: str = "qwen3:8b"):
         self.client = Client()
         self.model_name = model_name
@@ -53,7 +51,7 @@ class OllamaModel:
 
         # Generate responses
         responses = [self.generate(prompt) for prompt in prompts]
-        
+
         # Tokenize responses
         response_tokens = self.tokenizer(
             responses,

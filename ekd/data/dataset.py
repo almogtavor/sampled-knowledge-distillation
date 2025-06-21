@@ -1,11 +1,8 @@
-"""Dataset and data loading utilities for EKD."""
-
 import json
 from pathlib import Path
 from typing import List, Dict
 
-import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 PROMPT_TEMPLATE = (
     "You are a helpful problem‑solving assistant.\n"
@@ -13,6 +10,7 @@ PROMPT_TEMPLATE = (
     "Please think step by step and enclose your final answer in the form \\boxed{{answer}}.\n"
     "Solution:"
 )
+
 
 class AIMEJsonl(Dataset):
     """Lazy‑loads AIME JSONL and returns prompt strings."""
@@ -35,9 +33,10 @@ class AIMEJsonl(Dataset):
     def __getitem__(self, idx):
         return self.examples[idx]
 
+
 class DistillCollator:
     """Collates batches for distillation training."""
-    
+
     def __init__(self, tokenizer, max_len: int):
         self.tok = tokenizer
         self.max_len = max_len
@@ -50,4 +49,4 @@ class DistillCollator:
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-        } 
+        }

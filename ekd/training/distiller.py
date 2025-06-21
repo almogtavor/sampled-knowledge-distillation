@@ -1,5 +1,3 @@
-"""Training and distillation utilities."""
-
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
