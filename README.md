@@ -35,7 +35,7 @@ We use Ollama's Qwen3-8B in 4-bit as teacher:
 ```bash
 # Vanilla KD
 python ekd_distill.py \
-    --teacher_model qwen3:8b \
+    --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type vanilla \
     --datasets data/aime24.jsonl data/aime25.jsonl \

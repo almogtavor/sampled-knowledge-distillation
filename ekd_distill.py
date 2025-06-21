@@ -31,13 +31,13 @@ def main():
     print(f"Using GPU: {torch.cuda.get_device_name(device)} (device {torch.cuda.current_device()})")
 
     print("Loading teacher (Ollama)...")
-    teacher = OllamaModel(args.teacher_model)
+    # teacher = OllamaModel(args.teacher_model)
     # for non ollama models: # TODO: decide if we want to support non ollama models
-    #  teacher, tok = load_model(args.teacher_model, device_map="auto")
+    teacher, tok = load_model(args.teacher_model, device_map="auto", quant_bits=4)
     tok = teacher.tokenizer  # Use teacher's tokenizer for both models
 
     print("Loading student...")
-    student, _ = load_model(args.student_model, device_map="auto")
+    student, _ = load_model(args.student_model, device_map="auto", quant_bits=8)
     # student.resize_token_embeddings(len(tok))  # align vocab if needed
     student.resize_token_embeddings(len(teacher.tokenizer)) #TODO: verify its safe to do!!
 
