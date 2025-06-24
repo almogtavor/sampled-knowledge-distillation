@@ -38,16 +38,22 @@ python ekd_distill.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type vanilla \
-    --datasets data/aime24.jsonl data/aime25.jsonl \
+    --datasets gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
     --output_dir ./kd_vanilla_run
 
 # Entropy-guided KD
 python ekd_distill.py \
-    --teacher_model qwen3:8b \
+    --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type ekd \
     --top_k_percent 20 \
-    --datasets data/aime24.jsonl data/aime25.jsonl \
+    --datasets gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
     --output_dir ./kd_ekd_run
 ```
 
@@ -78,7 +84,7 @@ student by teacher-forcing.
 
 ## Dataset Format
 
-Prepare your dataset as JSONL files:
+Prepare datasets as JSONL files:
 ```json
 {
   "id": "example_1",
