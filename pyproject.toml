@@ -18,6 +18,7 @@ dependencies = [
     "tiktoken",
     "ollama>=0.5.1",
     "qwen>=0.1.1",
+    "pydantic>=2.11.5",
 ]
 requires-python = ">=3.10"
 

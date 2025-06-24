@@ -39,6 +39,9 @@ python ekd_distill.py \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type vanilla \
     --datasets gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
     --output_dir ./kd_vanilla_run
 
 # Entropy-guided KD
@@ -48,6 +51,9 @@ python ekd_distill.py \
     --distill_type ekd \
     --top_k_percent 20 \
     --datasets gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
     --output_dir ./kd_ekd_run
 ```
 
