@@ -14,6 +14,7 @@ def load_model(model_name: str, device_map: str = "auto", quant_bits: int = 4):
             bnb_4bit_compute_dtype=torch.float16 if is_torch_bf16_available() else torch.float32,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
+            llm_int8_enable_fp32_cpu_offload=True
         )
     elif quant_bits == 8:
         quant_cfg = BitsAndBytesConfig(load_in_8bit=True)

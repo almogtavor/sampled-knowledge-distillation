@@ -27,19 +27,21 @@ def main():
     if not is_torch_cuda_available():
         raise RuntimeError("CUDA-enabled PyTorch required for training.")
 
-    device = torch.device("cuda")
-    print(f"Using GPU: {torch.cuda.get_device_name(device)} (device {torch.cuda.current_device()})")
+    teacher_device = torch.device("cpu") # Teacher on CPU
+    student_device = torch.device("cuda") # Student on GPU
 
     print("Loading teacher (Ollama)...")
     # teacher = OllamaModel(args.teacher_model)
     # for non ollama models: # TODO: decide if we want to support non ollama models
-    teacher, tok = load_model(args.teacher_model, device_map="auto", quant_bits=4)
-    tok = teacher.tokenizer  # Use teacher's tokenizer for both models
+    teacher, tok = load_model(args.teacher_model, device_map="cpu", quant_bits=4)
 
     print("Loading student...")
     student, _ = load_model(args.student_model, device_map="auto", quant_bits=8)
     # student.resize_token_embeddings(len(tok))  # align vocab if needed
-    student.resize_token_embeddings(len(teacher.tokenizer)) #TODO: verify its safe to do!!
+    teacher.resize_token_embeddings(len(tok))  # optional if needed for teacher
+    student.resize_token_embeddings(len(tok)) #TODO: verify its safe to do!!
+
+    print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
 
     # build DataLoader
     if all(p.endswith(".jsonl") for p in args.datasets):
@@ -66,7 +68,8 @@ def main():
         distill_type=args.distill_type,
         top_k_percent=args.top_k_percent,
         lr=args.lr,
-        device=device,
+        teacher_device=teacher_device,
+        student_device=student_device,
     )
 
     distiller.train(epochs=args.epochs)
