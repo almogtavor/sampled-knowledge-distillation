@@ -1,8 +1,12 @@
 import argparse
+import os
 from pathlib import Path
 
 import torch
 from transformers.utils import is_torch_cuda_available
+
+# Force CPU mode if CUDA is incompatible
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
@@ -24,8 +28,10 @@ def main():
                         help="name of answer column for HF datasets")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--max_seq_len", type=int, default=1024)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
+                        help="Number of steps to accumulate gradients before updating")
+    parser.add_argument("--max_seq_len", type=int, default=512)  # to save memory
+    parser.add_argument("--lr", type=float, default=1e-5)  # Reduced from 5e-5
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
         "--dataset_config",
@@ -36,18 +42,25 @@ def main():
     args = parser.parse_args()
 
     if not is_torch_cuda_available():
-        raise RuntimeError("CUDA-enabled PyTorch required for training.")
-
-    teacher_device = torch.device("cpu")  # Teacher on CPU
-    student_device = torch.device("cuda")  # Student on GPU
+        print("Warning: CUDA not available or incompatible. Using CPU for training.")
+        teacher_device = torch.device("cpu")
+        student_device = torch.device("cpu")
+    else:
+        teacher_device = torch.device("cpu")  # Teacher on CPU
+        student_device = torch.device("cuda")  # Student on GPU
 
     print("Loading teacher...")
     # teacher = OllamaModel(args.teacher_model)
     # for non ollama models: # TODO: decide if we want to support non ollama models
-    teacher, tok = load_model(args.teacher_model, device_map="cpu", quant_bits=4)
+    teacher, tok = load_model(args.teacher_model, device_map="cpu", quant_bits=8)  # Use 8-bit for teacher to save memory
 
     print("Loading student...")
-    student, _ = load_model(args.student_model, device_map="auto", quant_bits=8)
+    # Load student without quantization but with smaller model to save memory
+    student, _ = load_model(args.student_model, device_map="auto", quant_bits=None)  # No quantization for training
+    
+    # Ensure student is in training mode - keep parameters in FP32 for gradient computation
+    student.train()
+    # Don't convert model to half - keep parameters in FP32 for gradient stability
     # student.resize_token_embeddings(len(tok))  # align vocab if needed
     teacher.resize_token_embeddings(len(tok))  # optional if needed for teacher
     student.resize_token_embeddings(len(tok))  # TODO: verify its safe to do!!

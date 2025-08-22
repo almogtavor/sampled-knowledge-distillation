@@ -194,3 +194,4 @@ cython_debug/
 .cursorindexingignore
 .idea
 .latex_out
+kd_vanilla_run
