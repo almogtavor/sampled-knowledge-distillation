@@ -6,8 +6,8 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH --output=logs/setup-fast.%j.out
-#SBATCH --error=logs/setup-fast.%j.err
+#SBATCH --output=logs/setup-fast.%j.log
+#SBATCH --error=logs/setup-fast.%j.log
 
 set -euo pipefail
 
@@ -79,19 +79,9 @@ PY
     echo "No nvidia-smi found, using CPU wheels"
   fi
   
-  echo "Installing packages from $TORCH_IDX ..."
-  # Install PyTorch first from the appropriate index (fallback to CPU if it fails)
-  if ! python -m pip install --prefer-binary --only-binary=:all: \
-       --index-url "$TORCH_IDX" \
-       torch; then
-    echo "GPU wheel install failed, falling back to CPU wheels..."
-    python -m pip install --prefer-binary --only-binary=:all: \
-       --index-url https://download.pytorch.org/whl/cpu \
-       torch
-  fi
-  
-  # Install other packages from default index
-  python -m pip install --prefer-binary transformers datasets accelerate sentencepiece rich tiktoken
+  echo "Installing packages from requirements.txt ..."
+  # Install all packages from requirements.txt (includes PyTorch 2.1.2+cu118)
+  python -m pip install -r requirements.txt
   
   echo "Marking environment as ready..."
   touch .ekd_fastenv_ready
@@ -132,19 +122,16 @@ PY
     echo "No nvidia-smi found, using CPU wheels"
   fi
 
-  # install torch if missing, with GPU index then CPU fallback
+  # install packages from requirements.txt if missing
   python -c 'import torch' 2>/dev/null || {
-    echo "torch not found, installing from $TORCH_IDX ..."
-    python -m pip install --prefer-binary --only-binary=:all: \
-      --index-url "$TORCH_IDX" torch \
-      || python -m pip install --prefer-binary --only-binary=:all: \
-         --index-url https://download.pytorch.org/whl/cpu torch
+    echo "torch not found, installing from requirements.txt ..."
+    python -m pip install -r requirements.txt
   }
 
   # install transformers stack if missing
   python -c 'import transformers' 2>/dev/null || {
-    echo "transformers not found, installing ..."
-    python -m pip install --prefer-binary transformers datasets accelerate sentencepiece rich tiktoken
+    echo "transformers not found, installing from requirements.txt ..."
+    python -m pip install -r requirements.txt
   }
 fi
 

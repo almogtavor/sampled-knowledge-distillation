@@ -20,4 +20,5 @@ python ekd_distill.py \
     --gradient_accumulation_steps 16 \
     --max_seq_len 512 \
     --lr 1e-5 \
+    --tensorboard_dir "tb/ekd_experiment" \
     --output_dir "/home/joberant/NLP_2425b/$USER/kd_ekd_run_out_model"
