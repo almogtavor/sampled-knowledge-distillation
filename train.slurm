@@ -1,17 +1,22 @@
 #!/bin/bash
 #SBATCH --job-name=ekd-train
-#SBATCH --partition=studentkillable       # or studentbatch if allowed
-#SBATCH --time=1-00:00:00                 # adjust
+#SBATCH --partition=studentkillable
+#SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --gpus=1                          # request a GPU
+#SBATCH --gpus=1                 # request a GPU
 #SBATCH --output=logs/train.%j.log
 #SBATCH --error=logs/train.%j.log
 
 set -euo pipefail
 cd /home/joberant/NLP_2425b/$USER/ekd
+
+# Get distillation type parameter (default to "ekd" if not provided)
+DISTILL_TYPE=${1:-"ekd"}
+
+echo "Running training with distillation type: $DISTILL_TYPE"
 
 # temp + pip
 export TMPDIR=/vol/joberant_nobck/data/NLP_368307701_2425b/almogt/ekd/tmp
@@ -31,4 +36,4 @@ export PYTHONUNBUFFERED=1
 # activate and run
 source fastenv310/bin/activate
 python -c "import torch; print('CUDA?', torch.cuda.is_available())"
-srun -u bash run_train.sh   # or whatever your run_train.sh calls
+srun -u bash run_train.sh "$DISTILL_TYPE"

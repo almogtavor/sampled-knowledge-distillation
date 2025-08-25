@@ -5,7 +5,7 @@ from typing import List, Dict
 from torch.utils.data import Dataset
 
 PROMPT_TEMPLATE = (
-    "You are a helpful problem‑solving assistant.\n"
+    "You are a helpful problem-solving assistant.\n"
     "Problem: {question}\n"
     "Please think step by step and enclose your final answer in the form \\boxed{{answer}}.\n"
     "Solution:"
@@ -13,7 +13,7 @@ PROMPT_TEMPLATE = (
 
 
 class AIMEJsonl(Dataset):
-    """Lazy‑loads AIME JSONL and returns prompt strings."""
+    """Lazy-loads AIME JSONL and returns prompt strings."""
 
     def __init__(self, paths: List[Path]):
         self.examples: List[Dict[str, str]] = []
@@ -43,10 +43,9 @@ class DistillCollator:
 
     def __call__(self, batch):
         prompts = [ex["prompt"] for ex in batch]
+        # The batch encoder is a dictionary holding tensors of the tokenized prompt text & mask.
         enc = self.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_len)
-        input_ids = enc["input_ids"]
-        attention_mask = enc["attention_mask"]
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
         }

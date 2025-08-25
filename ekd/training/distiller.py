@@ -2,6 +2,11 @@ import torch
 import torch.nn.functional as F
 from torch import device
 from torch.optim import AdamW
+import os
+from pathlib import Path
+import glob
+
+from ..config import TrainingConfig, CheckpointData, TrainingMetrics
 
 
 def token_entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -25,13 +30,9 @@ class Distiller:
             student_model,
             tokenizer,
             dataloader,
-            distill_type: str = "vanilla",
-            top_k_percent: int = 20,
-            lr: float = 5e-5,
-            alpha_aux_ce: float = 0.1,
+            config: TrainingConfig,
             teacher_device: device = "cpu",
             student_device: device = "cuda",
-            gradient_accumulation_steps: int = 1,
             writer=None,  # TensorBoard writer
     ):
         self.teacher = teacher_model.eval()  # frozen
@@ -39,15 +40,67 @@ class Distiller:
         self.student = student_model.train()
         self.tok = tokenizer
         self.dataloader = dataloader
-        self.type = distill_type
-        self.top_k = top_k_percent
-        self.alpha_ce = alpha_aux_ce
-        self.opt = AdamW(self.student.parameters(), lr=lr)
+        self.config = config
+        self.type = config.distill_type
+        self.top_k = config.top_k_percent
+        self.alpha_ce = 0.1  # Fixed value, could be added to config if needed
+        self.opt = AdamW(self.student.parameters(), lr=config.lr)
         self.teacher_device = teacher_device
         self.student_device = student_device
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.writer = writer  # TensorBoard writer
+        self.gradient_accumulation_steps = config.gradient_accumulation_steps
+        self.writer = writer
         self.global_step = 0  # For TensorBoard logging
+        
+        # Checkpointing
+        self.output_dir = Path(config.output_dir)
+        self.checkpoint_steps = config.checkpoint_steps
+        self.keep_checkpoints = config.keep_checkpoints
+        self.checkpoint_dir = self.output_dir / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(self, epoch: int, step: int):
+        """Save a training checkpoint."""
+        if self.checkpoint_steps <= 0:
+            return
+        checkpoint_name = f"checkpoint_epoch{epoch}_step{step}.pt"
+        checkpoint_path = self.checkpoint_dir / checkpoint_name
+        checkpoint = {
+            'epoch': epoch,
+            'step': step,
+            'global_step': self.global_step,
+            'model_state_dict': self.student.state_dict(),
+            'optimizer_state_dict': self.opt.state_dict(),
+            'distill_type': self.type,
+            'top_k_percent': self.top_k,
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint: {checkpoint_path}")
+        self._cleanup_old_checkpoints()
+    
+    def _cleanup_old_checkpoints(self):
+        """Keep only the most recent checkpoints."""
+        if self.keep_checkpoints <= 0:
+            return
+        checkpoint_pattern = str(self.checkpoint_dir / "checkpoint_epoch*_step*.pt")
+        checkpoint_files = glob.glob(checkpoint_pattern)
+        checkpoint_files.sort(key=os.path.getmtime, reverse=True)  # Sort by modification time
+
+        # Remove old checkpoints beyond keep_checkpoints limit
+        for old_checkpoint in checkpoint_files[self.keep_checkpoints:]:
+            os.remove(old_checkpoint)
+            print(f"Removed old checkpoint: {old_checkpoint}")
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load a training checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.student_device)
+        
+        self.student.load_state_dict(checkpoint['model_state_dict'])
+        self.opt.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.global_step = checkpoint['global_step']
+        
+        print(f"Loaded checkpoint from: {checkpoint_path}")
+        print(f"Resuming from epoch {checkpoint['epoch']}, step {checkpoint['step']}")
+        return checkpoint['epoch'], checkpoint['step']
 
     def _kl_loss(self, log_p: torch.Tensor, log_q: torch.Tensor):
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
@@ -115,18 +168,31 @@ class Distiller:
                     self.opt.step()
                     self.opt.zero_grad()
                     self.global_step += 1
+                    
+                    # Save checkpoint if needed
+                    if (self.checkpoint_steps > 0 and 
+                        self.global_step % self.checkpoint_steps == 0):
+                        self.save_checkpoint(epoch, step)
 
                 # logging
                 running["loss"] += loss.item() * self.gradient_accumulation_steps  # Unscale for logging
                 running["kl"] += kl_val
                 running["ce"] += ce_val
                 
-                # TensorBoard logging every step
+                # TensorBoard logging every step using TrainingMetrics
                 if self.writer is not None:
-                    self.writer.add_scalar("train/loss", loss.item() * self.gradient_accumulation_steps, self.global_step)
-                    self.writer.add_scalar("train/kl_loss", kl_val, self.global_step)
-                    self.writer.add_scalar("train/ce_loss", ce_val, self.global_step)
-                    self.writer.add_scalar("train/epoch", epoch + 1, self.global_step)
+                    metrics = TrainingMetrics(
+                        loss=loss.item() * self.gradient_accumulation_steps,
+                        kl_loss=kl_val,
+                        ce_loss=ce_val,
+                        epoch=epoch + 1,
+                        step=step + 1,
+                        global_step=self.global_step
+                    )
+                    
+                    # Log metrics to TensorBoard
+                    for key, value in metrics.to_dict().items():
+                        self.writer.add_scalar(key, value, self.global_step)
                     
                 if (step + 1) % log_every == 0:
                     n = log_every
@@ -136,7 +202,7 @@ class Distiller:
                     
                     print(
                         f"ep{epoch + 1} step{step + 1} | loss={avg_loss:.4f} "
-                        f"kl={avg_kl:.4f} ce={avg_ce:.4f}"
+                        f"kl={avg_kl:.4f} ce={avg_ce:.4f} | global_step={self.global_step}"
                     )
                     
                     # Log averages to TensorBoard
@@ -147,3 +213,8 @@ class Distiller:
                         self.writer.flush()
                         
                     running = {k: 0.0 for k in running}
+        
+        # Final checkpoint and cleanup at the end
+        if self.checkpoint_steps > 0:
+            print("Training completed. Performing final cleanup of old checkpoints...")
+            self._cleanup_old_checkpoints()
