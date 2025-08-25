@@ -1,0 +1,20 @@
+# Use PyPI as primary; add PyTorch CUDA 11.8 wheels as extra
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# Core dependencies for EKD project
+torch==2.2.2+cu118
+transformers>=4.50.0
+datasets
+accelerate
+bitsandbytes==0.43.3
+sentencepiece
+rich
+tiktoken
+ollama>=0.5.1
+qwen>=0.1.1
+pydantic>=2.11.5
+numpy<2
+hf_transfer
+tensorboard
+pydantic
