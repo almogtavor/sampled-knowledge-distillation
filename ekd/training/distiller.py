@@ -1,3 +1,4 @@
+from logging import config
 import torch
 import torch.nn.functional as F
 from torch import device
@@ -31,7 +32,7 @@ class Distiller:
             tokenizer,
             dataloader,
             config: TrainingConfig,
-            teacher_device: device = "cpu",
+            teacher_device: device = "cuda",
             student_device: device = "cuda",
             writer=None,  # TensorBoard writer
     ):
@@ -41,26 +42,21 @@ class Distiller:
         self.tok = tokenizer
         self.dataloader = dataloader
         self.config = config
-        self.type = config.distill_type
-        self.top_k = config.top_k_percent
         self.alpha_ce = 0.1  # Fixed value, could be added to config if needed
         self.opt = AdamW(self.student.parameters(), lr=config.lr)
         self.teacher_device = teacher_device
         self.student_device = student_device
-        self.gradient_accumulation_steps = config.gradient_accumulation_steps
         self.writer = writer
         self.global_step = 0  # For TensorBoard logging
         
         # Checkpointing
         self.output_dir = Path(config.output_dir)
-        self.checkpoint_steps = config.checkpoint_steps
-        self.keep_checkpoints = config.keep_checkpoints
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
-        if self.checkpoint_steps <= 0:
+        if self.config.checkpoint_steps <= 0:
             return
         checkpoint_name = f"checkpoint_epoch{epoch}_step{step}.pt"
         checkpoint_path = self.checkpoint_dir / checkpoint_name
@@ -70,8 +66,8 @@ class Distiller:
             'global_step': self.global_step,
             'model_state_dict': self.student.state_dict(),
             'optimizer_state_dict': self.opt.state_dict(),
-            'distill_type': self.type,
-            'top_k_percent': self.top_k,
+            'distill_type': self.config.distill_type,
+            'top_k_percent': self.config.top_k_percent,
         }
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
@@ -79,14 +75,14 @@ class Distiller:
     
     def _cleanup_old_checkpoints(self):
         """Keep only the most recent checkpoints."""
-        if self.keep_checkpoints <= 0:
+        if self.config.keep_checkpoints <= 0:
             return
         checkpoint_pattern = str(self.checkpoint_dir / "checkpoint_epoch*_step*.pt")
         checkpoint_files = glob.glob(checkpoint_pattern)
         checkpoint_files.sort(key=os.path.getmtime, reverse=True)  # Sort by modification time
 
         # Remove old checkpoints beyond keep_checkpoints limit
-        for old_checkpoint in checkpoint_files[self.keep_checkpoints:]:
+        for old_checkpoint in checkpoint_files[self.config.keep_checkpoints:]:
             os.remove(old_checkpoint)
             print(f"Removed old checkpoint: {old_checkpoint}")
 
@@ -125,7 +121,7 @@ class Distiller:
         s_logits = s_out.logits
         s_log_probs = torch.log_softmax(s_logits, dim=-1)
 
-        if self.type == "vanilla":
+        if self.config.distill_type == "vanilla":
             kl = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L]
             kd_loss = kl.mean()
         else:  # EKD
@@ -133,7 +129,7 @@ class Distiller:
             kd_losses = []
             for i in range(ent.size(0)):
                 seq_ent = ent[i].float()  # Ensure float dtype for quantile
-                threshold = torch.quantile(seq_ent, 1 - self.top_k / 100.0)
+                threshold = torch.quantile(seq_ent, 1 - self.config.top_k_percent / 100.0)
                 mask = seq_ent >= threshold  # high-entropy positions (fork tokens)
                 kl_i = self._kl_loss(t_log_probs[i].to(self.student_device), s_log_probs[i])  # [L]
                 if mask.any():
@@ -159,30 +155,30 @@ class Distiller:
                 loss, kl_val, ce_val = self._forward_batch(batch)
                 
                 # Scale loss by gradient accumulation steps
-                loss = loss / self.gradient_accumulation_steps
+                loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
                 
                 # Only update weights after accumulation steps
-                if (step + 1) % self.gradient_accumulation_steps == 0:
+                if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
                     self.opt.step()
                     self.opt.zero_grad()
                     self.global_step += 1
                     
                     # Save checkpoint if needed
-                    if (self.checkpoint_steps > 0 and 
-                        self.global_step % self.checkpoint_steps == 0):
+                    if (self.config.checkpoint_steps > 0 and 
+                        self.global_step % self.config.checkpoint_steps == 0):
                         self.save_checkpoint(epoch, step)
 
                 # logging
-                running["loss"] += loss.item() * self.gradient_accumulation_steps  # Unscale for logging
+                running["loss"] += loss.item() * self.config.gradient_accumulation_steps  # Unscale for logging
                 running["kl"] += kl_val
                 running["ce"] += ce_val
                 
                 # TensorBoard logging every step using TrainingMetrics
                 if self.writer is not None:
                     metrics = TrainingMetrics(
-                        loss=loss.item() * self.gradient_accumulation_steps,
+                        loss=loss.item() * self.config.gradient_accumulation_steps,
                         kl_loss=kl_val,
                         ce_loss=ce_val,
                         epoch=epoch + 1,
@@ -215,6 +211,6 @@ class Distiller:
                     running = {k: 0.0 for k in running}
         
         # Final checkpoint and cleanup at the end
-        if self.checkpoint_steps > 0:
+        if self.config.checkpoint_steps > 0:
             print("Training completed. Performing final cleanup of old checkpoints...")
             self._cleanup_old_checkpoints()

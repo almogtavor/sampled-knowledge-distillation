@@ -60,17 +60,14 @@ def main():
         teacher_device = torch.device("cpu")
         student_device = torch.device("cpu")
     else:
-        teacher_device = torch.device("cpu")  # Teacher on CPU to save GPU memory
-        student_device = torch.device("cuda")  # Student on GPU
+        teacher_device = torch.device("cuda")
+        student_device = torch.device("cuda")
 
     print("Loading teacher...")
-    teacher, tok = load_model(config.teacher_model, device_map="cpu")
+    teacher, tok = load_model(config.teacher_model, device_map=teacher_device)
 
     print("Loading student...")
-    if student_device.type == "cuda":
-        student, _ = load_model(config.student_model, device_map="auto")
-    else:
-        student, _ = load_model(config.student_model, device_map="cpu")
+    student, _ = load_model(config.student_model, device_map=student_device)
     
     # Ensure student is in training mode - keep parameters in FP32 for gradient computation
     student.train()
@@ -78,19 +75,11 @@ def main():
     teacher.resize_token_embeddings(len(tok))  # optional if needed for teacher
     student.resize_token_embeddings(len(tok))  # TODO: verify its safe to do!!
     
-    # Ensure models are on correct devices after resizing
-    if teacher_device.type == "cpu":
-        teacher = teacher.to("cpu")  # Keep teacher on CPU
-    else:
-        teacher = teacher.to(teacher_device)
-    student = student.to(student_device)
-
     if student_device.type == "cuda":
         print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
     else:
         print(f"Using device: {student_device}")
 
-    # build DataLoader
     if all(p.endswith(".jsonl") for p in config.datasets):
         # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
@@ -100,7 +89,6 @@ def main():
         hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
             else load_dataset(config.datasets[0])["train"]
         print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-        # Reformat to match AIMEJsonl format: list of dicts with prompt, answer
         examples = []
         for ex in hf_dataset:
             examples.append({
