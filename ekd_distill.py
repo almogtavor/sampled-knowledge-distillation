@@ -64,7 +64,7 @@ def main():
         student_device = torch.device("cuda")
 
     print("Loading teacher...")
-    teacher, tok = load_model(config.teacher_model, device_map=teacher_device)
+    teacher, tok = load_model(config.teacher_model, device_map=teacher_device.type)
 
     print("Loading student...")
     student, _ = load_model(config.student_model, device_map=student_device.type)
