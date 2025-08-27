@@ -67,7 +67,7 @@ def main():
     teacher, tok = load_model(config.teacher_model, device_map=teacher_device)
 
     print("Loading student...")
-    student, _ = load_model(config.student_model, device_map=student_device)
+    student, _ = load_model(config.student_model, device_map=student_device.type)
     
     # Ensure student is in training mode - keep parameters in FP32 for gradient computation
     student.train()
