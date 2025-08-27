@@ -1,4 +1,3 @@
-from logging import config
 import torch
 import torch.nn.functional as F
 from torch import device
