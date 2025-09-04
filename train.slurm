@@ -19,21 +19,21 @@ DISTILL_TYPE=${1:-"ekd"}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # temp + pip
-export TMPDIR=/vol/joberant_nobck/data/NLP_368307701_2425b/almogt/ekd/tmp
+export TMPDIR=/home/joberant/NLP_2425b/$USER/ekd/tmp
 export TMP=$TMPDIR
 export TEMP=$TMPDIR
-export PIP_CACHE_DIR=/vol/joberant_nobck/data/NLP_368307701_2425b/almogt/ekd/.pip-cache
+export PIP_CACHE_DIR=/home/joberant/NLP_2425b/$USER/ekd/.pip-cache
 mkdir -p "$TMPDIR" "$PIP_CACHE_DIR"
 
 # 🤗 caches
-export HF_HOME=/vol/joberant_nobck/data/NLP_368307701_2425b/almogt/ekd/huggingface
+export HF_HOME=/home/joberant/NLP_2425b/$USER/ekd/huggingface
 export HUGGINGFACE_HUB_CACHE=$HF_HOME/hub
-export HF_DATASETS_CACHE=/vol/joberant_nobck/data/NLP_368307701_2425b/almogt/ekd/hf-datasets
+export HF_DATASETS_CACHE=/home/joberant/NLP_2425b/$USER/ekd/hf-datasets
 export TORCH_HOME=$HF_HOME/torch
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export PYTHONUNBUFFERED=1
 
 # activate and run
-source fastenv310/bin/activate
+source fastenv310_2/bin/activate
 python -c "import torch; print('CUDA?', torch.cuda.is_available())"
 srun -u bash run_train.sh "$DISTILL_TYPE"

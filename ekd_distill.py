@@ -55,28 +55,39 @@ def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
 
+    # Set CUDA memory management settings for better memory efficiency
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # Clear any cached memory
+        # Set memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory max
+
     if not is_torch_cuda_available():
         print("Warning: CUDA not available. Using CPU for training.")
         teacher_device = torch.device("cpu")
         student_device = torch.device("cpu")
     else:
         teacher_device = torch.device("cuda")
-        student_device = torch.device("cuda")
+        student_device = torch.device("cuda")  # Student on GPU for training
 
     print("Loading teacher...")
     teacher, tok = load_model(config.teacher_model, device_map=teacher_device.type)
 
     print("Loading student...")
     student, _ = load_model(config.student_model, device_map=student_device.type)
-    
+
     # Ensure student is in training mode - keep parameters in FP32 for gradient computation
     student.train()
     # Don't convert model to half - keep parameters in FP32 for gradient stability
     teacher.resize_token_embeddings(len(tok))  # optional if needed for teacher
     student.resize_token_embeddings(len(tok))  # TODO: verify its safe to do!!
+        
+    print(f"Teacher device: {teacher_device}")
+    print(f"Student device: {student_device}")
     
     if student_device.type == "cuda":
         print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
     else:
         print(f"Using device: {student_device}")
 

@@ -25,7 +25,7 @@ python ekd_distill.py \
     --epochs 3 \
     --batch_size 1 \
     --gradient_accumulation_steps 16 \
-    --checkpoint_steps 500 \
+    --checkpoint_steps 250 \
     --keep_checkpoints 3 \
     --max_seq_len 512 \
     --lr 1e-5 \

@@ -1,11 +1,11 @@
-# Use PyPI as primary; add PyTorch CUDA 11.8 wheels as extra
+# Use PyPI as primary; add PyTorch CUDA 11.8# For the evaluation:
 --index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cu118
 
 # Core dependencies for EKD project
 torch==2.2.2+cu118
 transformers>=4.50.0
-datasets
+
 accelerate
 bitsandbytes==0.43.3
 sentencepiece
@@ -17,4 +17,42 @@ pydantic>=2.11.5
 numpy<2
 hf_transfer
 tensorboard
-pydantic
+
+
+
+datasets==3.6.0
+evaluate==0.4.5
+# jsonlines==3.1.0
+# immutabledict==4.2.1
+# dill==0.3.8
+# pyarrow==21.0.0
+# lxml==6.0.1
+# peft==0.17.1
+# tqdm-multiprocess==0.0.11
+# numexpr==2.11.0
+# pybind11==3.0.1
+# zstandard==0.24.0
+# typing-extensions==4.15.0
+# fsspec==2025.3.0
+
+
+# For the evaluation:
+tqdm
+pandas
+
+# --- lm-eval & deps (fix) ---
+sqlitedict>=2.1.0
+lm-eval[ifeval,math]==0.4.9.1
+
+# Lighteval (for summarization tasks with ROUGE)
+lighteval
+
+# Code-generation evals
+evalplus
+
+# Instruction-following auto eval (AlpacaEval 2)
+alpaca-eval
+
+# Safety (optional; these change fast, so clone if pip isn’t up-to-date)
+jailbreakbench
+# harmbench  # had a pip issue
