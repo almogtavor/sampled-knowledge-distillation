@@ -57,6 +57,26 @@ fi
 $PY -m pip -V || true
 $PY -m pip install -q --upgrade pip wheel setuptools
 
+# --- Force coherent CUDA stack (Torch 2.2.2+cu118 / Triton 2.2.0 / BnB 0.43.3)
+$PY - <<'PY' >/dev/null 2>&1
+import sys, importlib
+ok = False
+try:
+    import torch
+    ok = torch.__version__.startswith("2.2.") and getattr(torch.version, "cuda", "").startswith("11.8")
+except Exception:
+    pass
+sys.exit(0 if ok else 1)
+PY
+if [[ $? -ne 0 ]]; then
+  echo "Reinstalling torch/cu118 + triton 2.2.0 + bitsandbytes 0.43.3..."
+  $PY -m pip uninstall -y torch torchvision torchaudio triton bitsandbytes || true
+  $PY -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
+      torch==2.2.2+cu118 torchvision==0.17.2+cu118 torchaudio==2.2.2+cu118
+  $PY -m pip install --no-cache-dir triton==2.2.0 bitsandbytes==0.43.3
+fi
+
+
 # ---------- install torch/cu118 if missing ----------
 if ! $PY - <<'PY' >/dev/null 2>&1
 import torch; print(torch.__version__)

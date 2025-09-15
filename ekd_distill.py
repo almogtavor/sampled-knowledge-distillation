@@ -298,7 +298,8 @@ def main():
 
     # Initialize TensorBoard writer with experiment name
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    experiment_name = f"distill-{config.distill_type}-{current_date}"
+    job_id = os.getenv("SLURM_JOB_ID", "local")
+    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
     tensorboard_path = Path(config.tensorboard_dir) / experiment_name
     print(f"Setting up TensorBoard logging in {tensorboard_path}")
     writer = SummaryWriter(tensorboard_path)

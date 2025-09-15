@@ -45,8 +45,9 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
     export_dir.mkdir(parents=True, exist_ok=True)
     print(f"Exporting model from base '{base_model_dir}' with state_dict '{ckpt_path.name}' -> '{export_dir}'")
 
-    tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(base_model_dir, dtype=torch.float16, device_map=None)
+    # Use slow tokenizer to avoid potential parallelism/NFS hangs on clusters
+    tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=False, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(base_model_dir, dtype=torch.float16, device_map=None, trust_remote_code=True)
     chk = torch.load(ckpt_path, map_location="cpu")
     state = chk.get("model_state_dict")
     if state is None:
@@ -369,6 +370,9 @@ def main():
     parser.add_argument("--ekd_ckpt_dir", type=str, default="kd_ekd_run_out_model")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
+    # Optional: evaluate a single tag+checkpoint instead of both latest
+    parser.add_argument("--tag", type=str, choices=["vanilla", "ekd"], help="Evaluate only this run type (vanilla or ekd).")
+    parser.add_argument("--checkpoint_path", type=str, help="Path to a specific checkpoint .pt to evaluate (used with --tag).")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
@@ -379,15 +383,26 @@ def main():
 
     # Prepare models
     model_specs = []
-    for tag, ckdir in [("vanilla", args.vanilla_ckpt_dir), ("ekd", args.ekd_ckpt_dir)]:
-        ckpt_dir = Path(ckdir)
-        ckpt = find_latest_checkpoint(ckpt_dir)
-        if ckpt is None:
-            print(f"Warning: no checkpoints in {ckpt_dir}, skipping {tag}")
-            continue
-        export_dir = exports_dir / f"{tag}_export"
+    if args.tag and args.checkpoint_path:
+        tag = args.tag
+        ckpt = Path(args.checkpoint_path)
+        if not ckpt.exists():
+            print(f"Error: checkpoint not found: {ckpt}")
+            sys.exit(2)
+        # Include checkpoint stem in export dir to avoid collisions
+        export_dir = exports_dir / f"{tag}_export_{ckpt.stem}"
         export_hf_model(args.base_model_dir, ckpt, export_dir)
         model_specs.append((tag, export_dir))
+    else:
+        for tag, ckdir in [("vanilla", args.vanilla_ckpt_dir), ("ekd", args.ekd_ckpt_dir)]:
+            ckpt_dir = Path(ckdir)
+            ckpt = find_latest_checkpoint(ckpt_dir)
+            if ckpt is None:
+                print(f"Warning: no checkpoints in {ckpt_dir}, skipping {tag}")
+                continue
+            export_dir = exports_dir / f"{tag}_export"
+            export_hf_model(args.base_model_dir, ckpt, export_dir)
+            model_specs.append((tag, export_dir))
 
     if not model_specs:
         print("No models exported. Exiting.")
