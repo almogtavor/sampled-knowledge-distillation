@@ -146,10 +146,19 @@ class Distiller:
 
         # Adds a token-level CE term that tries to predict the ground-truth token IDs.
         # Flattens (B, L, V) -> (B*L, V) and (B, L) -> (B*L). Ignores pad tokens using the tokenizer’s pad id.
+        # Shift for next-token prediction: logits at position t predict token t+1
+        logits = s_logits[:, :-1, :] # predict tokens 1..L-1
+        targets = input_ids_student[:, 1:]  # gold tokens 1..L-1
+        mask = attention_student[:, 1:]  # ignore pads
+
+        # mask pads with -100 (ignore_index)
+        targets = targets.masked_fill(mask == 0, -100)
+        
+        V = s_logits.size(-1)
         ce_loss = F.cross_entropy(
-            s_logits.view(-1, s_logits.size(-1)),
-            input_ids_student.view(-1),
-            ignore_index=self.tok.pad_token_id
+            logits.contiguous().view(-1, V),
+            targets.contiguous().view(-1),
+            ignore_index=-100
         )
         loss = kd_loss + self.alpha_ce * ce_loss
         return loss, kd_loss.item(), ce_loss.item()
