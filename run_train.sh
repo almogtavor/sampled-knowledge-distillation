@@ -13,7 +13,7 @@ OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE}_run_out_model"
 
 # The python script with all its arguments.
 # Adjust arguments here as needed.
-python ekd_distill.py \
+python3 ekd_distill.py \
     --teacher_model "Qwen/Qwen3-8B" \
     --student_model "Qwen/Qwen3-0.6B" \
     --distill_type "$DISTILL_TYPE" \
@@ -27,7 +27,7 @@ python ekd_distill.py \
     --gradient_accumulation_steps 16 \
     --checkpoint_steps 250 \
     --keep_checkpoints 3 \
-    --max_seq_len 512 \
+    --max_seq_len 384 \
     --lr 1e-5 \
     --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
     --output_dir "$OUTPUT_DIR"

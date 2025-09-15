@@ -128,14 +128,24 @@ class Distiller:
             kd_losses = []
             for i in range(ent.size(0)):
                 seq_ent = ent[i].float()  # Ensure float dtype for quantile
+                # Gives the entropy value at the top k-th percentile
                 threshold = torch.quantile(seq_ent, 1 - self.config.top_k_percent / 100.0)
                 mask = seq_ent >= threshold  # high-entropy positions (fork tokens)
                 kl_i = self._kl_loss(t_log_probs[i].to(self.student_device), s_log_probs[i])  # [L]
                 if mask.any():
-                    kd_losses.append(kl_i[mask].mean())
-            kd_loss = torch.stack(kd_losses).mean()
+                    mask_student = mask.to(self.student_device)  # Move mask to student device
+                    kd_losses.append(kl_i[mask_student].mean())
+            
+            # Handle case where no high-entropy tokens are found in the entire batch
+            if len(kd_losses) > 0:
+                kd_loss = torch.stack(kd_losses).mean()
+            else:
+                # Fall back to vanilla KL divergence if no high-entropy tokens found
+                kl = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L]
+                kd_loss = kl.mean()
 
-        # optional small CE on every token to keep language ability
+        # Adds a token-level CE term that tries to predict the ground-truth token IDs.
+        # Flattens (B, L, V) -> (B*L, V) and (B, L) -> (B*L). Ignores pad tokens using the tokenizer’s pad id.
         ce_loss = F.cross_entropy(
             s_logits.view(-1, s_logits.size(-1)),
             input_ids_student.view(-1),

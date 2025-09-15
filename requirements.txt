@@ -41,18 +41,17 @@ tqdm
 pandas
 
 # --- lm-eval & deps (fix) ---
-sqlitedict>=2.1.0
-lm-eval[ifeval,math]==0.4.9.1
+# lm-eval[ifeval,math]==0.4.9.1
 
-# Lighteval (for summarization tasks with ROUGE)
-lighteval
+# # Lighteval (for summarization tasks with ROUGE)
+# lighteval
 
-# Code-generation evals
-evalplus
+# # Code-generation evals
+# evalplus
 
-# Instruction-following auto eval (AlpacaEval 2)
-alpaca-eval
+# # Instruction-following auto eval (AlpacaEval 2)
+# alpaca-eval
 
-# Safety (optional; these change fast, so clone if pip isn’t up-to-date)
-jailbreakbench
+# # Safety (optional; these change fast, so clone if pip isn’t up-to-date)
+# jailbreakbench
 # harmbench  # had a pip issue
