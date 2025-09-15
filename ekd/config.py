@@ -9,6 +9,8 @@ class TrainingConfig(BaseModel):
     # Model settings
     teacher_model: str
     student_model: str
+    teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
+    student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
     distill_type: Literal["vanilla", "ekd"] = "vanilla"
     top_k_percent: int = Field(default=20, description="for EKD only")
     

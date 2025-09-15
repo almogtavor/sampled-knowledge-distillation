@@ -19,6 +19,10 @@ def parse_args_to_config() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Entropy-guided KD for LLMs")
     parser.add_argument("--teacher_model", required=True)
     parser.add_argument("--student_model", required=True)
+    parser.add_argument("--teacher_quant_bits", type=int, choices=[4, 8], default=None,
+                        help="Load teacher in 4-bit or 8-bit to reduce VRAM usage")
+    parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
+                        help="Optionally quantize student for memory (not typical during training)")
     parser.add_argument("--distill_type", choices=["vanilla", "ekd"], default="vanilla")
     parser.add_argument("--top_k_percent", type=int, default=20, help="for EKD only")
     parser.add_argument("--datasets", nargs="+", required=True)
@@ -55,42 +59,87 @@ def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
 
-    if not is_torch_cuda_available():
-        print("Warning: CUDA not available. Using CPU for training.")
-        teacher_device = torch.device("cpu")
-        student_device = torch.device("cpu")
-    else:
-        teacher_device = torch.device("cpu")  # Teacher on CPU to save GPU memory
-        student_device = torch.device("cuda")  # Student on GPU
+    # Set CUDA memory management settings for better memory efficiency
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # Clear any cached memory
+        # Set memory fraction to prevent OOM
+        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory max
 
+        # device placement
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        if device_count >= 2:
+            # Calculate total VRAM across all GPUs
+            total_vram_gb = 0
+            for i in range(device_count):
+                vram_bytes = torch.cuda.get_device_properties(i).total_memory
+                total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
+            print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
+            teacher_device = torch.device("cuda:0")
+            student_device = torch.device("cuda:1")
+        else:
+            teacher_device = student_device = torch.device("cuda:0")
+    else:
+        print("Warning: CUDA not available. Using CPU for training.")
+        teacher_device = student_device = torch.device("cpu")
+
+    # Load models first (use quantization if specified)
     print("Loading teacher...")
-    teacher, tok = load_model(config.teacher_model, device_map="cpu")
+    # Try loading with 8-bit quantization to reduce memory footprint
+    if teacher_device.type == "cuda" and torch.cuda.device_count() >= 2:
+        print("Loading teacher with 8-bit quantization and device_map=auto...")
+        # Force 8-bit quantization to reduce memory usage
+        teacher, tok = load_model(
+            config.teacher_model,
+            device_map="auto",
+            quant_bits=8,  # Force 8-bit quantization
+        )
+    else:
+        teacher_device_map = 0 if teacher_device.type == "cuda" else "cpu"
+        teacher, tok = load_model(
+            config.teacher_model,
+            device_map=teacher_device_map,
+            quant_bits=config.teacher_quant_bits,
+        )
 
     print("Loading student...")
-    if student_device.type == "cuda":
-        student, _ = load_model(config.student_model, device_map="auto")
-    else:
-        student, _ = load_model(config.student_model, device_map="cpu")
-    
+    # Keep student on a single GPU (prefer GPU 1 if available)
+    student_device_map = 1 if (student_device.type == "cuda" and torch.cuda.device_count() >= 2) else (0 if student_device.type == "cuda" else "cpu")
+    student, _ = load_model(
+        config.student_model,
+        device_map=student_device_map,
+        quant_bits=config.student_quant_bits,
+    )
+
+    # teacher: eval, no grads
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    # Reduce memory footprint during forward
+    if hasattr(teacher, "config"):
+        teacher.config.use_cache = False
+
     # Ensure student is in training mode - keep parameters in FP32 for gradient computation
     student.train()
-    # Don't convert model to half - keep parameters in FP32 for gradient stability
-    teacher.resize_token_embeddings(len(tok))  # optional if needed for teacher
-    student.resize_token_embeddings(len(tok))  # TODO: verify its safe to do!!
+    # Enable gradient checkpointing to reduce activation memory
+    if hasattr(student, "gradient_checkpointing_enable"):
+        try:
+            student.gradient_checkpointing_enable()
+        except Exception:
+            pass
+    if hasattr(student, "config"):
+        student.config.use_cache = False
+        
+    print(f"Teacher device: {teacher_device}")
+    print(f"Student device: {student_device}")
     
-    # Ensure models are on correct devices after resizing
-    if teacher_device.type == "cpu":
-        teacher = teacher.to("cpu")  # Keep teacher on CPU
-    else:
-        teacher = teacher.to(teacher_device)
-    student = student.to(student_device)
-
     if student_device.type == "cuda":
         print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
     else:
         print(f"Using device: {student_device}")
 
-    # build DataLoader
     if all(p.endswith(".jsonl") for p in config.datasets):
         # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
@@ -100,7 +149,6 @@ def main():
         hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
             else load_dataset(config.datasets[0])["train"]
         print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-        # Reformat to match AIMEJsonl format: list of dicts with prompt, answer
         examples = []
         for ex in hf_dataset:
             examples.append({
