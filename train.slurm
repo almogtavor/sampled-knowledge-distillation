@@ -22,17 +22,22 @@ echo "Running training with distillation type: $DISTILL_TYPE"
 export TMPDIR=/home/joberant/NLP_2425b/$USER/ekd/tmp
 mkdir -p "$TMPDIR" huggingface logs
 
-# Set Hugging Face cache directories to use unlimited ekd storage instead of home quota
-export HF_HOME=/home/joberant/NLP_2425b/$USER/ekd/huggingface
-export HUGGINGFACE_HUB_CACHE=/home/joberant/NLP_2425b/$USER/ekd/huggingface/hub
-export HF_DATASETS_CACHE=/home/joberant/NLP_2425b/$USER/ekd/huggingface/datasets
-mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$HF_DATASETS_CACHE"
+# Use local tmp directory for fast offloads and caches  
+export HF_HOME="$TMPDIR/hf"
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export ACCELERATE_LOG_LEVEL=info
+export TRANSFORMERS_VERBOSITY=info
 
-# GPU configuration variables
-export MIN_FREE_MEM_MB=${MIN_FREE_MEM_MB:-9000}
-export REQUEUE_MAX_ATTEMPTS=${REQUEUE_MAX_ATTEMPTS:-15}
-export REQUEUE_SLEEP_MIN=${REQUEUE_SLEEP_MIN:-20}
-export REQUEUE_SLEEP_MAX=${REQUEUE_SLEEP_MAX:-60}
+# Prevent tokenizer hanging issues
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+
+mkdir -p "$HF_HOME/hub" "$HF_DATASETS_CACHE"
+
+# Fallback cache to unlimited ekd storage (but scratch is preferred)
+mkdir -p /home/joberant/NLP_2425b/$USER/ekd/huggingface/hub
 
 # Use fresh minimal virtual environment  
 VENV_DIR="$PWD/fastenv310_3_new"
@@ -44,10 +49,10 @@ if [[ -f "$VENV_DIR/bin/activate" ]] && [[ -x "$VENV_DIR/bin/python" ]]; then
     pip -V
 else
     echo "ERROR: Virtual environment not found at $VENV_DIR"
-    echo "Please create and install dependencies into fastenv310_3 before running this job"
+    echo "Please create and install dependencies into fastenv310_3_new before running this job"
     exit 1
 fi
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export MIN_FREE_MEM_MB=${MIN_FREE_MEM_MB:-9000}  # default for 12GB GPUs; override via env if needed
 export REQUEUE_MAX_ATTEMPTS=${REQUEUE_MAX_ATTEMPTS:-15}
 export REQUEUE_SLEEP_MIN=${REQUEUE_SLEEP_MIN:-20}

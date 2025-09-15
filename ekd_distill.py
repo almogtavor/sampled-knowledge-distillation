@@ -1,10 +1,14 @@
 import argparse
 from pathlib import Path
 from datetime import datetime
+import os, shutil
+from typing import List, Tuple, Optional
 
 import torch
 from transformers.utils import is_torch_cuda_available
 from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
@@ -12,6 +16,147 @@ from ekd.models.ollama_loader import OllamaModel
 from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
+
+
+def load_teacher_with_fallback(
+    model_name: str,
+    prefer_gpus: List[int],          # GPUs to use for the teacher, in order of preference
+    student_gpu: Optional[int],      # GPU reserved for the student (exclude from teacher)
+) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
+    """
+    1) Try single-GPU FP16 on prefer_gpus[0]
+    2) If OOM, try 2-GPU sharding across prefer_gpus[0:2] (excluding student_gpu)
+    3) If still OOM, try 8-bit on single GPU
+    4) If still OOM, try 4-bit on single GPU
+    Returns: (teacher_model, tokenizer, teacher_device_for_inputs)
+    """
+    # Helper: make a local offload/cache dir (per job if SLURM)
+    job_id = os.environ.get("SLURM_JOB_ID", "nojid")
+    # Use TMPDIR which is already set up in the SLURM script
+    tmpdir = os.environ.get("TMPDIR", "/home/joberant/NLP_2425b/almogt/ekd/tmp")
+    offload_dir = os.path.join(tmpdir, "hf_offload_teacher")
+    os.makedirs(offload_dir, exist_ok=True)
+
+    # Tokenizer first (slow & local to avoid cluster hiccups)
+    tok = AutoTokenizer.from_pretrained(
+        model_name,
+        use_fast=False,
+        trust_remote_code=True,
+        local_files_only=False,   # set True if your cache is complete
+    )
+    if tok.pad_token_id is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
+
+    # Filter teacher GPUs (exclude student's GPU if present)
+    teacher_gpus = [g for g in prefer_gpus if g != student_gpu]
+    if not teacher_gpus:
+        raise RuntimeError("No GPUs available for teacher after excluding the student GPU.")
+
+    # ===== 1) Single-GPU FP16 (best performance if it fits) =====
+    try:
+        one = teacher_gpus[0]
+        print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map={"": one},
+            dtype=torch.float16,             # use 'dtype' (not torch_dtype)
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        print("[teacher] Loaded on single GPU.", flush=True)
+        return teacher, tok, torch.device(f"cuda:{one}")
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            print(f"[teacher] Single-GPU load failed (non-OOM): {e}", flush=True)
+            # continue anyway and try multi-GPU
+        else:
+            print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
+
+    # ===== 2) Two-GPU sharding with Accelerate =====
+    if len(teacher_gpus) >= 2:
+        try:
+            g0, g1 = teacher_gpus[0], teacher_gpus[1]
+            print(f"[teacher] Trying 2-GPU sharding on cuda:{g0},{g1}", flush=True)
+
+            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            with init_empty_weights():
+                empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+
+            # Keep GPU memory budgets just under 12GiB
+            max_memory = {g0: "11GiB", g1: "11GiB", "cpu": "40GiB"}
+
+            teacher = load_checkpoint_and_dispatch(
+                empty_model,
+                checkpoint=model_name,
+                device_map="balanced_low_0",
+                max_memory=max_memory,
+                offload_folder=offload_dir,
+                dtype=torch.float16,
+            )
+            teacher.eval()
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+
+            print(f"[teacher] 2-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
+            # For model-parallel HF models, feeding inputs on the first GPU is fine:
+            return teacher, tok, torch.device(f"cuda:{g0}")
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                print(f"[teacher] 2-GPU load failed (non-OOM): {e}", flush=True)
+            else:
+                print("[teacher] 2-GPU OOM, trying quantization...", flush=True)
+        except Exception as e:
+            print(f"[teacher] 2-GPU dispatch error: {e}", flush=True)
+
+    # ===== 3) 8-bit quantization on single GPU =====
+    try:
+        from transformers import BitsAndBytesConfig
+        q8 = BitsAndBytesConfig(load_in_8bit=True)
+        one = teacher_gpus[0]
+        print(f"[teacher] Trying 8-bit on cuda:{one}", flush=True)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map={"": one},
+            quantization_config=q8,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        print("[teacher] Loaded 8-bit.", flush=True)
+        return teacher, tok, torch.device(f"cuda:{one}")
+    except Exception as e:
+        print(f"[teacher] 8-bit failed: {e}", flush=True)
+
+    # ===== 4) 4-bit quantization on single GPU (last resort) =====
+    try:
+        from transformers import BitsAndBytesConfig
+        q4 = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        one = teacher_gpus[0]
+        print(f"[teacher] Trying 4-bit on cuda:{one}", flush=True)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map={"": one},
+            quantization_config=q4,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        print("[teacher] Loaded 4-bit.", flush=True)
+        return teacher, tok, torch.device(f"cuda:{one}")
+    except Exception as e:
+        raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
 def parse_args_to_config() -> TrainingConfig:
@@ -62,56 +207,42 @@ def main():
     # Set CUDA memory management settings for better memory efficiency
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # Clear any cached memory
-        # Set memory fraction to prevent OOM
-        torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory max
 
-        # device placement
-    if torch.cuda.is_available():
-        device_count = torch.cuda.device_count()
-        if device_count >= 2:
-            # Calculate total VRAM across all GPUs
-            total_vram_gb = 0
-            for i in range(device_count):
-                vram_bytes = torch.cuda.get_device_properties(i).total_memory
-                total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
-            print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
-            teacher_device = torch.device("cuda:0")
-            student_device = torch.device("cuda:1")
-        else:
-            teacher_device = student_device = torch.device("cuda:0")
-    else:
-        print("Warning: CUDA not available. Using CPU for training.")
-        teacher_device = student_device = torch.device("cpu")
+    # ----------------- teacher / student device planning -----------------
+    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if device_count == 0:
+        raise RuntimeError("No CUDA devices available.")
 
-    # Load models first (use quantization if specified)
-    print("Loading teacher...")
-    # Try loading with 8-bit quantization to reduce memory footprint
-    if teacher_device.type == "cuda" and torch.cuda.device_count() >= 2:
-        print("Loading teacher with 8-bit quantization and device_map=auto...")
-        # Force 8-bit quantization to reduce memory usage
-        teacher, tok = load_model(
-            config.teacher_model,
-            device_map="auto",
-            quant_bits=8,  # Force 8-bit quantization
-        )
-    else:
-        teacher_device_map = 0 if teacher_device.type == "cuda" else "cpu"
-        teacher, tok = load_model(
-            config.teacher_model,
-            device_map=teacher_device_map,
-            quant_bits=config.teacher_quant_bits,
-        )
+    # Calculate total VRAM across all GPUs
+    total_vram_gb = 0
+    for i in range(device_count):
+        vram_bytes = torch.cuda.get_device_properties(i).total_memory
+        total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
+    print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
 
-    print("Loading student...")
-    # Keep student on a single GPU (prefer GPU 1 if available)
-    student_device_map = 1 if (student_device.type == "cuda" and torch.cuda.device_count() >= 2) else (0 if student_device.type == "cuda" else "cpu")
-    student, _ = load_model(
+    # Reserve GPU 1 for the student (as before):
+    student_gpu = 1 if device_count >= 2 else 0
+    student_device = torch.device(f"cuda:{student_gpu}")
+
+    # Prefer these GPUs for the teacher (exclude student later inside the function)
+    # Example: if you have GPUs 0,2,3,4 allocated, keep that list in order of free mem.
+    prefer_for_teacher = [0, 2, 3, 4][:max(1, device_count)]
+
+    print("Loading teacher with GPU-first fallback...", flush=True)
+    teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
+        model_name=config.teacher_model,
+        prefer_gpus=prefer_for_teacher,
+        student_gpu=student_gpu,
+    )
+
+    print("Loading student on its own GPU...", flush=True)
+    student, _ = load_model(  # your existing helper is fine for student
         config.student_model,
-        device_map=student_device_map,
+        device_map=student_gpu,     # {'': 1}
         quant_bits=config.student_quant_bits,
     )
 
-    # teacher: eval, no grads
+    # Freeze teacher, no grads (redundant but safe)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -130,7 +261,7 @@ def main():
     if hasattr(student, "config"):
         student.config.use_cache = False
         
-    print(f"Teacher device: {teacher_device}")
+    print(f"Teacher device: {teacher_inputs_device}")
     print(f"Student device: {student_device}")
     
     if student_device.type == "cuda":
@@ -178,7 +309,7 @@ def main():
         tokenizer=tok,
         dataloader=dl,
         config=config,  # Pass the entire config instead of individual args
-        teacher_device=teacher_device,
+        teacher_device=teacher_inputs_device,  # IMPORTANT: inputs for teacher go here
         student_device=student_device,
         writer=writer,  # Pass TensorBoard writer to Distiller
     )
