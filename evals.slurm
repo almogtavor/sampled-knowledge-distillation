@@ -55,23 +55,12 @@ export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 # Activate env  
-source fastenv310_3/bin/activate
+source fastenv310_3_new/bin/activate
 python -c "import torch; print('CUDA?', torch.cuda.is_available())"
 
 # Ensure dependencies for evaluation are present (best-effort)
-python - <<'PY'
-import importlib, subprocess
-pkgs = [
-		("lm_eval", 'pip install -U "lm-eval[tasks,ifeval]"'),
-		("lighteval", 'pip install -U lighteval'),
-		("evalplus", 'pip install -U "evalplus[vllm]"'),
-]
-for mod, cmd in pkgs:
-		try:
-				importlib.import_module(mod)
-		except Exception:
-				subprocess.check_call(cmd, shell=True)
-PY
+echo "Installing evaluation dependencies..."
+pip install lm-eval lighteval evalplus --quiet || echo "Some eval packages failed to install, continuing anyway"
 
 # Run evaluation for the single checkpoint
 srun -u python ekd/evaluations/eval.py \
