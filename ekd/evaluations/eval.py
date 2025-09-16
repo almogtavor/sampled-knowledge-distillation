@@ -250,12 +250,12 @@ def run_lmeval_parallel(
 
 # ---------- Lighteval (summarization) ----------
 
-LIGHTEVAL_TASKS = ["helm|summarization:cnn-dm", "helm|summarization:xsum"]
+LIGHTEVAL_TASKS = ["helm|summarization:cnn_dailymail", "helm|summarization:xsum"]
 
 def run_lighteval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path]:
     out_path = results_dir / f"lighteval_{tag}.json"
     # some installs use hyphen, some underscore
-    tasks = [t.replace("cnn-dm", "cnn_dailymail") for t in LIGHTEVAL_TASKS]
+    tasks = [t.replace("-", "_") for t in LIGHTEVAL_TASKS]  # normalize hyphen → underscore
     cmd = [
         "lighteval",
         "--model", "hf", str(model_dir),
@@ -279,6 +279,9 @@ def run_lighteval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path
 
 def run_evalplus(model_dir: Path, tag: str, datasets: List[str]) -> Dict[str, Optional[Path]]:
     out = {}
+    evalplus_home = Path(os.environ.get("TMPDIR", "/tmp")) / "evalplus_home"
+    (evalplus_home / ".cache").mkdir(parents=True, exist_ok=True)
+
     for ds_name in datasets:
         cmd = [
             "evalplus.evaluate",
@@ -287,9 +290,15 @@ def run_evalplus(model_dir: Path, tag: str, datasets: List[str]) -> Dict[str, Op
             "--backend", "hf",
             "--greedy",
         ]
-        code, _ = run(cmd)
+        env = os.environ.copy()
+        # redirect caches to TMPDIR
+        env["HOME"] = str(evalplus_home)             # avoid $HOME
+        env["XDG_CACHE_HOME"] = str(evalplus_home / ".cache")
+        env.setdefault("EVALPLUS_TRUST_REMOTE_CODE", "1")
+        code, _ = run(cmd, env=env)
+
         results_root = Path("evalplus_results") / ds_name
-        out[ds_name] = results_root if results_root.exists() else None
+        out[ds_name] = results_root if results_root.exists() and code == 0 else None
     return out
 
 # ---------- AlpacaEval 2 (LC win-rates) ----------
@@ -355,9 +364,14 @@ def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
             blob = json.load(open(p))
             r = blob.get("results", {})
             for task, metrics in r.items():
-                results[task] = {}
+                results.setdefault(task, {})
                 for mk, mv in metrics.items():
-                    if isinstance(mv, (int, float)):
+                    if isinstance(mv, dict) and "value" in mv:
+                        if isinstance(mv["value"], (int, float)):
+                            results[task][mk] = float(mv["value"])
+                        if "stderr" in mv and isinstance(mv["stderr"], (int, float)):
+                            results[task][f"{mk}_stderr"] = float(mv["stderr"])
+                    elif isinstance(mv, (int, float)):
                         results[task][mk] = float(mv)
         except Exception as e:
             print(f"Failed to parse {p}: {e}")

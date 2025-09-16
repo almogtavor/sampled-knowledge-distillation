@@ -24,6 +24,12 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
+# ---------- force eval caches to TMPDIR (avoid $HOME quota) ----------  
+export XDG_CACHE_HOME="$TMPDIR/xdg_cache";          mkdir -p "$XDG_CACHE_HOME"
+export WANDB_CACHE_DIR="$TMPDIR/wandb_cache";       mkdir -p "$WANDB_CACHE_DIR"  
+export WANDB_DIR="$TMPDIR/wandb";                   mkdir -p "$WANDB_DIR"
+export EVALPLUS_TRUST_REMOTE_CODE=1
+
 # ---------- use the pinned training venv ----------
 VENV_DIR="$PWD/fastenv310_3_new"
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
@@ -110,3 +116,8 @@ srun -u "$PY" ekd/evaluations/eval.py "${EVAL_ARGS[@]}" | tee "eval_runs/${RUN_T
 # extract LaTeX table if present
 awk '/\\begin{table}/, /\\end{table}/' "eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.log" > "eval_runs/${RUN_TAG}.table.${SLURM_JOB_ID}.tex" || true
 echo "Done. Logs: eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.log"
+
+# Example usage:
+# sbatch evals.slurm vanilla latest_checkpoint.pt Qwen/Qwen3-0.6B
+# or for testing with existing model:
+# sbatch evals.slurm vanilla model.safetensors Qwen/Qwen3-0.6B
