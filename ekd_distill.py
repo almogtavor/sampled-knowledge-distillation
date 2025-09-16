@@ -6,7 +6,6 @@ from typing import List, Tuple, Optional
 
 import torch
 from transformers.utils import is_torch_cuda_available
-from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
@@ -17,16 +16,11 @@ from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
 
-# Import W&B utils with fallback
+# Import logging utils with fallback
 try:
-    from ekd.logging.wandb_utils import create_training_logger
-    WANDB_AVAILABLE = True
+    from ekd.logging.wandb_utils import create_training_combined_logger
 except ImportError:
-    WANDB_AVAILABLE = False
-    
-    def create_training_logger(*args, **kwargs):
-        """Fallback function when W&B is not available"""
-        return None
+    create_training_combined_logger = lambda *args, **kwargs: None
 
 
 def load_teacher_with_fallback(
@@ -325,13 +319,10 @@ def main():
         + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
     )
     
-    # Initialize TensorBoard
-    tensorboard_path = Path(config.tensorboard_dir) / experiment_name
-    print(f"Setting up TensorBoard logging in {tensorboard_path}")
-    writer = SummaryWriter(tensorboard_path)
-    
-    # Initialize W&B
-    wandb_logger = create_training_logger(config, experiment_name)
+    # Initialize combined logger (W&B + TensorBoard)
+    combined_logger = create_training_combined_logger(
+        config, experiment_name, tensorboard_dir=config.tensorboard_dir
+    )
 
     distiller = Distiller(
         teacher_model=teacher,
@@ -341,27 +332,18 @@ def main():
         config=config,  # Pass the entire config instead of individual args
         teacher_device=teacher_inputs_device,
         student_device=student_device,
-        writer=writer,  # Pass TensorBoard writer to Distiller
-        wandb_run=wandb_logger.run,  # Pass W&B run to Distiller
+        logger=combined_logger,  # Use new combined logger
     )
 
     distiller.train(epochs=config.epochs)
 
-    # Close logging
-    writer.close()
-    if wandb_logger.enabled:
-        # Log final model artifacts
+    # Close logging  
+    if combined_logger:
         try:
-            wandb_logger.log_artifact(
-                artifact_path=config.output_dir,
-                name=f"student_model_{experiment_name}",
-                type="model",
-                description=f"Distilled student model ({config.distill_type})"
-            )
-            wandb_logger.finish()
-        except Exception as e:
-            print(f"Error finalizing W&B run: {e}")
-            wandb_logger.finish()
+            combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
+            combined_logger.finish()
+        except Exception:
+            pass
 
     print("Saving student to", config.output_dir)
     student.save_pretrained(config.output_dir)

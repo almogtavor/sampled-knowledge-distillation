@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-W&B Logging Utilities for EKD Project
+Logging Utilities for EKD Project
 
-This module provides utilities for logging training runs and evaluations to Weights & Biases.
+This module provides utilities for logging training runs and evaluations to both
+Weights & Biases and TensorBoard.
 """
 
 import os
-from typing import Optional, Dict, Any
+from pathlib import Path
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 # Optional imports
@@ -15,6 +17,12 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 
 class WandBLogger:
@@ -89,6 +97,133 @@ class WandBLogger:
                 print("W&B run finished successfully")
             except Exception as e:
                 print(f"Error finishing W&B run: {e}")
+
+
+class TensorBoardLogger:
+    """TensorBoard logging utility for EKD project."""
+    
+    def __init__(self, log_dir: str):
+        """Initialize TensorBoard logger.
+        
+        Args:
+            log_dir: Directory for TensorBoard logs
+        """
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.enabled = TENSORBOARD_AVAILABLE
+        self.writer = None
+        
+        if self.enabled:
+            try:
+                self.writer = SummaryWriter(log_dir=str(self.log_dir))
+                print(f"TensorBoard logging enabled at {self.log_dir}")
+            except Exception as e:
+                print(f"Failed to initialize TensorBoard: {e}")
+                self.enabled = False
+        else:
+            print("TensorBoard not available")
+    
+    def log_scalar(self, name: str, value: float, step: int = 0) -> None:
+        """Log a scalar value to TensorBoard."""
+        if self.enabled and self.writer:
+            try:
+                self.writer.add_scalar(name, value, step)
+            except Exception as e:
+                print(f"Error logging scalar to TensorBoard: {e}")
+    
+    def log_scalars(self, metrics: Dict[str, float], step: int = 0) -> None:
+        """Log multiple scalar values to TensorBoard."""
+        if self.enabled and self.writer:
+            try:
+                for name, value in metrics.items():
+                    self.writer.add_scalar(name, value, step)
+            except Exception as e:
+                print(f"Error logging scalars to TensorBoard: {e}")
+    
+    def flush(self) -> None:
+        """Flush TensorBoard writer."""
+        if self.enabled and self.writer:
+            try:
+                self.writer.flush()
+            except Exception as e:
+                print(f"Error flushing TensorBoard: {e}")
+    
+    def close(self) -> None:
+        """Close TensorBoard writer."""
+        if self.enabled and self.writer:
+            try:
+                self.writer.close()
+                print("TensorBoard logger closed successfully")
+            except Exception as e:
+                print(f"Error closing TensorBoard: {e}")
+
+
+class CombinedLogger:
+    """Combined logger that handles both W&B and TensorBoard logging."""
+    
+    def __init__(
+        self,
+        wandb_logger: Optional[WandBLogger] = None,
+        tensorboard_logger: Optional[TensorBoardLogger] = None,
+    ):
+        """Initialize combined logger.
+        
+        Args:
+            wandb_logger: W&B logger instance
+            tensorboard_logger: TensorBoard logger instance
+        """
+        self.wandb_logger = wandb_logger
+        self.tensorboard_logger = tensorboard_logger
+        self.global_step = 0
+    
+    def log(self, metrics: Dict[str, float], step: Optional[int] = None) -> None:
+        """Log metrics to both W&B and TensorBoard."""
+        if step is None:
+            step = self.global_step
+            
+        if self.wandb_logger:
+            self.wandb_logger.log(metrics, step)
+        
+        if self.tensorboard_logger:
+            self.tensorboard_logger.log_scalars(metrics, step)
+    
+    def log_scalar(self, name: str, value: float, step: Optional[int] = None) -> None:
+        """Log a single scalar to both W&B and TensorBoard."""
+        if step is None:
+            step = self.global_step
+            
+        if self.wandb_logger:
+            self.wandb_logger.log({name: value}, step)
+        
+        if self.tensorboard_logger:
+            self.tensorboard_logger.log_scalar(name, value, step)
+    
+    def log_artifact(self, artifact_path: str, name: str, artifact_type: str = "model") -> None:
+        """Log artifact to W&B."""
+        if self.wandb_logger:
+            self.wandb_logger.log_artifact(artifact_path, name, artifact_type)
+    
+    def log_table(self, table_name: str, columns: list, data: list) -> None:
+        """Log table to W&B."""
+        if self.wandb_logger:
+            self.wandb_logger.log_table(table_name, columns, data)
+    
+    def increment_step(self) -> None:
+        """Increment the global step counter."""
+        self.global_step += 1
+    
+    def flush(self) -> None:
+        """Flush both loggers."""
+        if self.tensorboard_logger:
+            self.tensorboard_logger.flush()
+    
+    def finish(self) -> None:
+        """Finish and close both loggers."""
+        if self.wandb_logger:
+            self.wandb_logger.finish()
+        
+        if self.tensorboard_logger:
+            self.tensorboard_logger.close()
 
 
 def create_training_logger(config, experiment_name: Optional[str] = None) -> WandBLogger:
@@ -186,3 +321,73 @@ def log_evaluation_results(logger: WandBLogger, model_tag: str, results: Dict[st
         
     except Exception as e:
         print(f"Error logging {model_tag} metrics to W&B: {e}")
+
+
+# Standalone evaluation logging functions (for backward compatibility)
+def log_evaluation_to_wandb(tag: str, merged_metrics: Dict[str, Dict[str, float]], project: str) -> None:
+    """Log evaluation metrics to W&B."""
+    if not WANDB_AVAILABLE:
+        print("W&B not available, skipping wandb logging")
+        return
+    try:
+        wandb.init(project=project, name=f"eval-{tag}", reinit=True)
+        wandb_metrics = {}
+        for task, metrics in merged_metrics.items():
+            for metric, val in metrics.items():
+                wandb_metrics[f"{task}/{metric}"] = val
+        wandb.log(wandb_metrics)
+        wandb.finish()
+        print(f"✓ Logged {len(wandb_metrics)} metrics to W&B project '{project}'")
+    except Exception as e:
+        print(f"Failed to log to W&B: {e}")
+
+
+def log_evaluation_to_tensorboard(
+    tag: str, 
+    merged_metrics: Dict[str, Dict[str, float]], 
+    log_dir: str = "tb_logs"
+) -> None:
+    """Log evaluation metrics to TensorBoard."""
+    if not TENSORBOARD_AVAILABLE:
+        print("TensorBoard not available, skipping tensorboard logging")
+        return
+    try:
+        tb_path = Path(log_dir) / tag
+        tb_path.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tb_path))
+        metric_count = 0
+        for task, metrics in merged_metrics.items():
+            for metric, val in metrics.items():
+                writer.add_scalar(f"{task}/{metric}", val)
+                metric_count += 1
+        writer.close()
+        print(f"✓ Logged {metric_count} metrics to TensorBoard at {tb_path}")
+    except Exception as e:
+        print(f"Failed to log to TensorBoard: {e}")
+
+
+def create_training_combined_logger(
+    config: "TrainingConfig",
+    experiment_name: str,
+    tensorboard_dir: Optional[str] = None
+) -> CombinedLogger:
+    """Create a combined logger for training with both W&B and TensorBoard.
+    
+    Args:
+        config: Training configuration
+        experiment_name: Name of the experiment
+        tensorboard_dir: Directory for TensorBoard logs (optional)
+        
+    Returns:
+        CombinedLogger instance
+    """
+    # Create W&B logger
+    wandb_logger = create_training_logger(config, experiment_name)
+    
+    # Create TensorBoard logger
+    tensorboard_logger = None
+    if tensorboard_dir:
+        tb_path = Path(tensorboard_dir) / experiment_name
+        tensorboard_logger = TensorBoardLogger(str(tb_path))
+    
+    return CombinedLogger(wandb_logger, tensorboard_logger)
