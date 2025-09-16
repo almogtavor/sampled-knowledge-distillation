@@ -13,6 +13,26 @@ from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
 
+# ===== DDP bootstrap (single-node multi-GPU ready) =====
+import os
+def _ddp_env():
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank       = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    return local_rank, rank, world_size
+
+LOCAL_RANK, RANK, WORLD_SIZE = _ddp_env()
+USE_DDP = WORLD_SIZE > 1
+
+if USE_DDP:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    dist.init_process_group(backend="nccl", init_method="env://")
+    torch.cuda.set_device(LOCAL_RANK)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def is_main_process(): return RANK == 0
+torch.backends.cudnn.benchmark = True
 
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
@@ -65,16 +85,14 @@ def main():
         # Set memory fraction to prevent OOM
         torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory max
 
-        # device placement
+    # device placement
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         if device_count >= 2:
-            # Calculate total VRAM across all GPUs
-            total_vram_gb = 0
-            for i in range(device_count):
-                vram_bytes = torch.cuda.get_device_properties(i).total_memory
-                total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
-            print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
+            total_vram_gb = sum(
+                torch.cuda.get_device_properties(i).total_memory for i in range(device_count)
+            ) / (1024**3)
+            print(f"Success: Detected {device_count} GPUs with {round(total_vram_gb, 1)} GB total VRAM available.")
             teacher_device = torch.device("cuda:0")
             student_device = torch.device("cuda:1")
         else:
@@ -85,76 +103,57 @@ def main():
 
     # Load models first (use quantization if specified)
     print("Loading teacher...")
-    # Try loading with 8-bit quantization to reduce memory footprint
-    if teacher_device.type == "cuda" and torch.cuda.device_count() >= 2:
-        print("Loading teacher with 8-bit quantization and device_map=auto...")
-        # Force 8-bit quantization to reduce memory usage
+    if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        print("Loading teacher with device_map=auto (may shard across GPUs)...")
         teacher, tok = load_model(
             config.teacher_model,
             device_map="auto",
-            quant_bits=8,  # Force 8-bit quantization
+            quant_bits=config.teacher_quant_bits or 8,  # force 8-bit if not specified
         )
+        # Important: do NOT move teacher to a specific GPU
+        teacher_device = None  # marker: teacher is sharded
     else:
-        teacher_device_map = 0 if teacher_device.type == "cuda" else "cpu"
         teacher, tok = load_model(
             config.teacher_model,
-            device_map=teacher_device_map,
+            device_map=0 if teacher_device.type == "cuda" else "cpu",
             quant_bits=config.teacher_quant_bits,
         )
 
     print("Loading student...")
-    # Keep student on a single GPU (prefer GPU 1 if available)
-    student_device_map = 1 if (student_device.type == "cuda" and torch.cuda.device_count() >= 2) else (0 if student_device.type == "cuda" else "cpu")
     student, _ = load_model(
         config.student_model,
-        device_map=student_device_map,
+        device_map=1 if (student_device.type == "cuda" and torch.cuda.device_count() >= 2) else (
+            0 if student_device.type == "cuda" else "cpu"
+        ),
         quant_bits=config.student_quant_bits,
     )
 
-    # teacher: eval, no grads
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
-    # Reduce memory footprint during forward
     if hasattr(teacher, "config"):
         teacher.config.use_cache = False
 
-    # Ensure student is in training mode - keep parameters in FP32 for gradient computation
     student.train()
-    # Enable gradient checkpointing to reduce activation memory
     if hasattr(student, "gradient_checkpointing_enable"):
-        try:
-            student.gradient_checkpointing_enable()
-        except Exception:
-            pass
+        try: student.gradient_checkpointing_enable()
+        except Exception: pass
     if hasattr(student, "config"):
         student.config.use_cache = False
-        
-    print(f"Teacher device: {teacher_device}")
-    print(f"Student device: {student_device}")
-    
-    if student_device.type == "cuda":
-        print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
-        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
-        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
-    else:
-        print(f"Using device: {student_device}")
 
+    print(f"Teacher device: {'sharded' if teacher_device is None else teacher_device}")
+    print(f"Student device: {student_device}")
+
+    # Load dataset
     if all(p.endswith(".jsonl") for p in config.datasets):
         # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
     else:
-        # Load from Hugging Face dataset if user passes HF dataset name
         print(f"Loading Hugging Face dataset: {config.datasets[0]}")
-        hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
-            else load_dataset(config.datasets[0])["train"]
+        hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] \
+            if config.dataset_config else load_dataset(config.datasets[0])["train"]
         print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-        examples = []
-        for ex in hf_dataset:
-            examples.append({
-                "prompt": ex[config.prompt_col],
-                "answer": ex[config.answer_col],
-            })
+        examples = [{"prompt": ex[config.prompt_col], "answer": ex[config.answer_col]} for ex in hf_dataset]
         dataset = examples
 
     collate = DistillCollator(tok, config.max_seq_len)
@@ -172,13 +171,14 @@ def main():
     print(f"Setting up TensorBoard logging in {tensorboard_path}")
     writer = SummaryWriter(tensorboard_path)
 
+    # Distiller
     distiller = Distiller(
         teacher_model=teacher,
         student_model=student,
         tokenizer=tok,
         dataloader=dl,
         config=config,  # Pass the entire config instead of individual args
-        teacher_device=teacher_device,
+        teacher_device=teacher_device,   # None means sharded
         student_device=student_device,
         writer=writer,  # Pass TensorBoard writer to Distiller
     )
