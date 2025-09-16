@@ -26,7 +26,6 @@ if "HF_DATASETS_CACHE" not in os.environ:
 # ---------- Optional logging imports ----------
 try:
     import wandb
-    wandb.login(key=os.getenv("WANDB_API_KEY"))
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
@@ -580,6 +579,19 @@ def main():
         sys.exit(1)
 
     all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
+    
+    # Import and initialize W&B logging
+    try:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from ekd.logging.wandb_utils import create_evaluation_logger, log_evaluation_results
+        wandb_logger = create_evaluation_logger(
+            base_model=args.base_model_dir,
+            models_evaluated=[spec[0] for spec in model_specs]
+        )
+    except ImportError:
+        print("W&B logging utilities not available")
+        wandb_logger = None
 
     for tag, model_dir in model_specs:
         print(f"\n=== Running benchmarks for {tag} ===")
@@ -623,15 +635,76 @@ def main():
         ])
         all_models_metrics[tag] = merged
 
-        # Log to W&B and TensorBoard
-        print(f"\n=== Logging metrics for {tag} ===")
-        if not args.disable_wandb:
-            log_to_wandb(tag, merged, project=args.wandb_project)
-        if not args.disable_tensorboard:
-            log_to_tensorboard(tag, merged, log_dir=str(work_dir / "tb_logs"))
+        # Log results to W&B
+        if wandb_logger is not None and wandb_logger.enabled:
+            print(f"\n=== Logging metrics for {tag} to W&B ===")
+            try:
+                log_evaluation_results(wandb_logger, tag, merged)
+            except Exception as e:
+                print(f"Error logging {tag} metrics to W&B: {e}")
+
+        # TensorBoard logging (if available)
+        if TENSORBOARD_AVAILABLE:
+            try:
+                tb_log_dir = work_dir / "tb_logs" / tag
+                tb_log_dir.mkdir(parents=True, exist_ok=True)
+                tb_writer = SummaryWriter(tb_log_dir)
+                
+                for suite_name, suite_metrics in merged.items():
+                    for metric_name, value in suite_metrics.items():
+                        tb_writer.add_scalar(f"{suite_name}/{metric_name}", value, 0)
+                
+                tb_writer.close()
+                print(f"TensorBoard metrics logged to {tb_log_dir}")
+            except Exception as e:
+                print(f"Error logging to TensorBoard: {e}")
 
     # Print LaTeX
     print_latex_table(all_models_metrics)
+    
+    # Finalize W&B run
+    if wandb_logger is not None and wandb_logger.enabled:
+        try:
+            # Create comparison tables and plots
+            if len(all_models_metrics) > 1:
+                # Create model comparison table
+                comparison_data = []
+                all_metrics = set()
+                for model_metrics in all_models_metrics.values():
+                    for suite_metrics in model_metrics.values():
+                        all_metrics.update(suite_metrics.keys())
+                
+                for metric in sorted(all_metrics):
+                    row = [metric]
+                    for model_name in sorted(all_models_metrics.keys()):
+                        # Find this metric across all suites for this model
+                        value = None
+                        for suite_metrics in all_models_metrics[model_name].values():
+                            if metric in suite_metrics:
+                                value = suite_metrics[metric]
+                                break
+                        row.append(value if value is not None else "N/A")
+                    comparison_data.append(row)
+                
+                wandb_logger.log_table(
+                    "model_comparison",
+                    ["Metric"] + sorted(all_models_metrics.keys()),
+                    comparison_data
+                )
+            
+            # Log final summary
+            summary_metrics = {}
+            for model_name, model_metrics in all_models_metrics.items():
+                total_metrics = sum(len(suite) for suite in model_metrics.values())
+                summary_metrics[f"{model_name}/total_metrics"] = total_metrics
+            
+            wandb_logger.log(summary_metrics)
+            wandb_logger.finish()
+            
+        except Exception as e:
+            print(f"Error finalizing W&B evaluation run: {e}")
+            if wandb_logger:
+                wandb_logger.finish()
 
 if __name__ == "__main__":
     main()

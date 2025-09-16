@@ -9,6 +9,13 @@ import glob
 
 from ..config import TrainingConfig, CheckpointData, TrainingMetrics
 
+# Optional W&B import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 def token_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Compute per-token entropy (the regular Entropy formula) in natural logarithm (base e).
@@ -35,6 +42,7 @@ class Distiller:
             teacher_device: device = "cuda",
             student_device: device = "cuda",
             writer=None,  # TensorBoard writer
+            wandb_run=None,  # W&B run object for logging
     ):
         self.teacher = teacher_model.eval()  # frozen
         # self.teacher = teacher_model # todo: is it okay not to use the frozen? sounds like it should be frozen
@@ -47,6 +55,7 @@ class Distiller:
         self.teacher_device = teacher_device
         self.student_device = student_device
         self.writer = writer
+        self.wandb_run = wandb_run
         self.global_step = 0  # For TensorBoard logging
         
         # Checkpointing
@@ -232,20 +241,29 @@ class Distiller:
                 running["kl"] += kl_val
                 running["ce"] += ce_val
                 
-                # TensorBoard logging every step using TrainingMetrics
+                # Logging every step using TrainingMetrics
+                metrics = TrainingMetrics(
+                    loss=loss.item() * self.config.gradient_accumulation_steps,
+                    kl_loss=kl_val,
+                    ce_loss=ce_val,
+                    epoch=epoch + 1,
+                    step=step + 1,
+                    global_step=self.global_step
+                )
+                
+                # Log metrics to TensorBoard
                 if self.writer is not None:
-                    metrics = TrainingMetrics(
-                        loss=loss.item() * self.config.gradient_accumulation_steps,
-                        kl_loss=kl_val,
-                        ce_loss=ce_val,
-                        epoch=epoch + 1,
-                        step=step + 1,
-                        global_step=self.global_step
-                    )
-                    
-                    # Log metrics to TensorBoard
                     for key, value in metrics.to_dict().items():
                         self.writer.add_scalar(key, value, self.global_step)
+                
+                # Log metrics to W&B
+                if self.wandb_run is not None and WANDB_AVAILABLE:
+                    wandb_metrics = metrics.to_dict()
+                    wandb_metrics.update({
+                        "train/step": step + 1,
+                        "train/global_step": self.global_step
+                    })
+                    self.wandb_run.log(wandb_metrics, step=self.global_step)
                     
                 if (step + 1) % log_every == 0:
                     n = log_every
@@ -268,6 +286,17 @@ class Distiller:
                         self.writer.add_scalar("train/avg_ce_loss", avg_ce, self.global_step)
                         self.writer.add_scalar("train/elapsed_time", elapsed, self.global_step)
                         self.writer.flush()
+                    
+                    # Log averages to W&B
+                    if self.wandb_run is not None and WANDB_AVAILABLE:
+                        wandb_avg_metrics = {
+                            "train/avg_loss": avg_loss,
+                            "train/avg_kl_loss": avg_kl,
+                            "train/avg_ce_loss": avg_ce,
+                            "train/elapsed_time": elapsed,
+                            "train/steps_per_second": log_every / elapsed
+                        }
+                        self.wandb_run.log(wandb_avg_metrics, step=self.global_step)
                         
                     running = {k: 0.0 for k in running}
         

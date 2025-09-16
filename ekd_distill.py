@@ -17,6 +17,17 @@ from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
 
+# Import W&B utils with fallback
+try:
+    from ekd.logging.wandb_utils import create_training_logger
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    
+    def create_training_logger(*args, **kwargs):
+        """Fallback function when W&B is not available"""
+        return None
+
 
 def load_teacher_with_fallback(
     model_name: str,
@@ -306,16 +317,21 @@ def main():
         persistent_workers=True
     )
 
-    # Initialize TensorBoard writer with experiment name
+    # Initialize logging with experiment name
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
     experiment_name = (
         f"distill-{config.distill_type}-{current_date}_{job_id}"
         + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
     )
+    
+    # Initialize TensorBoard
     tensorboard_path = Path(config.tensorboard_dir) / experiment_name
     print(f"Setting up TensorBoard logging in {tensorboard_path}")
     writer = SummaryWriter(tensorboard_path)
+    
+    # Initialize W&B
+    wandb_logger = create_training_logger(config, experiment_name)
 
     distiller = Distiller(
         teacher_model=teacher,
@@ -326,12 +342,26 @@ def main():
         teacher_device=teacher_inputs_device,
         student_device=student_device,
         writer=writer,  # Pass TensorBoard writer to Distiller
+        wandb_run=wandb_logger.run,  # Pass W&B run to Distiller
     )
 
     distiller.train(epochs=config.epochs)
 
-    # Close TensorBoard writer
+    # Close logging
     writer.close()
+    if wandb_logger.enabled:
+        # Log final model artifacts
+        try:
+            wandb_logger.log_artifact(
+                artifact_path=config.output_dir,
+                name=f"student_model_{experiment_name}",
+                type="model",
+                description=f"Distilled student model ({config.distill_type})"
+            )
+            wandb_logger.finish()
+        except Exception as e:
+            print(f"Error finalizing W&B run: {e}")
+            wandb_logger.finish()
 
     print("Saving student to", config.output_dir)
     student.save_pretrained(config.output_dir)

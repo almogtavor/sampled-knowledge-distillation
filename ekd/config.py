@@ -30,6 +30,9 @@ class TrainingConfig(BaseModel):
     # Output and logging
     output_dir: str
     tensorboard_dir: str = "tb"
+    wandb_project: str = "selective-entropy-knowledge-distillation"
+    wandb_entity: str = "selective-entropy-knowledge-distillation"
+    wandb_enabled: bool = True
     
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")
@@ -69,6 +72,17 @@ class TrainingMetrics(BaseModel):
             "train/kl_loss": self.kl_loss,
             "train/ce_loss": self.ce_loss,
             "train/epoch": self.epoch
+        }
+    
+    def to_wandb_dict(self) -> dict:
+        """Convert to W&B-specific dictionary with additional context."""
+        return {
+            "train/loss": self.loss,
+            "train/kl_loss": self.kl_loss,
+            "train/ce_loss": self.ce_loss,
+            "train/epoch": self.epoch,
+            "train/step": self.step,
+            "train/global_step": self.global_step,
         }
     
     def to_running_dict(self) -> dict:
