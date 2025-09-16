@@ -1,0 +1,186 @@
+\begin{thebibliography}{25}
+\expandafter\ifx\csname natexlab\endcsname\relax\def\natexlab#1{#1}\fi
+
+\bibitem[{Agarwal et~al.(2024)Agarwal, Vieillard, Stanczyk, Ramos, Geist, and
+  Bachem}]{agarwal2024gkd}
+Rishabh Agarwal, Nino Vieillard, Piotr Stanczyk, Sabela Ramos, Matthieu Geist,
+  and Olivier Bachem. 2024.
+\newblock \href {https://arxiv.org/abs/2306.13649} {On-policy distillation of
+  language models: Learning from self-generated mistakes}.
+\newblock \emph{arXiv preprint arXiv:2306.13649}.
+
+\bibitem[{Ando and Zhang(2005)}]{Ando2005}
+Rie~Kubota Ando and Tong Zhang. 2005.
+\newblock \href {https://www.jmlr.org/papers/volume6/ando05a/ando05a.pdf} {A
+  framework for learning predictive structures from multiple tasks and
+  unlabeled data}.
+\newblock \emph{Journal of Machine Learning Research}, 6:1817--1853.
+
+\bibitem[{Andrew and Gao(2007)}]{andrew2007scalable}
+Galen Andrew and Jianfeng Gao. 2007.
+\newblock \href {https://dl.acm.org/doi/abs/10.1145/1273496.1273501} {Scalable
+  training of {$L_1$}-regularized log-linear models}.
+\newblock In \emph{Proceedings of the 24th International Conference on Machine
+  Learning}, pages 33--40.
+
+\bibitem[{Anshumann et~al.(2025)Anshumann, Agarwal, and
+  Bachem}]{anshumann2025sparse}
+Piyush Anshumann, Rishabh Agarwal, and Olivier Bachem. 2025.
+\newblock \href {https://arxiv.org/abs/2503.16870} {Sparse logit sampling:
+  Accelerating knowledge distillation in llms}.
+\newblock \emph{arXiv preprint arXiv:2503.16870}.
+
+\bibitem[{Augenstein et~al.(2016)Augenstein, Rockt{\"a}schel, Vlachos, and
+  Bontcheva}]{augenstein-etal-2016-stance}
+Isabelle Augenstein, Tim Rockt{\"a}schel, Andreas Vlachos, and Kalina
+  Bontcheva. 2016.
+\newblock \href {https://doi.org/10.18653/v1/D16-1084} {Stance detection with
+  bidirectional conditional encoding}.
+\newblock In \emph{Proceedings of the 2016 Conference on Empirical Methods in
+  Natural Language Processing}, pages 876--885, Austin, Texas. Association for
+  Computational Linguistics.
+
+\bibitem[{Boizard et~al.(2024)Boizard, Colombo, Piantanida, and
+  Clavel}]{boizard2024uld}
+Nicolas Boizard, Pierre Colombo, Pablo Piantanida, and Chlo{\'e} Clavel. 2024.
+\newblock \href {https://arxiv.org/abs/2402.12030} {Towards cross-tokenizer
+  distillation: the universal logit distillation loss for llms}.
+\newblock \emph{arXiv preprint arXiv:2402.12030}.
+
+\bibitem[{Cooley and Tukey(1965)}]{ct1965}
+James~W. Cooley and John~W. Tukey. 1965.
+\newblock \href
+  {https://www.ams.org/journals/mcom/1965-19-090/S0025-5718-1965-0178586-1/S0025-5718-1965-0178586-1.pdf}
+  {An algorithm for the machine calculation of complex {F}ourier series}.
+\newblock \emph{Mathematics of Computation}, 19(90):297--301.
+
+\bibitem[{Feng et~al.(2024)Feng, Zhang, Wu, and Zhang}]{feng2024kpod}
+Kaituo Feng, Changsheng Zhang, Ye~Wu, and Guoren Zhang. 2024.
+\newblock \href {https://arxiv.org/abs/2405.16064} {Keypoint-based progressive
+  chain-of-thought distillation for llms}.
+\newblock \emph{arXiv preprint arXiv:2405.16064}.
+
+\bibitem[{Furlanello et~al.(2018)Furlanello, Lipton, Tschannen, Itti, and
+  Anandkumar}]{furlanello2018ban}
+Tommaso Furlanello, Zachary~C. Lipton, Michael Tschannen, Laurent Itti, and
+  Anima Anandkumar. 2018.
+\newblock \href
+  {https://proceedings.mlr.press/v80/furlanello18a/furlanello18a.pdf}
+  {Born-again neural networks}.
+\newblock In \emph{Proceedings of Machine Learning Research}, volume~80, pages
+  1607--1616.
+
+\bibitem[{Goodman et~al.(2016)Goodman, Vlachos, and
+  Naradowsky}]{goodman-etal-2016-noise}
+James Goodman, Andreas Vlachos, and Jason Naradowsky. 2016.
+\newblock \href {https://doi.org/10.18653/v1/P16-1001} {Noise reduction and
+  targeted exploration in imitation learning for {A}bstract {M}eaning
+  {R}epresentation parsing}.
+\newblock In \emph{Proceedings of the 54th Annual Meeting of the Association
+  for Computational Linguistics (Volume 1: Long Papers)}, pages 1--11, Berlin,
+  Germany. Association for Computational Linguistics.
+
+\bibitem[{Gu et~al.(2023)Gu, Dong, Wei, and Huang}]{gu2023minillm}
+Yuxian Gu, Li~Dong, Furu Wei, and Minlie Huang. 2023.
+\newblock \href {https://arxiv.org/abs/2306.08543} {Knowledge distillation of
+  large language models}.
+\newblock \emph{arXiv preprint arXiv:2306.08543}.
+
+\bibitem[{Guo et~al.(2017)Guo, Pleiss, Sun, and
+  Weinberger}]{guo2017calibration}
+Chuan Guo, Geoff Pleiss, Yu~Sun, and Kilian~Q. Weinberger. 2017.
+\newblock \href {https://arxiv.org/abs/1706.04599} {On calibration of modern
+  neural networks}.
+\newblock \emph{arXiv preprint arXiv:1706.04599}.
+
+\bibitem[{Gusfield(1997)}]{Gusfield:97}
+Dan Gusfield. 1997.
+\newblock \href
+  {https://www.cambridge.org/core/books/algorithms-on-strings-trees-and-sequences/F0B095049C7E6EF5356F0A26686C20D3}
+  {\emph{Algorithms on Strings, Trees and Sequences}}.
+\newblock Cambridge University Press, Cambridge, UK.
+
+\bibitem[{Harper(2014)}]{harper-2014-learning}
+Mary Harper. 2014.
+\newblock \href {https://aclanthology.org/C14-1001} {Learning from 26
+  languages: Program management and science in the babel program}.
+\newblock In \emph{Proceedings of {COLING} 2014, the 25th International
+  Conference on Computational Linguistics: Technical Papers}, page~1, Dublin,
+  Ireland. Dublin City University and Association for Computational
+  Linguistics.
+
+\bibitem[{Hinton et~al.(2015)Hinton, Vinyals, and
+  Dean}]{hinton2015distillation}
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. 2015.
+\newblock \href {https://arxiv.org/abs/1503.02531} {Distilling the knowledge in
+  a neural network}.
+\newblock \emph{arXiv preprint arXiv:1503.02531}.
+
+\bibitem[{Kim and Rush(2016)}]{kim2016sequencekd}
+Yoon Kim and Alexander~M. Rush. 2016.
+\newblock \href {https://arxiv.org/abs/1606.07947} {Sequence-level knowledge
+  distillation}.
+\newblock \emph{arXiv preprint arXiv:1606.07947}.
+
+\bibitem[{Liu et~al.(2025{\natexlab{a}})Liu, Chen, Zhang, Liu, Wang, and
+  Peng}]{liu2025tokenlevel}
+Jiahao Liu, Tongxu Chen, Chengming Zhang, Hongwei Liu, Haochen Wang, and
+  Nenghai Peng. 2025{\natexlab{a}}.
+\newblock \href {https://arxiv.org/abs/2503.16511} {Token-level
+  uncertainty-aware objective for language model post-training}.
+\newblock \emph{arXiv preprint arXiv:2503.16511}.
+
+\bibitem[{Liu et~al.(2025{\natexlab{b}})Liu, Qi, Wang, Han, and
+  Chen}]{liu2025srd}
+Ming Liu, Jie Qi, Yicheng Wang, Jiawei Han, and Lei Chen. 2025{\natexlab{b}}.
+\newblock Selective reflection-tuning: Student-selected data recycling for llm
+  instruction-tuning.
+\newblock \emph{arXiv preprint}.
+
+\bibitem[{Raman et~al.(2023)Raman, Vare, Srinivasan, Chandra, and
+  Khandelwal}]{raman2023slim}
+Neeraj Raman, Siddharth Vare, Apurva Srinivasan, Vignesh Chandra, and Kush
+  Khandelwal. 2023.
+\newblock \href {https://openreview.net/pdf?id=2fc5GOPYip} {For distillation,
+  tokens are not all you need}.
+\newblock In \emph{OpenReview}.
+
+\bibitem[{Rasooli and Tetreault(2015)}]{rasooli-tetrault-2015}
+Mohammad~Sadegh Rasooli and Joel~R. Tetreault. 2015.
+\newblock \href {http://arxiv.org/abs/1503.06733} {Yara parser: {A} fast and
+  accurate dependency parser}.
+\newblock \emph{Computing Research Repository}, arXiv:1503.06733.
+\newblock Version 2.
+
+\bibitem[{Sanh et~al.(2019)Sanh, Debut, Chaumond, and
+  Wolf}]{sanh2019distilbert}
+Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf. 2019.
+\newblock \href {https://arxiv.org/abs/1910.01108} {Distilbert, a distilled
+  version of bert: smaller, faster, cheaper and lighter}.
+\newblock \emph{arXiv preprint arXiv:1910.01108}.
+
+\bibitem[{Shum et~al.(2024)Shum, Wang, Chen, and Zheng}]{shum2024first}
+Hubert Shum, Linlin Wang, Jiajun Chen, and Liang Zheng. 2024.
+\newblock On the calibration and trustworthiness of knowledge distillation.
+\newblock \emph{arXiv preprint}.
+
+\bibitem[{Tarvainen and Valpola(2017)}]{tarvainen2017meanteacher}
+Antti Tarvainen and Harri Valpola. 2017.
+\newblock Mean teachers are better role models: Weight-averaged consistency
+  targets improve semi-supervised deep learning results.
+\newblock \emph{Advances in Neural Information Processing Systems}, 30.
+
+\bibitem[{Wang et~al.(2021)Wang, Xu, Zhao, Jia, and Zhou}]{wang2021selectivekd}
+Fusheng Wang, Jianhao Xu, Fandong Zhao, Jianfeng Jia, and Jie Zhou. 2021.
+\newblock \href {https://arxiv.org/abs/2105.12967} {Selective knowledge
+  distillation for neural machine translation}.
+\newblock \emph{arXiv preprint arXiv:2105.12967}.
+
+\bibitem[{Zhang et~al.(2023)Zhang, Agarwal, Babuschkin, and
+  Bachem}]{zhang2023shiftkd}
+Jinghan Zhang, Rishabh Agarwal, Igor Babuschkin, and Olivier Bachem. 2023.
+\newblock \href {https://arxiv.org/abs/2312.16242} {Benchmarking knowledge
+  distillation under distribution shift}.
+\newblock \emph{arXiv preprint arXiv:2312.16242}.
+
+\end{thebibliography}
