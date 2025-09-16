@@ -5,7 +5,7 @@
 # Core dependencies for EKD project
 torch==2.2.2+cu118
 transformers>=4.50.0
-
+python-dotenv
 accelerate
 bitsandbytes==0.43.3
 sentencepiece
@@ -17,7 +17,7 @@ pydantic>=2.11.5
 numpy<2
 hf_transfer
 tensorboard
-
+wandb
 
 
 datasets==3.6.0

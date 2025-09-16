@@ -10,21 +10,40 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from dotenv import load_dotenv
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+load_dotenv()
+# Optional logging imports
+try:
+    import wandb
+    wandb.login(key=os.getenv("WANDB_API_KEY"))
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
+
 # ---------- Utility ----------
 
-def run(cmd: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None) -> Tuple[int, str]:
+def run(cmd: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str]:
     print(f"\n$ {' '.join(cmd)}")
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True, timeout=timeout)
         print(out)
         return 0, out
     except subprocess.CalledProcessError as e:
         print(e.output)
         return e.returncode, e.output
+    except subprocess.TimeoutExpired as e:
+        print(f"Command timed out after {timeout} seconds: {e}")
+        return 124, f"Timeout after {timeout} seconds"
 
 def find_latest_checkpoint(dir_path: Path) -> Optional[Path]:
     if not dir_path.exists():
@@ -79,48 +98,78 @@ def which(bin_name: str) -> bool:
 # ---------- LM-Eval (reasoning/QA/IF-Eval) ----------
 
 LMEVAL_TASKS = [
-    # grade-school + math
-    "gsm8k", "svamp", "asdiv", "hendrycks_math",
-    # advanced reasoning
-    "gpqa",       # if your install expects gpqa_diamond or gpqa_main, the script retries
-    "bbh",        # group of BBH tasks
-    "agieval",    # group of AGIEval tasks
-    # QA
-    "squadv2", "nq_open", "hotpotqa",
-    # Instruction following (IFEval lives in an optional extra)
-    "ifeval",
+    # # grade-school + math
+    # "gsm8k", "svamp", "asdiv", "hendrycks_math",
+    # # advanced reasoning
+    # "gpqa",       # if your install expects gpqa_diamond or gpqa_main, the script retries
+    # "bbh",        # group of BBH tasks
+    # "agieval",    # group of AGIEval tasks
+    # # QA
+    # "squadv2", "nq_open", "hotpotqa",
+    # # Instruction following (IFEval lives in an optional extra)
+    # "ifeval",
+
+    # Common sense reasoning (fast)
+    "hellaswag", "winogrande", 
+    # Knowledge and reasoning (medium)
+    "arc_easy", "arc_challenge",
+    # Math reasoning (slow)
+    "gsm8k",
+    # Reading comprehension (very slow)
+    "mmlu",
 ]
 
-def run_lmeval(model_dir: Path, tag: str, results_dir: Path, device: str) -> Optional[Path]:
+# Fast subset for initial evaluation
+LMEVAL_FAST_TASKS = [
+    "hellaswag", "winogrande", "arc_easy"
+]
+
+def run_lmeval(model_dir: Path, tag: str, results_dir: Path, device: str, fast_mode: bool = True) -> Optional[Path]:
     out_dir = results_dir / f"lmeval_{tag}"
     ensure_dir(out_dir)
 
-    # Build final task list but tolerate missing names by probing
-    tasks_to_try = list(LMEVAL_TASKS)
-    # First attempt: run all at once
+    # Choose task set based on mode
+    tasks_to_try = list(LMEVAL_FAST_TASKS if fast_mode else LMEVAL_TASKS)
+    print(f"Running {'fast' if fast_mode else 'full'} evaluation with tasks: {tasks_to_try}")
+    
+    # Use smaller, fixed batch size for stability
     base_args = [
         "lm-eval",
         "--model", "hf",
         "--model_args", f"pretrained={model_dir},trust_remote_code=True",
         "--device", device,
-        "--batch_size", "auto",
+        "--batch_size", "4",  # Fixed small batch size instead of auto
         "--output_path", str(out_dir),
         "--log_samples",
     ]
 
-    # Try in one go
-    code, _ = run(base_args + ["--tasks", ",".join(tasks_to_try)])
-    if code == 0:
-        # LM-Eval writes results.json inside out_dir/<model_name>/*
-        # We'll just return the top folder; aggregator will find jsons.
-        return out_dir
-
-    # If a group name fails (varies across versions), fall back to per-task runs
+    # Run tasks individually to avoid hanging on problematic tasks
     good_any = False
-    for t in tasks_to_try:
-        code_t, _ = run(base_args + ["--tasks", t])
-        if code_t == 0:
-            good_any = True
+    task_timeouts = {
+        "hellaswag": 600,      # 10 minutes
+        "winogrande": 300,     # 5 minutes
+        "arc_easy": 600,       # 10 minutes
+        "arc_challenge": 900,  # 15 minutes
+        "gsm8k": 1800,         # 30 minutes
+        "mmlu": 3600,          # 60 minutes
+    }
+    
+    for task in tasks_to_try:
+        timeout = task_timeouts.get(task, 1200)  # Default 20 minutes
+        print(f"Running task: {task} (timeout: {timeout}s)")
+        try:
+            code_t, output = run(base_args + ["--tasks", task], timeout=timeout)
+            if code_t == 0:
+                good_any = True
+                print(f"✅ Task {task} completed successfully")
+            elif code_t == 124:  # Timeout
+                print(f"⏰ Task {task} timed out after {timeout} seconds")
+            else:
+                print(f"❌ Task {task} failed with code {code_t}")
+        except Exception as e:
+            print(f"❌ Task {task} failed with exception: {e}")
+            continue
+    
     return out_dir if good_any else None
 
 # ---------- Lighteval (summarization) ----------
@@ -326,6 +375,51 @@ def merge_model_results(per_source: List[Dict[str, Dict[str, float]]]) -> Dict[s
                 merged[task][mk] = mv
     return merged
 
+def log_to_wandb(tag: str, merged_metrics: Dict[str, Dict[str, float]], project: str = "ekd-evaluation") -> None:
+    """Log evaluation metrics to Weights & Biases."""
+    if not WANDB_AVAILABLE:
+        print("W&B not available, skipping wandb logging")
+        return
+    
+    try:
+        wandb.init(project=project, name=f"eval-{tag}", reinit=True)
+        
+        # Flatten metrics for W&B
+        wandb_metrics = {}
+        for task, metrics in merged_metrics.items():
+            for metric, val in metrics.items():
+                wandb_metrics[f"{task}/{metric}"] = val
+        
+        wandb.log(wandb_metrics)
+        wandb.finish()
+        print(f"✓ Logged {len(wandb_metrics)} metrics to W&B project '{project}'")
+    except Exception as e:
+        print(f"Failed to log to W&B: {e}")
+
+def log_to_tensorboard(tag: str, merged_metrics: Dict[str, Dict[str, float]], log_dir: str = "tb_logs") -> None:
+    """Log evaluation metrics to TensorBoard."""
+    if not TENSORBOARD_AVAILABLE:
+        print("TensorBoard not available, skipping tensorboard logging")
+        return
+    
+    try:
+        tb_path = Path(log_dir) / tag
+        tb_path.mkdir(parents=True, exist_ok=True)
+        
+        writer = SummaryWriter(log_dir=str(tb_path))
+        
+        # Log each metric as a scalar
+        metric_count = 0
+        for task, metrics in merged_metrics.items():
+            for metric, val in metrics.items():
+                writer.add_scalar(f"{task}/{metric}", val)
+                metric_count += 1
+        
+        writer.close()
+        print(f"✓ Logged {metric_count} metrics to TensorBoard at {tb_path}")
+    except Exception as e:
+        print(f"Failed to log to TensorBoard: {e}")
+
 def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]) -> None:
     # Collect union of metric names
     all_metrics = sorted({m for model in all_models_metrics.values() for task in model.values() for m in task.keys()})
@@ -373,6 +467,11 @@ def main():
     # Optional: evaluate a single tag+checkpoint instead of both latest
     parser.add_argument("--tag", type=str, choices=["vanilla", "ekd"], help="Evaluate only this run type (vanilla or ekd).")
     parser.add_argument("--checkpoint_path", type=str, help="Path to a specific checkpoint .pt to evaluate (used with --tag).")
+    # Logging configuration
+    parser.add_argument("--wandb_project", type=str, default="ekd-evaluation", help="W&B project name for logging.")
+    parser.add_argument("--disable_wandb", action="store_true", help="Disable W&B logging.")
+    parser.add_argument("--disable_tensorboard", action="store_true", help="Disable TensorBoard logging.")
+    parser.add_argument("--fast_eval", action="store_true", help="Use fast evaluation (subset of tasks) to avoid hanging.")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
@@ -414,7 +513,7 @@ def main():
         print(f"\n=== Running benchmarks for {tag} ===")
 
         # LM-Eval
-        lmeval_root = run_lmeval(model_dir, tag, results_dir, args.device)
+        lmeval_root = run_lmeval(model_dir, tag, results_dir, args.device, fast_mode=args.fast_eval)
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
 
         # Lighteval summarization
@@ -446,6 +545,13 @@ def main():
             hb_metrics
         ])
         all_models_metrics[tag] = merged
+
+        # Log to W&B and TensorBoard
+        print(f"\n=== Logging metrics for {tag} ===")
+        if not args.disable_wandb:
+            log_to_wandb(tag, merged, project=args.wandb_project)
+        if not args.disable_tensorboard:
+            log_to_tensorboard(tag, merged, log_dir=str(work_dir / "tb_logs"))
 
     # Print LaTeX
     print_latex_table(all_models_metrics)

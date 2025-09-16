@@ -12,14 +12,16 @@
 
 set -euo pipefail
 
-# Usage: sbatch evals.slurm <vanilla|ekd> <checkpoint_filename.pt> [base_model_dir]
+# Usage: sbatch evals.slurm <vanilla|ekd> <checkpoint_filename.pt> [base_model_dir] [fast]
 # Example: sbatch evals.slurm ekd checkpoint_epoch1_step4527.pt Qwen/Qwen2-0.5B
+# Fast mode: sbatch evals.slurm ekd checkpoint_epoch1_step4527.pt Qwen/Qwen2-0.5B fast
 
 cd /home/joberant/NLP_2425b/$USER/ekd
 
 RUN_TAG=${1:-}
 CKPT_FILE=${2:-}
 BASE_MODEL_DIR=${3:-"Qwen/Qwen3-0.6B"}
+FAST_MODE=${4:-}
 
 if [[ -z "$RUN_TAG" || -z "$CKPT_FILE" ]]; then
 	echo "Error: missing args. Usage: sbatch evals.slurm <vanilla|ekd> <checkpoint_filename.pt> [base_model_dir]"
@@ -60,15 +62,17 @@ python -c "import torch; print('CUDA?', torch.cuda.is_available())"
 
 # Ensure dependencies for evaluation are present (best-effort)
 echo "Installing evaluation dependencies..."
-pip install lm-eval lighteval evalplus --quiet || echo "Some eval packages failed to install, continuing anyway"
+pip install lm-eval lighteval evalplus wandb tensorboard --quiet || echo "Some eval packages failed to install, continuing anyway"
+
+# Build evaluation command with optional fast mode
+EVAL_ARGS="--base_model_dir $BASE_MODEL_DIR --device cuda:0 --work_dir eval_runs --tag $RUN_TAG --checkpoint_path $CKPT_PATH"
+if [[ "$FAST_MODE" == "fast" ]]; then
+    EVAL_ARGS="$EVAL_ARGS --fast_eval"
+    echo "Running FAST evaluation mode (subset of tasks)"
+fi
 
 # Run evaluation for the single checkpoint
-srun -u python ekd/evaluations/eval.py \
-	--base_model_dir "$BASE_MODEL_DIR" \
-	--device cuda:0 \
-	--work_dir eval_runs \
-	--tag "$RUN_TAG" \
-	--checkpoint_path "$CKPT_PATH" | tee "eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.log"
+srun -u python ekd/evaluations/eval.py $EVAL_ARGS | tee "eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.log"
 
 # Extract LaTeX table to a separate file if present in log
 awk '/\\begin{table}/, /\\end{table}/' "eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.log" > "eval_runs/${RUN_TAG}.table.${SLURM_JOB_ID}.tex" || true
