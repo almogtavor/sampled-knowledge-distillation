@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn.functional as F
 from torch import device
@@ -101,71 +102,109 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
+    @staticmethod
+    def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
+        # cast to fp32 for stability, clamp, and replace NaN/Inf
+        x = x.float()
+        x = torch.clamp(x, min=-1e4, max=1e4)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+        if not torch.isfinite(x).all():
+            print(f"[warn] non-finite after sanitize in {name}")
+        return x
+    
     def _forward_batch(self, batch):
-        # A 2D integer tensor of shape [batch_size, seq_len]
-        input_ids_teacher = batch["input_ids"].to(self.teacher_device)
-        # A 2D binary (0/1) tensor of shape [batch_size, seq_len]. 1 for real tokens, 0 for padding tokens
-        attention_teacher = batch["attention_mask"].to(self.teacher_device)
+        # Move inputs
+        input_ids = batch["input_ids"]
+        attn_mask = batch["attention_mask"]
+        input_ids_t = input_ids.to(self.teacher_device)
+        attn_t = attn_mask.to(self.teacher_device)
+        input_ids_s = input_ids.to(self.student_device)
+        attn_s = attn_mask.to(self.student_device)
 
-        input_ids_student = batch["input_ids"].to(self.student_device)
-        attention_student = batch["attention_mask"].to(self.student_device)
+        T = 2.0  # distillation temperature; feel free to move to config
+        T2 = T * T
 
+        # ---- teacher ----
         with torch.no_grad():
-            t_out = self.teacher(input_ids_teacher, attention_mask=attention_teacher, output_hidden_states=False)
-            t_logits = t_out.logits  # [B, L, V]
-            t_log_probs = torch.log_softmax(t_logits, dim=-1)
-            ent = token_entropy(t_logits)  # [B, L]
+            t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
+            t_logits = self._sanitize_logits(t_logits, "teacher")
 
-        s_out = self.student(input_ids_student, attention_mask=attention_student)
-        s_logits = s_out.logits
-        s_log_probs = torch.log_softmax(s_logits, dim=-1)
+        # ---- student ----
+        s_logits = self.student(input_ids_s, attention_mask=attn_s).logits
+        s_logits = self._sanitize_logits(s_logits, "student")
 
+        # Align to next-token prediction
+        t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
+        s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
+        valid_next = attn_s[:, 1:].bool()  # [B, L-1]
+
+        # Softened log-probs for KD
+        t_lp = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+        s_lp = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
+
+        # KL per position (sum over vocab → [B, L-1])
+        kl_pos = self._kl_loss(t_lp.to(self.student_device), s_lp)
+
+        # --- KD loss ---
         if self.config.distill_type == "vanilla":
-            kl = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L]
-            kd_loss = kl.mean()
-        else:  # EKD
-            # mask top-k% entropy tokens per example
-            kd_losses = []
-            for i in range(ent.size(0)):
-                seq_ent = ent[i].float()  # Ensure float dtype for quantile
-                # Gives the entropy value at the top k-th percentile
-                threshold = torch.quantile(seq_ent, 1 - self.config.top_k_percent / 100.0)
-                mask = seq_ent >= threshold  # high-entropy positions (fork tokens)
-                kl_i = self._kl_loss(t_log_probs[i].to(self.student_device), s_log_probs[i])  # [L]
-                if mask.any():
-                    mask_student = mask.to(self.student_device)  # Move mask to student device
-                    kd_losses.append(kl_i[mask_student].mean())
-            
-            # Handle case where no high-entropy tokens are found in the entire batch
-            if len(kd_losses) > 0:
-                kd_loss = torch.stack(kd_losses).mean()
+            denom = valid_next.sum().clamp(min=1)
+            kd_loss = (kl_pos * valid_next).sum() / denom
+        else:
+            # EKD: top-k% entropy among valid positions only
+            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+            kd_terms = []
+            Bsz = kl_pos.size(0)
+            for i in range(Bsz):
+                vi = valid_next[i]
+                if vi.sum() < 2:
+                    continue
+                ent_valid = ent[i][vi]
+                thr = torch.quantile(ent_valid.float(), 1 - self.config.top_k_percent / 100.0)
+                keep = torch.zeros_like(vi)
+                keep[vi] = ent_valid >= thr
+                if keep.any():
+                    kd_terms.append(kl_pos[i][keep].mean())
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
             else:
-                # Fall back to vanilla KL divergence if no high-entropy tokens found
-                kl = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L]
-                kd_loss = kl.mean()
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
 
-        # Adds a token-level CE term that tries to predict the ground-truth token IDs.
-        # Flattens (B, L, V) -> (B*L, V) and (B, L) -> (B*L). Ignores pad tokens using the tokenizer’s pad id.
-        # Shift for next-token prediction: logits at position t predict token t+1
-        logits = s_logits[:, :-1, :] # predict tokens 1..L-1
-        targets = input_ids_student[:, 1:]  # gold tokens 1..L-1
-        mask = attention_student[:, 1:]  # ignore pads
+        # Multiply by T^2 as in standard distillation
+        kd_loss = kd_loss * T2
 
-        # mask pads with -100 (ignore_index)
-        targets = targets.masked_fill(mask == 0, -100)
-        
-        V = s_logits.size(-1)
-        ce_loss = F.cross_entropy(
-            logits.contiguous().view(-1, V),
-            targets.contiguous().view(-1),
-            ignore_index=-100
-        )
-        loss = kd_loss + self.alpha_ce * ce_loss
-        return loss, kd_loss.item(), ce_loss.item()
+        # --- CE loss (only valid targets) ---
+        logits = s_pred                      # [B, L-1, V]
+        targets = input_ids_s[:, 1:]         # [B, L-1]
+        targets = targets.masked_fill(~valid_next, -100)
+
+        V = logits.size(-1)
+        flat_logits = logits.reshape(-1, V)
+        flat_targets = targets.reshape(-1)
+        keep = flat_targets.ne(-100)
+
+        if keep.any():
+            ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
+        else:
+            ce_loss = flat_logits.sum() * 0.0
+
+        # Final loss
+        total = kd_loss + self.alpha_ce * ce_loss
+
+        # Last line of defense: skip bad batch
+        if (not torch.isfinite(total)) or (not torch.isfinite(kd_loss)) or (not torch.isfinite(ce_loss)):
+            print("[warn] skipping batch due to non-finite loss "
+                f"(total={total.item()}, kd={kd_loss.item()}, ce={ce_loss.item()})")
+            # Return a tiny zero-like loss with grad so autograd graph stays valid
+            zero = (flat_logits.sum() * 0.0) + (flat_targets[keep][:0].sum() * 0.0)
+            return zero + zero, 0.0, 0.0
+
+        return total, kd_loss.item(), ce_loss.item()
 
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
         for epoch in range(epochs):
+            step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
             self.opt.zero_grad()  # Initialize gradients
             
@@ -214,9 +253,12 @@ class Distiller:
                     avg_kl = running['kl'] / n
                     avg_ce = running['ce'] / n
                     
+                    elapsed = time.time() - step_start 
+                    step_start = time.time()
                     print(
-                        f"ep{epoch + 1} step{step + 1} | loss={avg_loss:.4f} "
-                        f"kl={avg_kl:.4f} ce={avg_ce:.4f} | global_step={self.global_step}"
+                        f"ep{epoch + 1} step{step + 1} | "
+                        f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
+                        f"| global_step={self.global_step} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
                     )
                     
                     # Log averages to TensorBoard
@@ -224,6 +266,7 @@ class Distiller:
                         self.writer.add_scalar("train/avg_loss", avg_loss, self.global_step)
                         self.writer.add_scalar("train/avg_kl_loss", avg_kl, self.global_step)
                         self.writer.add_scalar("train/avg_ce_loss", avg_ce, self.global_step)
+                        self.writer.add_scalar("train/elapsed_time", elapsed, self.global_step)
                         self.writer.flush()
                         
                     running = {k: 0.0 for k in running}
