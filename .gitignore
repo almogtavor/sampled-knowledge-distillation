@@ -195,3 +195,17 @@ cython_debug/
 .idea
 .latex_out
 kd_vanilla_run
+
+# LaTeX generated files
+written/*.aux
+written/*.bbl
+written/*.blg
+written/*.log
+written/*.out
+written/*.pdf
+written/*.fls
+written/*.fdb_latexmk
+written/*.synctex.gz
+written/*.toc
+written/*.lof
+written/*.lot

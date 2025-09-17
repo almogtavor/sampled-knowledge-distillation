@@ -92,9 +92,45 @@ nvidia-smi
 3. **Monitor**: `tail -f $(ls -t logs/train.*.log | head -1)`
 4. **View metrics**: http://localhost:6006
 
+## 🧪 Model Evaluation
+
+### Submit evaluation job:
+```bash
+./submit_eval.sh ekd <CHECKPOINT_NAME>
+```
+
+**Examples:**
+```bash
+# Evaluate specific checkpoint
+./submit_eval.sh ekd checkpoint_epoch1_step4527.pt
+
+# Evaluate final model (model.safetensors)
+./submit_eval.sh ekd model.safetensors
+```
+
+### Monitor evaluation:
+```bash
+# Check job status
+squeue -u YOUR_USER
+
+# View evaluation logs
+tail -f logs/eval.<jobid>.log
+```
+
+### Available checkpoints:
+- Check saved checkpoints: `ls -la kd_ekd_run_out_model/checkpoints/`
+- Final trained model: `kd_ekd_run_out_model/model.safetensors`
+
+### Evaluation details:
+- **Benchmarks**: LM-Eval, Lighteval, EvalPlus, AlpacaEval
+- **GPU allocation**: Automatic fallback (3→2→1 GPUs as available)
+- **Cache management**: Handled via SLURM environment variables
+- **Results**: Logged to W&B and TensorBoard
+
 ## 📁 Output Locations
 
 - **EKD model**: `/home/joberant/NLP_2425b/YOUR_USER/kd_ekd_run_out_model`
 - **Vanilla model**: `/home/joberant/NLP_2425b/YOUR_USER/kd_vanilla_run_out_model`
 - **TensorBoard logs**: `tb/ekd_experiment/` or `tb/vanilla_experiment/`
 - **Training logs**: `logs/train.<jobid>.log`
+- **Evaluation logs**: `logs/eval.<jobid>.log`

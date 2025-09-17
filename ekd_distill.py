@@ -6,7 +6,6 @@ from typing import List, Tuple, Optional
 
 import torch
 from transformers.utils import is_torch_cuda_available
-from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
@@ -16,6 +15,12 @@ from ekd.models.ollama_loader import OllamaModel
 from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
+
+# Import logging utils with fallback
+try:
+    from ekd.logging.wandb_utils import create_training_combined_logger
+except ImportError:
+    create_training_combined_logger = lambda *args, **kwargs: None
 
 
 def load_teacher_with_fallback(
@@ -75,18 +80,18 @@ def load_teacher_with_fallback(
         else:
             print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
 
-    # ===== 2) Two-GPU sharding with Accelerate =====
+    # ===== 2) Multi-GPU sharding with Accelerate =====
     if len(teacher_gpus) >= 2:
         try:
-            g0, g1 = teacher_gpus[0], teacher_gpus[1]
-            print(f"[teacher] Trying 2-GPU sharding on cuda:{g0},{g1}", flush=True)
+            print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
 
             cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             with init_empty_weights():
                 empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
 
-            # Keep GPU memory budgets just under 12GiB
-            max_memory = {g0: "11GiB", g1: "11GiB", "cpu": "40GiB"}
+            # Use all teacher_gpus with per-GPU caps
+            max_memory = {g: "11GiB" for g in teacher_gpus}
+            max_memory["cpu"] = "40GiB"
 
             teacher = load_checkpoint_and_dispatch(
                 empty_model,
@@ -100,23 +105,23 @@ def load_teacher_with_fallback(
             for p in teacher.parameters():
                 p.requires_grad_(False)
 
-            print(f"[teacher] 2-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
-            # For model-parallel HF models, feeding inputs on the first GPU is fine:
-            return teacher, tok, torch.device(f"cuda:{g0}")
+            print(f"[teacher] Multi-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
+            # For model-parallel HF models, feeding inputs on the first teacher GPU is fine:
+            return teacher, tok, torch.device(f"cuda:{teacher_gpus[0]}")
         except RuntimeError as e:
             if "out of memory" not in str(e).lower():
-                print(f"[teacher] 2-GPU load failed (non-OOM): {e}", flush=True)
+                print(f"[teacher] Multi-GPU load failed (non-OOM): {e}", flush=True)
             else:
-                print("[teacher] 2-GPU OOM, trying quantization...", flush=True)
+                print("[teacher] Multi-GPU OOM, falling back to quantization (you should always start with no quantization or FP16!)...", flush=True)
         except Exception as e:
-            print(f"[teacher] 2-GPU dispatch error: {e}", flush=True)
+            print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
 
     # ===== 3) 8-bit quantization on single GPU =====
     try:
         from transformers import BitsAndBytesConfig
         q8 = BitsAndBytesConfig(load_in_8bit=True)
         one = teacher_gpus[0]
-        print(f"[teacher] Trying 8-bit on cuda:{one}", flush=True)
+        print(f"[teacher] Trying 8-bit quantization fallback on cuda:{one}", flush=True)
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map={"": one},
@@ -142,7 +147,7 @@ def load_teacher_with_fallback(
             bnb_4bit_use_double_quant=True,
         )
         one = teacher_gpus[0]
-        print(f"[teacher] Trying 4-bit on cuda:{one}", flush=True)
+        print(f"[teacher] Trying 4-bit quantization (last resort) on cuda:{one}", flush=True)
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map={"": one},
@@ -153,7 +158,7 @@ def load_teacher_with_fallback(
         teacher.eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
-        print("[teacher] Loaded 4-bit.", flush=True)
+        print("[teacher] Loaded with 4-bit quantization (last resort).", flush=True)
         return teacher, tok, torch.device(f"cuda:{one}")
     except Exception as e:
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
@@ -164,8 +169,6 @@ def parse_args_to_config() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Entropy-guided KD for LLMs")
     parser.add_argument("--teacher_model", required=True)
     parser.add_argument("--student_model", required=True)
-    parser.add_argument("--teacher_quant_bits", type=int, choices=[4, 8], default=None,
-                        help="Load teacher in 4-bit or 8-bit to reduce VRAM usage")
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
     parser.add_argument("--distill_type", choices=["vanilla", "ekd"], default="vanilla")
@@ -207,6 +210,11 @@ def main():
     # Set CUDA memory management settings for better memory efficiency
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # Clear any cached memory
+        
+    # Speed optimizations (safe)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     # ----------------- teacher / student device planning -----------------
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -220,13 +228,17 @@ def main():
         total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
     print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
 
-    # Reserve GPU 1 for the student (as before):
-    student_gpu = 1 if device_count >= 2 else 0
+    # Dynamic GPU allocation based on CUDA_VISIBLE_DEVICES
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    avail = [int(x) for x in visible.split(",")] if visible else list(range(device_count))
+    student_gpu = avail[1] if len(avail) >= 2 else avail[0]
     student_device = torch.device(f"cuda:{student_gpu}")
-
-    # Prefer these GPUs for the teacher (exclude student later inside the function)
-    # Example: if you have GPUs 0,2,3,4 allocated, keep that list in order of free mem.
-    prefer_for_teacher = [0, 2, 3, 4][:max(1, device_count)]
+    prefer_for_teacher = [g for g in avail if g != student_gpu]
+    
+    print(f"CUDA_VISIBLE_DEVICES: {visible}")
+    print(f"Available GPUs: {avail}")
+    print(f"Student GPU: {student_gpu}")
+    print(f"Teacher GPUs: {prefer_for_teacher}")
 
     print("Loading teacher with GPU-first fallback...", flush=True)
     teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
@@ -265,7 +277,7 @@ def main():
     print(f"Student device: {student_device}")
     
     if student_device.type == "cuda":
-        print(f"Using GPU: {torch.cuda.get_device_name(student_device)} (device {torch.cuda.current_device()})")
+        print(f"Using GPU: {torch.cuda.get_device_name(student_device.index)} (device {student_device.index})")
         print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
         print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
     else:
@@ -293,16 +305,24 @@ def main():
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        collate_fn=collate
+        collate_fn=collate,
+        num_workers=min(8, os.cpu_count() or 1),
+        pin_memory=True,
+        persistent_workers=True
     )
 
-    # Initialize TensorBoard writer with experiment name
+    # Initialize logging with experiment name
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    tensorboard_path = Path(config.tensorboard_dir) / experiment_name
-    print(f"Setting up TensorBoard logging in {tensorboard_path}")
-    writer = SummaryWriter(tensorboard_path)
+    experiment_name = (
+        f"distill-{config.distill_type}-{current_date}_{job_id}"
+        + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
+    )
+    
+    # Initialize combined logger (W&B + TensorBoard)
+    combined_logger = create_training_combined_logger(
+        config, experiment_name, tensorboard_dir=config.tensorboard_dir
+    )
 
     distiller = Distiller(
         teacher_model=teacher,
@@ -310,15 +330,20 @@ def main():
         tokenizer=tok,
         dataloader=dl,
         config=config,  # Pass the entire config instead of individual args
-        teacher_device=teacher_inputs_device,  # IMPORTANT: inputs for teacher go here
+        teacher_device=teacher_inputs_device,
         student_device=student_device,
-        writer=writer,  # Pass TensorBoard writer to Distiller
+        logger=combined_logger,  # Use new combined logger
     )
 
     distiller.train(epochs=config.epochs)
 
-    # Close TensorBoard writer
-    writer.close()
+    # Close logging  
+    if combined_logger:
+        try:
+            combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
+            combined_logger.finish()
+        except Exception:
+            pass
 
     print("Saving student to", config.output_dir)
     student.save_pretrained(config.output_dir)

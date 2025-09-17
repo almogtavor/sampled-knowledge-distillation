@@ -68,20 +68,50 @@
 
 \begin{document}
 \maketitle
+\let\thefootnote\relax\footnotetext{* Equal contribution.}
 \begin{abstract}
-This document is a supplement to the general instructions for *ACL authors. It contains instructions for using the \LaTeX{} style file for ACL 2023.
-The document itself conforms to its own specifications, and is, therefore, an example of what your manuscript should look like.
-These instructions should be used both for papers submitted for review and for final versions of accepted papers.
+Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to auto-regressive models. We propose Entropy Knowledge Distillation (EKD), a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. EKD enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
 \end{abstract}
 
 \section{Introduction}
 
-These instructions are for authors submitting papers to ACL 2023 using \LaTeX. They are not self-contained. All authors must follow the general instructions for *ACL proceedings,\footnote{\url{http://acl-org.github.io/ACLPUB/formatting.html}} as well as guidelines set forth in the ACL 2023 call for papers.\footnote{\url{https://2023.aclweb.org/calls/main_conference/}} This document contains additional instructions for the \LaTeX{} style files.
-The templates include the \LaTeX{} source of this document (\texttt{acl2023.tex}),
-the \LaTeX{} style file used to format it (\texttt{acl2023.sty}),
-an ACL bibliography style (\texttt{acl\_natbib.bst}),
-an example bibliography (\texttt{custom.bib}),
-and the bibliography for the ACL Anthology (\texttt{anthology.bib}).
+Large language models (LLMs) deliver state-of-the-art performance but are costly to serve and adapt. Knowledge distillation (KD) amortizes these costs by training a compact student to imitate a larger teacher \citep{hinton2015distillation}. While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to auto-regressive LLMs raises two persistent obstacles: (i) \textbf{train-inference mismatch} in sequence generation, and (ii) \textbf{efficiency limits} from storing or querying full teacher logits.
+
+To address (i), recent work proposes \emph{on-policy} distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd}. To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}. Storing more logits improves quality but erodes the efficiency goal.
+
+We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs. Our thesis is that the KD budget should be spent \emph{selectively at the token level} (where the teacher can add the most information) while keeping \emph{unbiased} class-level supervision when it is applied. Concretely, we:
+
+\begin{itemize}
+\item introduce \textbf{token-selective distillation}: choose a subset of tokens for KD using scores such as teacher entropy, teacher-student KL, and student CE;
+\item estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD}—importance-sampling teacher classes and reweighting—so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
+\item maintain standard cross-entropy (CE) on \emph{all} tokens to stabilize training and calibration \citep{guo2017calibration}; and
+\item add simple curricula (increasing KD coverage over time) and optional EMA-based self-distillation for robustness.
+\end{itemize}
+
+Empirically, we compare against (a) full Random-Sampling KD at every token, (b) deterministic top-$K$ logit truncation baselines including SLIM-style sparse logits \citep{raman2023slim}, and (c) token/data selection schemes such as GLS for NMT \citep{wang2021selectivekd}, token-level uncertainty-aware post-training \citep{liu2025tokenlevel}, and progressive chain-of-thought distillation \citep{feng2024kpod}. We evaluate both in-distribution and under distribution shift using the ShiftKD protocol \citep{zhang2023shiftkd}. Our results indicate that token-selective, \emph{unbiased} KD attains a stronger accuracy-efficiency Pareto frontier while preserving calibration.
+
+\paragraph{Contributions.} (1) A unified framework for \emph{token-level} selection with \emph{unbiased} class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
+
+\section{Related Work}
+
+\paragraph{KD for LLMs.} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
+
+\paragraph{Sparse logit KD and calibration.} Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide \emph{unbiased} estimates that match full-KD gradients in expectation with minimal overhead. Trustworthy distillation explicitly studies calibration and proposes processing the top-$k$ teacher tokens to reduce miscalibration \citep{shum2024first}. We measure calibration via Expected Calibration Error (ECE) \citep{guo2017calibration}.
+
+\paragraph{Selecting where to supervise.} Beyond “how” to form the target, several works decide “where” to apply supervision. In NMT, \citet{wang2021selectivekd} select \emph{words} by cross-entropy using batch-level and global (FIFO) queues (GLS). For post-training, token-level uncertainty-aware objectives select \emph{tokens} by loss/entropy and add self-distillation to prevent OOD overfitting \citep{liu2025tokenlevel}. In reasoning, KPOD learns keypoint weights and a progressive schedule within chain-of-thought rationales \citep{feng2024kpod}. Data-centric selection via Selective Reflection Distillation curates training instances with a curriculum \citep{liu2025srd}. Our work differs by coupling \emph{token-level} selection with \emph{unbiased} logit sampling at selected positions, yielding efficiency without the calibration drawbacks of deterministic truncation.
+
+\paragraph{Self-distillation and EMA teachers.} Self-distillation regularizes students via a teacher derived from the student itself, e.g., Born-Again Networks \citep{furlanello2018ban} and Mean Teacher (EMA) consistency \citep{tarvainen2017meanteacher}. We adopt an optional EMA self-distill term as a light regularizer complementary to external-teacher KD.
+
+\paragraph{Evaluation under shift.} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
+
+\paragraph{Summary.} Prior work either improves the \emph{where} (token/word/sample selection, curricula) \emph{or} the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
+
+% --------------------------
+% Suggested BibTeX keys (map to your .bib)
+% hinton2015distillation, sanh2019distilbert, kim2016sequencekd, gu2023minillm,
+% agarwal2024gkd, boizard2024uld, raman2023slim, anshumann2025sparse,
+% shum2024first, guo2017calibration, wang2021selectivekd, liu2025tokenlevel,
+% feng2024kpod, liu2025srd, furlanello2018ban, tarvainen2017meanteacher, zhang2023shiftkd
 
 \section{Engines}
 

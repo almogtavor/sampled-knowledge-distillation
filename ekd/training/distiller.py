@@ -34,7 +34,7 @@ class Distiller:
             config: TrainingConfig,
             teacher_device: device = "cuda",
             student_device: device = "cuda",
-            writer=None,  # TensorBoard writer
+            logger=None,  # Combined logger for W&B + TensorBoard
     ):
         self.teacher = teacher_model.eval()  # frozen
         # self.teacher = teacher_model # todo: is it okay not to use the frozen? sounds like it should be frozen
@@ -46,8 +46,10 @@ class Distiller:
         self.opt = AdamW(self.student.parameters(), lr=config.lr)
         self.teacher_device = teacher_device
         self.student_device = student_device
-        self.writer = writer
-        self.global_step = 0  # For TensorBoard logging
+        
+        # Logging setup
+        self.logger = logger
+        self.global_step = 0
         
         # Checkpointing
         self.output_dir = Path(config.output_dir)
@@ -232,20 +234,20 @@ class Distiller:
                 running["kl"] += kl_val
                 running["ce"] += ce_val
                 
-                # TensorBoard logging every step using TrainingMetrics
-                if self.writer is not None:
-                    metrics = TrainingMetrics(
-                        loss=loss.item() * self.config.gradient_accumulation_steps,
-                        kl_loss=kl_val,
-                        ce_loss=ce_val,
-                        epoch=epoch + 1,
-                        step=step + 1,
-                        global_step=self.global_step
-                    )
-                    
-                    # Log metrics to TensorBoard
-                    for key, value in metrics.to_dict().items():
-                        self.writer.add_scalar(key, value, self.global_step)
+                # Logging every step using TrainingMetrics
+                metrics = TrainingMetrics(
+                    loss=loss.item() * self.config.gradient_accumulation_steps,
+                    kl_loss=kl_val,
+                    ce_loss=ce_val,
+                    epoch=epoch + 1,
+                    step=step + 1,
+                    global_step=self.global_step
+                )
+                
+                # Log metrics
+                if self.logger:
+                    log_metrics = {**metrics.to_dict(), "train/step": step + 1, "train/global_step": self.global_step}
+                    self.logger.log(log_metrics, self.global_step)
                     
                 if (step + 1) % log_every == 0:
                     n = log_every
@@ -261,13 +263,19 @@ class Distiller:
                         f"| global_step={self.global_step} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
                     )
                     
-                    # Log averages to TensorBoard
-                    if self.writer is not None:
-                        self.writer.add_scalar("train/avg_loss", avg_loss, self.global_step)
-                        self.writer.add_scalar("train/avg_kl_loss", avg_kl, self.global_step)
-                        self.writer.add_scalar("train/avg_ce_loss", avg_ce, self.global_step)
-                        self.writer.add_scalar("train/elapsed_time", elapsed, self.global_step)
-                        self.writer.flush()
+                    # Log averages using new combined logger or legacy loggers
+                    avg_metrics = {
+                        "train/avg_loss": avg_loss,
+                        "train/avg_kl_loss": avg_kl,
+                        "train/avg_ce_loss": avg_ce,
+                        "train/elapsed_time": elapsed,
+                        "train/steps_per_second": log_every / elapsed
+                    }
+                    
+                    # Log averages
+                    if self.logger:
+                        self.logger.log(avg_metrics, self.global_step)
+                        self.logger.flush()
                         
                     running = {k: 0.0 for k in running}
         

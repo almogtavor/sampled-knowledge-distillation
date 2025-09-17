@@ -1,84 +1,139 @@
 % Use this file for citations not found in the ACL Anthology (contained in "anthology.bib").
 
-@book{Aho:72,
-    author  = {Alfred V. Aho and Jeffrey D. Ullman},
-    title   = {The Theory of Parsing, Translation and Compiling},
-    year    = "1972",
-    volume  = "1",
-    publisher = {Prentice-Hall},
-    address = {Englewood Cliffs, NJ}
+% Knowledge Distillation Papers
+
+@article{hinton2015distillation,
+  title={Distilling the Knowledge in a Neural Network},
+  author={Hinton, Geoffrey and Vinyals, Oriol and Dean, Jeff},
+  journal={arXiv preprint arXiv:1503.02531},
+  year={2015},
+  url={https://arxiv.org/abs/1503.02531}
 }
 
-@book{APA:83,
-    author  = {{American Psychological Association}},
-    title   = {Publications Manual},
-    year    = "1983",
-    publisher = {American Psychological Association},
-    address = {Washington, DC}
+@article{sanh2019distilbert,
+  title={DistilBERT, a distilled version of BERT: smaller, faster, cheaper and lighter},
+  author={Sanh, Victor and Debut, Lysandre and Chaumond, Julien and Wolf, Thomas},
+  journal={arXiv preprint arXiv:1910.01108},
+  year={2019},
+  url={https://arxiv.org/abs/1910.01108}
 }
 
-@article{Chandra:81,
-	author = {Ashok K. Chandra and Dexter C. Kozen and Larry J. Stockmeyer},
-	year = "1981",
-	title = {Alternation},
-	journal = {Journal of the Association for Computing Machinery},
-	volume = "28",
-	number = "1",
-	pages = "114--133",
-	doi = "10.1145/322234.322243",
+@article{agarwal2024gkd,
+  title={On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes},
+  author={Agarwal, Rishabh and Vieillard, Nino and Stanczyk, Piotr and Ramos, Sabela and Geist, Matthieu and Bachem, Olivier},
+  journal={arXiv preprint arXiv:2306.13649},
+  year={2024},
+  url={https://arxiv.org/abs/2306.13649}
 }
 
-@inproceedings{andrew2007scalable,
-  title={Scalable training of {$L_1$}-regularized log-linear models},
-  author={Andrew, Galen and Gao, Jianfeng},
-  booktitle={Proceedings of the 24th International Conference on Machine Learning},
-  pages={33--40},
-  year={2007},
-  url={https://dl.acm.org/doi/abs/10.1145/1273496.1273501}
+@article{anshumann2025sparse,
+  title={Sparse Logit Sampling: Accelerating Knowledge Distillation in LLMs},
+  author={Anshumann, Piyush and Agarwal, Rishabh and Bachem, Olivier},
+  journal={arXiv preprint arXiv:2503.16870},
+  year={2025},
+  url={https://arxiv.org/abs/2503.16870}
 }
 
-@book{Gusfield:97,
-    author  = {Dan Gusfield},
-    title   = {Algorithms on Strings, Trees and Sequences},
-    year    = "1997",
-    publisher = {Cambridge University Press},
-    address = {Cambridge, UK},
-    url={https://www.cambridge.org/core/books/algorithms-on-strings-trees-and-sequences/F0B095049C7E6EF5356F0A26686C20D3}
+@article{wang2021selectivekd,
+  title={Selective Knowledge Distillation for Neural Machine Translation},
+  author={Wang, Fusheng and Xu, Jianhao and Zhao, Fandong and Jia, Jianfeng and Zhou, Jie},
+  journal={arXiv preprint arXiv:2105.12967},
+  year={2021},
+  url={https://arxiv.org/abs/2105.12967}
 }
 
-@article{rasooli-tetrault-2015,
-    author    = {Mohammad Sadegh Rasooli and Joel R. Tetreault},
-    title     = {Yara Parser: {A} Fast and Accurate Dependency Parser},
-    journal   = {Computing Research Repository},
-    volume    = {arXiv:1503.06733},
-    year      = {2015},
-    url       = {http://arxiv.org/abs/1503.06733},
-    note    = {version 2}
+@article{zhang2023shiftkd,
+  title={Benchmarking Knowledge Distillation under Distribution Shift},
+  author={Zhang, Jinghan and Agarwal, Rishabh and Babuschkin, Igor and Bachem, Olivier},
+  journal={arXiv preprint arXiv:2312.16242},
+  year={2023},
+  url={https://arxiv.org/abs/2312.16242}
 }
 
-@article{Ando2005,
-	Acmid = {1194905},
-	Author = {Ando, Rie Kubota and Zhang, Tong},
-	Issn = {1532-4435},
-	Issue_Date = {12/1/2005},
-	Journal = {Journal of Machine Learning Research},
-	Month = dec,
-	Numpages = {37},
-	Pages = {1817--1853},
-	Publisher = {JMLR.org},
-	Title = {A Framework for Learning Predictive Structures from Multiple Tasks and Unlabeled Data},
-	Volume = {6},
-	Year = {2005},
-	url={https://www.jmlr.org/papers/volume6/ando05a/ando05a.pdf}
+@article{feng2024kpod,
+  title={Keypoint-based Progressive Chain-of-Thought Distillation for LLMs},
+  author={Feng, Kaituo and Zhang, Changsheng and Wu, Ye and Zhang, Guoren},
+  journal={arXiv preprint arXiv:2405.16064},
+  year={2024},
+  url={https://arxiv.org/abs/2405.16064}
 }
 
-@article{ct1965,
-  title={An algorithm for the machine calculation of complex {F}ourier series},
-  author={Cooley, James W. and Tukey, John W.},
-  journal={Mathematics of Computation},
-  volume={19},
-  number={90},
-  pages={297--301},
-  year={1965},
-  url={https://www.ams.org/journals/mcom/1965-19-090/S0025-5718-1965-0178586-1/S0025-5718-1965-0178586-1.pdf}
+@article{liu2025tokenlevel,
+  title={Token-Level Uncertainty-Aware Objective for Language Model Post-Training},
+  author={Liu, Jiahao and Chen, Tongxu and Zhang, Chengming and Liu, Hongwei and Wang, Haochen and Peng, Nenghai},
+  journal={arXiv preprint arXiv:2503.16511},
+  year={2025},
+  url={https://arxiv.org/abs/2503.16511}
+}
+
+@article{guo2017calibration,
+  title={On Calibration of Modern Neural Networks},
+  author={Guo, Chuan and Pleiss, Geoff and Sun, Yu and Weinberger, Kilian Q.},
+  journal={arXiv preprint arXiv:1706.04599},
+  year={2017},
+  url={https://arxiv.org/abs/1706.04599}
+}
+
+@inproceedings{furlanello2018ban,
+  title={Born-Again Neural Networks},
+  author={Furlanello, Tommaso and Lipton, Zachary C. and Tschannen, Michael and Itti, Laurent and Anandkumar, Anima},
+  booktitle={Proceedings of Machine Learning Research},
+  volume={80},
+  pages={1607--1616},
+  year={2018},
+  url={https://proceedings.mlr.press/v80/furlanello18a/furlanello18a.pdf}
+}
+
+@article{boizard2024uld,
+  title={Towards Cross-Tokenizer Distillation: the Universal Logit Distillation Loss for LLMs},
+  author={Boizard, Nicolas and Colombo, Pierre and Piantanida, Pablo and Clavel, Chlo{\'e}},
+  journal={arXiv preprint arXiv:2402.12030},
+  year={2024},
+  url={https://arxiv.org/abs/2402.12030}
+}
+
+@inproceedings{raman2023slim,
+  title={For Distillation, Tokens Are Not All You Need},
+  author={Raman, Neeraj and Vare, Siddharth and Srinivasan, Apurva and Chandra, Vignesh and Khandelwal, Kush},
+  booktitle={OpenReview},
+  year={2023},
+  url={https://openreview.net/pdf?id=2fc5GOPYip}
+}
+
+@article{shum2024first,
+  title={On the Calibration and Trustworthiness of Knowledge Distillation},
+  author={Shum, Hubert and Wang, Linlin and Chen, Jiajun and Zheng, Liang},
+  journal={arXiv preprint},
+  year={2024}
+}
+
+@article{kim2016sequencekd,
+  title={Sequence-Level Knowledge Distillation},
+  author={Kim, Yoon and Rush, Alexander M.},
+  journal={arXiv preprint arXiv:1606.07947},
+  year={2016},
+  url={https://arxiv.org/abs/1606.07947}
+}
+
+@article{gu2023minillm,
+  title={Knowledge Distillation of Large Language Models},
+  author={Gu, Yuxian and Dong, Li and Wei, Furu and Huang, Minlie},
+  journal={arXiv preprint arXiv:2306.08543},
+  year={2023},
+  url={https://arxiv.org/abs/2306.08543}
+}
+
+@article{tarvainen2017meanteacher,
+  title={Mean teachers are better role models: Weight-averaged consistency targets improve semi-supervised deep learning results},
+  author={Tarvainen, Antti and Valpola, Harri},
+  journal={Advances in Neural Information Processing Systems},
+  volume={30},
+  year={2017}
+}
+
+@article{liu2025srd,
+  title={Selective Reflection-Tuning: Student-Selected Data Recycling for LLM Instruction-Tuning},
+  author={Liu, Ming and Qi, Jie and Wang, Yicheng and Han, Jiawei and Chen, Lei},
+  journal={arXiv preprint},
+  year={2025}
 }
