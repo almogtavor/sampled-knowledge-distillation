@@ -316,7 +316,7 @@ def main():
     job_id = os.getenv("SLURM_JOB_ID", "local")
     experiment_name = (
         f"distill-{config.distill_type}-{current_date}_{job_id}"
-        + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
+        + (f"_k={config.top_k_percent}" if config.distill_type != "vanilla" else "")
     )
     
     # Initialize combined logger (W&B + TensorBoard)
