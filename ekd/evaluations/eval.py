@@ -427,7 +427,7 @@ def collect_alpacaeval_metrics(out_dir: Optional[Path]) -> Dict[str, Dict[str, f
                 vals = {}
                 for k in ["length_controlled_win_rate", "win_rate", "pairwise_win_rate", "length_controlled"]:
                     if k in blob and isinstance(blob[k], (int, float)):
-                        vals[k] = float(k in blob and blob[k])
+                        vals[k] = float(blob[k])
                 if vals:
                     results[task] = vals
                     break
