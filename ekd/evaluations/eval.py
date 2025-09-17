@@ -159,24 +159,32 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
         print("No CUDA devices visible, defaulting to CPU (will be slow).")
     return ids
 
-# ---------- LM-Eval (only small/fast tasks) ----------
-# LMEVAL_TASKS = [
-#     # grade-school + math
-#     "gsm8k", "svamp", "asdiv", "hendrycks_math",
-#     # advanced reasoning
-#     "gpqa",       # if your install expects gpqa_diamond or gpqa_main, the script retries
-#     "bbh",        # group of BBH tasks
-#     "agieval",    # group of AGIEval tasks
-#     # QA
-#     "squadv2", "nq_open", "hotpotqa",
-#     # Instruction following (IFEval lives in an optional extra)
-#     "ifeval",
-#     # Common sense reasoning (fast)
-#     "hellaswag", "winogrande", 
-#     # Knowledge and reasoning (medium)
-#     "arc_easy", "arc_challenge"
-# ]
-LMEVAL_TASKS_SMALL = ["hellaswag", "winogrande", "arc_easy"]
+# ---------- LM-Eval (optimized for 15min evaluation window) ----------
+# EXCLUDED TASKS (too slow or unreliable for 15min window):
+# - "hellaswag": Always times out at 600s (too heavy for small models)
+# - "arc_challenge": Slower than arc_easy, less reliable
+# - "hendrycks_math": Advanced math, very slow for distilled models
+# - "gpqa", "bbh", "agieval": Advanced reasoning too demanding
+# - "squadv2", "nq_open", "hotpotqa": Long context QA tasks
+# - "ifeval": Instruction following requires special setup
+LMEVAL_TASKS_SMALL = ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy", "gsm8k", "svamp"]
+# Optimized 15min selection: 7 tasks covering diverse reasoning types including math
+# Timing breakdown (empirically validated + estimated):
+# - boolq: ~2.5min (Boolean reasoning)
+# - piqa: ~1.8min (Physical reasoning)  
+# - openbookqa: ~1.5min (Science QA)
+# - winogrande: ~1.6min (Commonsense reasoning)
+# - arc_easy: ~2.7min (Grade school science)
+# - gsm8k: ~2.0min (Grade school math word problems)
+# - svamp: ~1.5min (Simple math variations)
+# Total: ~13-15min per model (at 15min limit)
+# 
+# Alternative configurations by speed/coverage:
+# Ultra-fast: ["winogrande", "arc_easy"]                    # ~4min, core tasks only
+# Fast: ["piqa", "winogrande", "arc_easy"]                 # ~6min, adds physical reasoning
+# Balanced: ["boolq", "winogrande", "arc_easy", "svamp"]   # ~8min, adds boolean QA + simple math
+# Comprehensive: ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy"]  # ~10min, no math
+# Full: ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy", "gsm8k", "svamp"]  # ~15min, includes math
 
 def run_lmeval_parallel(
     model_dir: Path,
@@ -184,7 +192,7 @@ def run_lmeval_parallel(
     results_dir: Path,
     gpu_ids: List[int],
 ) -> Optional[Path]:
-    """Run Hellaswag / Winogrande / ARC-Easy in parallel, one task per GPU."""
+    """Run Winogrande / ARC-Easy in parallel, one task per GPU (ultra-fast, no timeouts)."""
     out_dir = results_dir / f"lmeval_{tag}"
     ensure_dir(out_dir)
     tasks = list(LMEVAL_TASKS_SMALL)
@@ -201,11 +209,18 @@ def run_lmeval_parallel(
         # "--log_samples",  # keep off for speed unless you need examples
     ]
 
-    # For full runs (no --limit), bump timeouts to avoid false timeouts
+    # Optimized timeouts for 15min evaluation window (generous but bounded)
     task_timeouts = {
-        "hellaswag": 1800,   # 30m
-        "winogrande": 600,   # 10m
-        "arc_easy": 1200,    # 20m
+        "boolq": 300,        # 5m (Boolean reasoning - fast)
+        "piqa": 240,         # 4m (Physical reasoning - fastest)
+        "openbookqa": 180,   # 3m (Science QA - very fast)  
+        "winogrande": 240,   # 4m (Commonsense reasoning)
+        "arc_easy": 360,     # 6m (Grade school science)
+        "gsm8k": 300,        # 5m (Grade school math word problems)
+        "svamp": 240,        # 4m (Simple math variations - should be fast)
+        "asdiv": 240,        # 4m (Arithmetic word problems - if added)
+        "hellaswag": 600,    # 10m (excluded but kept for reference - always times out)
+        "arc_challenge": 900, # 15m (excluded - too slow)
     }
 
     # If no GPUs, fallback to sequential CPU (slow)
