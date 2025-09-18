@@ -28,7 +28,7 @@ ollama run qwen3:8b
 We provide two distillation types:
 * **vanilla** — KL between teacher & student on **all** tokens.
 * **ekd** — KL computed **only** on *fork tokens*, i.e. those whose
-  teacher-entropy is in the top-`--top_k_percent` percentile inside each
+  teacher-entropy is in the top-`--k_percent` percentile inside each
   example.
 
 We use Ollama's Qwen3-8B in 4-bit as teacher:
@@ -49,7 +49,7 @@ python ekd_distill.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type ekd \
-    --top_k_percent 20 \
+    --k_percent 20 \
     --datasets gsm8k \
     --dataset_config main \
     --prompt_col question \

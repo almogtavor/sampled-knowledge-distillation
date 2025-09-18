@@ -233,7 +233,7 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
         job_id = os.getenv("SLURM_JOB_ID", "local")
         experiment_name = (
             f"distill-{config.distill_type}-{current_date}_{job_id}"
-            + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
+            + (f"_k={config.k_percent}" if config.distill_type == "vanilla" else "")
         )
     
     wandb_config = {
@@ -241,7 +241,7 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
         "teacher_model": config.teacher_model,
         "student_model": config.student_model,
         "distill_type": config.distill_type,
-        "top_k_percent": config.top_k_percent,
+        "k_percent": config.k_percent,
         "epochs": config.epochs,
         "batch_size": config.batch_size,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
@@ -255,7 +255,7 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
     
     tags = [
         config.distill_type,
-        f"k={config.top_k_percent}" if config.distill_type == "vanilla" else "ekd",
+        f"k={config.k_percent}" if config.distill_type == "vanilla" else "ekd",
         "training"
     ]
     

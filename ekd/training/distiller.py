@@ -69,7 +69,7 @@ class Distiller:
             'model_state_dict': self.student.state_dict(),
             'optimizer_state_dict': self.opt.state_dict(),
             'distill_type': self.config.distill_type,
-            'top_k_percent': self.config.top_k_percent,
+            'k_percent': self.config.k_percent,
         }
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
@@ -151,7 +151,7 @@ class Distiller:
         if self.config.distill_type == "vanilla":
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-        else:
+        elif self.config.distill_type == "ekd":
             # EKD: top-k% entropy among valid positions only
             ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
             kd_terms = []
@@ -161,11 +161,33 @@ class Distiller:
                 if vi.sum() < 2:
                     continue
                 ent_valid = ent[i][vi]
-                thr = torch.quantile(ent_valid.float(), 1 - self.config.top_k_percent / 100.0)
+                thr = torch.quantile(ent_valid.float(), 1 - self.config.k_percent / 100.0)
                 keep = torch.zeros_like(vi)
                 keep[vi] = ent_valid >= thr
                 if keep.any():
                     kd_terms.append(kl_pos[i][keep].mean())
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
+        else:  # random k
+            kd_terms = []
+            Bsz = kl_pos.size(0)
+            for i in range(Bsz):
+                vi = valid_next[i]
+                valid_count = vi.sum().item()
+                if valid_count < 2:
+                    continue
+                k_count = max(1, int(valid_count * self.config.k_percent / 100.0))
+                valid_indices = torch.where(vi)[0]
+                if len(valid_indices) >= k_count:
+                    perm = torch.randperm(len(valid_indices), device=self.student_device)
+                    selected_indices = valid_indices[perm[:k_count]]
+                    keep = torch.zeros_like(vi)
+                    keep[selected_indices] = True
+                    if keep.any():
+                        kd_terms.append(kl_pos[i][keep].mean())
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
             else:

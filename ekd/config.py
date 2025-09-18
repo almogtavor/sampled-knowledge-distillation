@@ -11,8 +11,8 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "ekd"] = "vanilla"
-    top_k_percent: int = Field(default=20, description="for EKD only")
+    distill_type: Literal["vanilla", "ekd", "random"] = "vanilla"
+    k_percent: int = Field(default=20, description="for EKD and random only")
     
     # Dataset settings
     datasets: List[str]
@@ -46,7 +46,7 @@ class CheckpointData(BaseModel):
     step: int
     global_step: int
     distill_type: str
-    top_k_percent: int
+    k_percent: int
     model_state_dict: dict
     optimizer_state_dict: dict
     
