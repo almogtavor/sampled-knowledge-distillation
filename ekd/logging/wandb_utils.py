@@ -264,7 +264,7 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
     
     # Add mode-specific tags
     if config.distill_type == "ekd":
-        tags.append(f"k={config.top_k_percent}")
+        tags.append(f"k={config.k_percent}")
     elif config.distill_type == "bucket":
         tags.append(f"bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}")
     elif config.distill_type == "vanilla":
