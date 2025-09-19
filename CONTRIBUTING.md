@@ -96,16 +96,16 @@ nvidia-smi
 
 ### Submit evaluation job:
 ```bash
-./submit_eval.sh ekd <CHECKPOINT_NAME>
+./submit_eval.sh ekd <CHECKPOINT_NAME> light
 ```
 
 **Examples:**
 ```bash
 # Evaluate specific checkpoint
-./submit_eval.sh ekd checkpoint_epoch1_step4527.pt
+./submit_eval.sh ekd checkpoint_epoch1_step4527.pt light
 
 # Evaluate final model (model.safetensors)
-./submit_eval.sh ekd model.safetensors
+./submit_eval.sh ekd model.safetensors light
 ```
 
 ### Monitor evaluation:

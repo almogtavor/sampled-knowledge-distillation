@@ -30,7 +30,6 @@ except ImportError:
     log_evaluation_to_wandb = log_evaluation_to_tensorboard = lambda *args, **kwargs: None
 
 # ---------- Utility ----------
-
 def run(cmd: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str]:
     print(f"\n$ {' '.join(cmd)}")
     try:
@@ -92,7 +91,6 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
     """
     export_dir.mkdir(parents=True, exist_ok=True)
     meta_path = export_dir / "kd_export_meta.json"
-
     ckpt_hash = sha256_file(ckpt_path)
     if meta_path.exists():
         try:
@@ -102,21 +100,17 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
                 return
         except Exception:
             pass
-
     print(f"Exporting model from base '{base_model_dir}' with state_dict '{ckpt_path.name}' -> '{export_dir}'")
     tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=False, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(base_model_dir, dtype=torch.float16, device_map=None, trust_remote_code=True)
-
     chk = torch.load(ckpt_path, map_location="cpu")
     state = chk.get("model_state_dict")
     if state is None:
         raise ValueError(f"No 'model_state_dict' in {ckpt_path}")
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}")
-
     model.save_pretrained(export_dir)
     tok.save_pretrained(export_dir)
-
     meta = {
         "source_checkpoint": str(ckpt_path),
         "epoch": chk.get("epoch"),
@@ -138,7 +132,6 @@ def which(bin_name: str) -> bool:
     return shutil.which(bin_name) is not None
 
 # ---------- GPU helpers ----------
-
 def visible_gpu_ids() -> List[int]:
     """Return the list of visible GPU ids from CUDA_VISIBLE_DEVICES or torch."""
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
@@ -159,44 +152,98 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
         print("No CUDA devices visible, defaulting to CPU (will be slow).")
     return ids
 
-# ---------- LM-Eval (optimized for 15min evaluation window) ----------
-# EXCLUDED TASKS (too slow or unreliable for 15min window):
-# - "hellaswag": Always times out at 600s (too heavy for small models)
-# - "arc_challenge": Slower than arc_easy, less reliable
-# - "hendrycks_math": Advanced math, very slow for distilled models
-# - "gpqa", "bbh", "agieval": Advanced reasoning too demanding
-# - "squadv2", "nq_open", "hotpotqa": Long context QA tasks
-# - "ifeval": Instruction following requires special setup
-LMEVAL_TASKS_SMALL = ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy", "gsm8k", "svamp"]
-# Optimized 15min selection: 7 tasks covering diverse reasoning types including math
-# Timing breakdown (empirically validated + estimated):
-# - boolq: ~2.5min (Boolean reasoning)
-# - piqa: ~1.8min (Physical reasoning)  
-# - openbookqa: ~1.5min (Science QA)
-# - winogrande: ~1.6min (Commonsense reasoning)
-# - arc_easy: ~2.7min (Grade school science)
-# - gsm8k: ~2.0min (Grade school math word problems)
-# - svamp: ~1.5min (Simple math variations)
-# Total: ~13-15min per model (at 15min limit)
-# 
-# Alternative configurations by speed/coverage:
-# Ultra-fast: ["winogrande", "arc_easy"]                    # ~4min, core tasks only
-# Fast: ["piqa", "winogrande", "arc_easy"]                 # ~6min, adds physical reasoning
-# Balanced: ["boolq", "winogrande", "arc_easy", "svamp"]   # ~8min, adds boolean QA + simple math
-# Comprehensive: ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy"]  # ~10min, no math
-# Full: ["boolq", "piqa", "openbookqa", "winogrande", "arc_easy", "gsm8k", "svamp"]  # ~15min, includes math
+# ==========================================================
+#                      SUITE DEFINITIONS
+# ==========================================================
 
-def run_lmeval_parallel(
+# NOTE: Task names follow lm-eval harness conventions. Some tasks may be unavailable
+# in older harness versions; failures are tolerated and reported.
+# LIGHT suite (coffee-break): strict caps via --limit (first-N selection by harness)
+LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
+    ("gsm8k", 100),            # accuracy
+    ("svamp", 100),            # accuracy
+    ("arc_challenge", 300),    # acc_norm
+    ("hellaswag", 500),        # acc_norm
+    ("gpqa_diamond", None),    # accuracy (tiny)
+    ("aime24", None),          # exact-match (tiny, if available)
+]
+# Optional tiny adds (off by default): BoolQ 200, HumanEval full
+LIGHT_ENABLE_OPTIONALS = os.environ.get("LIGHT_EXTRAS", "0") == "1"
+LIGHT_OPTIONALS: List[Tuple[str, Optional[int]]] = [
+    ("boolq", 200),
+]
+
+# HEAVY suite (paper): broad coverage; full sets (no --limit) unless noted
+HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
+    # Reasoning & math
+    ("gsm8k", None),
+    ("svamp", None),
+    ("asdiv", None),               # arithmetic subset (ASDiv-A handled inside task)
+    ("hendrycks_math", None),      # MATH
+    ("aime24", None),
+    ("aime25", None),
+    ("olympiadbench", None),
+    ("gpqa_diamond", None),
+    # General reasoning
+    ("bbh", None),                  # BIG-Bench Hard group
+    ("agieval", None),              # AGIEval group
+    # QA / multi-hop
+    ("squadv2", None),
+    ("hotpotqa", None),
+    ("nq_open", None),
+    # Commonsense
+    ("hellaswag", None),
+    ("arc_challenge", None),
+]
+
+# Per-task timeouts (seconds). Be generous on heavy tasks.
+TASK_TIMEOUTS = {
+    # light-ish baselines
+    "boolq": 600,
+    "arc_challenge": 1500,
+    "hellaswag": 1200,
+    "svamp": 900,
+    "gsm8k": 1200,
+    "gpqa_diamond": 900,
+    "aime24": 900,
+    "aime25": 900,
+    # heavy add-ons
+    "asdiv": 1200,
+    "hendrycks_math": 3600,
+    "olympiadbench": 5400,
+    "bbh": 5400,
+    "agieval": 5400,
+    "squadv2": 2400,
+    "hotpotqa": 3600,
+    "nq_open": 3600,
+}
+
+# Summarization (Lighteval)
+LIGHTEVAL_TASKS = ["helm|summarization:cnn_dailymail", "helm|summarization:xsum"]
+
+# ==========================================================
+#                  LM-Eval runner with suites
+# ==========================================================
+def run_lmeval_suite(
     model_dir: Path,
     tag: str,
     results_dir: Path,
     gpu_ids: List[int],
+    suite: str,
 ) -> Optional[Path]:
-    """Run Winogrande / ARC-Easy in parallel, one task per GPU (ultra-fast, no timeouts)."""
-    out_dir = results_dir / f"lmeval_{tag}"
+    """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
+    out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
-    tasks = list(LMEVAL_TASKS_SMALL)
-    if not tasks:
+
+    tasks_with_limits: List[Tuple[str, Optional[int]]]
+    if suite == "light":
+        tasks_with_limits = list(LIGHT_LMEVAL_TASKS)
+        if LIGHT_ENABLE_OPTIONALS:
+            tasks_with_limits += list(LIGHT_OPTIONALS)
+    else:
+        tasks_with_limits = list(HEAVY_LMEVAL_TASKS)
+
+    if not tasks_with_limits:
         print("No LM-Eval tasks selected.")
         return None
 
@@ -206,70 +253,57 @@ def run_lmeval_parallel(
         "--model_args", f"pretrained={model_dir},trust_remote_code=True",
         "--batch_size", "4",
         "--output_path", str(out_dir),
-        # "--log_samples",  # keep off for speed unless you need examples
     ]
 
-    # Optimized timeouts for 15min evaluation window (generous but bounded)
-    task_timeouts = {
-        "boolq": 300,        # 5m (Boolean reasoning - fast)
-        "piqa": 240,         # 4m (Physical reasoning - fastest)
-        "openbookqa": 180,   # 3m (Science QA - very fast)  
-        "winogrande": 240,   # 4m (Commonsense reasoning)
-        "arc_easy": 360,     # 6m (Grade school science)
-        "gsm8k": 300,        # 5m (Grade school math word problems)
-        "svamp": 240,        # 4m (Simple math variations - should be fast)
-        "asdiv": 240,        # 4m (Arithmetic word problems - if added)
-        "hellaswag": 600,    # 10m (excluded but kept for reference - always times out)
-        "arc_challenge": 900, # 15m (excluded - too slow)
-    }
-
-    # If no GPUs, fallback to sequential CPU (slow)
+    # CPU fallback (sequential)
     if not gpu_ids:
         print("[lm-eval] No GPUs detected; running sequentially on CPU.")
         good_any = False
-        for t in tasks:
-            timeout = task_timeouts.get(t, 900)
-            code, _ = run(base_args + ["--tasks", t, "--device", "cpu"], timeout=timeout)
+        for (task, limit) in tasks_with_limits:
+            args = base_args + ["--tasks", task, "--device", "cpu"]
+            if isinstance(limit, (int, float)):
+                args += ["--limit", str(limit)]
+            timeout = TASK_TIMEOUTS.get(task, 3600)
+            code, _ = run(args, timeout=timeout)
             good_any |= (code == 0)
         return out_dir if good_any else None
 
+    # Parallel across physical GPUs (mask each process to one GPU)
     good_any = False
     i = 0
-    while i < len(tasks):
+    while i < len(tasks_with_limits):
         procs = []
-        wave = tasks[i : i + len(gpu_ids)]
-        print(f"[lm-eval] Launching wave: {wave} on GPUs {gpu_ids}")
-
-        for t, gid in zip(wave, gpu_ids):
+        wave = tasks_with_limits[i : i + len(gpu_ids)]
+        wave_names = [t for (t, _) in wave]
+        print(f"[lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
+        for (task, limit), gid in zip(wave, gpu_ids):
             env = os.environ.copy()
-            # mask to a single physical GPU; inside, cuda:0 == that physical GPU
-            env["CUDA_VISIBLE_DEVICES"] = str(gid)
-            cmd = base_args + ["--tasks", t, "--device", "cuda:0"]
+            env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
+            cmd = base_args + ["--tasks", task, "--device", "cuda:0"]
+            if isinstance(limit, (int, float)):
+                cmd += ["--limit", str(limit)]
             p = run_async(cmd, env=env)
-            procs.append((t, p, task_timeouts.get(t, 900)))
-
-        # Collect with per-task timeouts
-        for t, p, to in procs:
+            timeout = TASK_TIMEOUTS.get(task, 3600)
+            procs.append((task, p, timeout))
+        for task, p, to in procs:
             rc, out = wait_with_timeout(p, timeout=to)
             if rc == 0:
-                print(f"✅ Task {t} completed successfully")
+                print(f"✅ Task {task} completed successfully")
                 good_any = True
             elif rc == 124:
-                print(f"⏰ Task {t} timed out after {to} seconds")
+                print(f"⏰ Task {task} timed out after {to} seconds")
             else:
-                print(f"❌ Task {t} failed with code {rc}")
-
+                print(f"❌ Task {task} failed with code {rc}")
         i += len(gpu_ids)
-
     return out_dir if good_any else None
 
 # ---------- Lighteval (summarization) ----------
-
-LIGHTEVAL_TASKS = ["helm|summarization:cnn_dailymail", "helm|summarization:xsum"]
-
-def run_lighteval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path]:
+def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
+    """Run summarization only for HEAVY suite (CNN/DM, XSum)."""
+    if suite != "heavy":
+        print("[lighteval] Skipping summarization for light suite.")
+        return None
     out_path = results_dir / f"lighteval_{tag}.json"
-    # some installs use hyphen, some underscore
     tasks = [t.replace("-", "_") for t in LIGHTEVAL_TASKS]  # normalize hyphen → underscore
     cmd = [
         "lighteval",
@@ -289,14 +323,15 @@ def run_lighteval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path
         code, _ = run(cmd)
     return out_path if code == 0 and out_path.exists() else None
 
-
 # ---------- EvalPlus (code: HumanEval/MBPP) ----------
-
-def run_evalplus(model_dir: Path, tag: str, datasets: List[str]) -> Dict[str, Optional[Path]]:
+def run_evalplus(model_dir: Path, tag: str, datasets: List[str], suite: str) -> Dict[str, Optional[Path]]:
+    """Run code-gen only for HEAVY suite by default."""
+    if suite != "heavy":
+        print("[evalplus] Skipping code-gen for light suite.")
+        return {}
     out = {}
     evalplus_home = Path(os.environ.get("TMPDIR", "/tmp")) / "evalplus_home"
     (evalplus_home / ".cache").mkdir(parents=True, exist_ok=True)
-
     for ds_name in datasets:
         cmd = [
             "evalplus.evaluate",
@@ -306,19 +341,19 @@ def run_evalplus(model_dir: Path, tag: str, datasets: List[str]) -> Dict[str, Op
             "--greedy",
         ]
         env = os.environ.copy()
-        # redirect caches to TMPDIR
         env["HOME"] = str(evalplus_home)             # avoid $HOME
         env["XDG_CACHE_HOME"] = str(evalplus_home / ".cache")
         env.setdefault("EVALPLUS_TRUST_REMOTE_CODE", "1")
         code, _ = run(cmd, env=env)
-
         results_root = Path("evalplus_results") / ds_name
         out[ds_name] = results_root if results_root.exists() and code == 0 else None
     return out
 
 # ---------- AlpacaEval 2 (LC win-rates) ----------
-
-def run_alpacaeval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path]:
+def run_alpacaeval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
+    if suite != "heavy":
+        print("[alpacaeval] Skipping for light suite.")
+        return None
     if os.getenv("OPENAI_API_KEY") is None:
         print("Skipping AlpacaEval 2: OPENAI_API_KEY not set.")
         return None
@@ -333,9 +368,27 @@ def run_alpacaeval(model_dir: Path, tag: str, results_dir: Path) -> Optional[Pat
     code, _ = run(cmd)
     return out_dir if code == 0 else None
 
-# ---------- Safety (JailbreakBench + HarmBench) ----------
+# ---------- IF-Eval (instruction-following compliance) ----------
+def run_ifeval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
+    """Run IF-Eval if available and only for HEAVY suite."""
+    if suite != "heavy":
+        print("[ifeval] Skipping for light suite.")
+        return None
+    if not which("ifeval"):
+        print("Skipping IF-Eval: 'ifeval' CLI not found (pip install may be required).")
+        return None
+    out_dir = results_dir / f"ifeval_{tag}"
+    ensure_dir(out_dir)
+    # Minimal CLI; adjust if your local ifeval expects different flags.
+    cmd = ["ifeval", "--model", str(model_dir), "--output", str(out_dir)]
+    code, _ = run(cmd)
+    return out_dir if code == 0 else None
 
-def run_jailbreakbench(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path]:
+# ---------- Safety (JailbreakBench + HarmBench) ----------
+def run_jailbreakbench(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
+    if suite != "heavy":
+        print("[jbb] Skipping for light suite.")
+        return None
     base_url = os.getenv("JBB_BASE_URL")
     model_name = os.getenv("JBB_MODEL")
     if not which("python") or base_url is None or model_name is None:
@@ -346,7 +399,6 @@ def run_jailbreakbench(model_dir: Path, tag: str, results_dir: Path) -> Optional
     shim = f"""
 import json, os
 import jailbreakbench as jbb
-
 base_url = os.environ.get("JBB_BASE_URL")
 model = os.environ.get("JBB_MODEL")
 prompts = jbb.load_default_prompts()
@@ -358,7 +410,13 @@ print("Wrote JBB results")
     code, _ = run([sys.executable, "-c", shim])
     return out_dir if code == 0 else None
 
-def run_harmbench(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path]:
+def run_harmbench(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
+    if suite != "heavy":
+        print("[harmbench] Skipping for light suite.")
+        return None
+    if importlib.util.find_spec("harmbench") is None:
+        print("Skipping HarmBench: package 'harmbench' not installed.")
+        return None
     config = os.getenv("HARMBENCH_CONFIG")
     if config is None:
         print("Skipping HarmBench: set HARMBENCH_CONFIG to a YAML that points to your HF model.")
@@ -368,8 +426,8 @@ def run_harmbench(model_dir: Path, tag: str, results_dir: Path) -> Optional[Path
     code, _ = run([sys.executable, "-m", "harmbench", "--config", config])
     return out_dir if code == 0 else None
 
-# ---------- Results aggregation -> LaTeX ----------
 
+# ---------- Results aggregation ----------
 def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
     results = {}
     if not lmeval_dir or not lmeval_dir.exists():
@@ -476,8 +534,6 @@ def merge_model_results(per_source: List[Dict[str, Dict[str, float]]]) -> Dict[s
                 merged[task][mk] = mv
     return merged
 
-
-
 def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]) -> None:
     all_metrics = sorted({m for model in all_models_metrics.values() for task in model.values() for m in task.keys()})
     tasks = sorted({t for model in all_models_metrics.values() for t in model.keys()})
@@ -512,31 +568,28 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
     print(r"\end{table}")
 
 # ---------- Main pipeline ----------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model_dir", type=str, required=True, help="HF dir used to initialize the student (architecture + tokenizer).")
     parser.add_argument("--vanilla_ckpt_dir", type=str, default="kd_vanilla_run_out_model")
     parser.add_argument("--ekd_ckpt_dir", type=str, default="kd_ekd_run_out_model")
-
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
     parser.add_argument("--max_parallel", type=int, default=None,
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
-
     parser.add_argument("--work_dir", type=str, default="eval_runs")
-
     # Logging configuration (default project updated per request)
     parser.add_argument("--wandb_project", type=str, default="selective-entropy-knowledge-distillation",
                         help="W&B project slug (e.g., 'selective-entropy-knowledge-distillation').")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable W&B logging.")
     parser.add_argument("--disable_tensorboard", action="store_true", help="Disable TensorBoard logging.")
-
+    # Suite selection
+    parser.add_argument("--suite", type=str, choices=["light", "heavy"], default="light",
+                        help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
     # Optional: evaluate a single tag+checkpoint instead of both latest
     parser.add_argument("--tag", type=str, choices=["vanilla", "ekd"], help="Evaluate only this run type (vanilla or ekd).")
     parser.add_argument("--checkpoint_path", type=str, help="Path to a specific checkpoint .pt to evaluate (used with --tag).")
-
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
@@ -581,39 +634,41 @@ def main():
         sys.exit(1)
 
     all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
-    
-    # Initialize W&B logging (optional)
-    wandb_logger = None
 
     for tag, model_dir in model_specs:
-        print(f"\n=== Running benchmarks for {tag} ===")
+        print(f"\n=== Running benchmarks for {tag} (suite={args.suite}) ===")
 
-        # LM-Eval (parallel across GPUs; only small tasks)
-        lmeval_root = run_lmeval_parallel(
+        # LM-Eval (parallel across GPUs according to the chosen suite)
+        lmeval_root = run_lmeval_suite(
             model_dir=model_dir,
             tag=tag,
             results_dir=results_dir,
             gpu_ids=gpu_pool,
+            suite=args.suite,
         )
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
 
-        # Lighteval summarization (optional)
-        lighteval_file = run_lighteval(model_dir, tag, results_dir)
+        # Summarization (HEAVY only)
+        lighteval_file = run_lighteval(model_dir, tag, results_dir, suite=args.suite)
         lighteval_metrics = collect_lighteval_metrics(lighteval_file)
 
-        # EvalPlus (code)
-        evalplus_roots = run_evalplus(model_dir, tag, ["humaneval", "mbpp"])
+        # Code-gen (HEAVY only)
+        evalplus_roots = run_evalplus(model_dir, tag, ["humaneval", "mbpp"], suite=args.suite)
         he_metrics = collect_evalplus_metrics(evalplus_roots.get("humaneval"), "HumanEval+")
         mbpp_metrics = collect_evalplus_metrics(evalplus_roots.get("mbpp"), "MBPP+")
 
-        # AlpacaEval 2 (requires OPENAI_API_KEY)
-        alpaca_dir = run_alpacaeval(model_dir, tag, results_dir)
+        # Instruction following (HEAVY only, if available)
+        ifeval_dir = run_ifeval(model_dir, tag, results_dir, suite=args.suite)
+        ifeval_metrics = collect_simple_json(ifeval_dir, "IF-Eval", "results.json")
+
+        # Instruction-following win-rate (HEAVY only, requires API key)
+        alpaca_dir = run_alpacaeval(model_dir, tag, results_dir, suite=args.suite)
         alpaca_metrics = collect_alpacaeval_metrics(alpaca_dir)
 
-        # Safety (optional)
-        jbb_dir = run_jailbreakbench(model_dir, tag, results_dir)
+        # Safety (HEAVY only)
+        jbb_dir = run_jailbreakbench(model_dir, tag, results_dir, suite=args.suite)
         jbb_metrics = collect_simple_json(jbb_dir, "JailbreakBench", "jbb_results.json")
-        hb_dir = run_harmbench(model_dir, tag, results_dir)
+        hb_dir = run_harmbench(model_dir, tag, results_dir, suite=args.suite)
         hb_metrics = collect_simple_json(hb_dir, "HarmBench", "harmbench_results.json")
 
         merged = merge_model_results([
@@ -621,23 +676,24 @@ def main():
             lighteval_metrics,
             he_metrics,
             mbpp_metrics,
+            ifeval_metrics,
             alpaca_metrics,
             jbb_metrics,
             hb_metrics
         ])
         all_models_metrics[tag] = merged
 
-        # Log results to W&B and TensorBoard  
+        # Log results to W&B and TensorBoard
         try:
-            log_evaluation_to_wandb(tag, merged, args.wandb_project)
-            log_evaluation_to_tensorboard(tag, merged, str(work_dir / "tb_logs"))
+            if not args.disable_wandb:
+                log_evaluation_to_wandb(tag, merged, args.wandb_project)
+            if not args.disable_tensorboard:
+                log_evaluation_to_tensorboard(tag, merged, str(work_dir / "tb_logs"))
         except Exception as e:
             print(f"Error logging {tag} metrics: {e}")
 
-    # Print LaTeX
+    # Print LaTeX summary
     print_latex_table(all_models_metrics)
-    
-
 
 if __name__ == "__main__":
     main()
