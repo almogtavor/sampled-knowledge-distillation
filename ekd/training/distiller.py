@@ -191,9 +191,8 @@ class Distiller:
                 else:
                     # fallback to vanilla on valid positions if nothing selected
                     denom = valid_next.sum().clamp(min=1)
-                    kl_all = self._kl_loss(t_lp, s_lp)
+                    kl_all = self._kl_loss(t_lp.to(self.student_device), s_lp)
                     kd_loss = (kl_all * valid_next).sum() / denom
-
             # Temperature factor (keep gradients comparable across T)
             kd_loss = kd_loss * (T * T)
         elif self.config.distill_type == "random-sampled-ekd":
