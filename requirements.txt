@@ -27,15 +27,20 @@ evaluate==0.4.5
 tqdm==4.67.1
 pandas==2.3.2
 
-# ---- Eval harnesses (exact pins to avoid resolver backtracking) ----
-lm-eval[math,ifeval]==0.4.9.1     # single source of truth; do NOT also list lm-eval>=...
+# ---- Eval harnesses (pins; avoid resolver backtracking) ----
+lm-eval==0.4.9.1
+# extras unrolled to avoid the lm-eval vs lm-eval[extras] conflict
+langdetect==1.0.9                  # from [ifeval]
+math_verify[antlr4_11_0]==0.8.0    # from [math]
+antlr4-python3-runtime==4.11.0     # pinned to match math_verify extra
+
 lighteval==0.10.0
 rouge-score==0.1.2
 
-evalplus==0.3.1                   # CLI: evalplus.evaluate
+evalplus==0.3.1
 alpaca-eval==0.6.6
 
-# ---- Optional safety (script skips if missing env/configs) ----
+# ---- Optional safety (script skips if missing env/configs)
 jailbreakbench==1.0.0
 litellm==1.77.1
 PyYAML>=6.0.1

@@ -6,6 +6,7 @@ from torch.optim import AdamW
 import os
 from pathlib import Path
 import glob
+import math
 
 from ..config import TrainingConfig, CheckpointData, TrainingMetrics
 
@@ -151,26 +152,54 @@ class Distiller:
         if self.config.distill_type == "vanilla":
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-        else:
+        elif self.config.distill_type == "ekd":
             # EKD: top-k% entropy among valid positions only
-            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
-            kd_terms = []
-            Bsz = kl_pos.size(0)
-            for i in range(Bsz):
-                vi = valid_next[i]
-                if vi.sum() < 2:
-                    continue
-                ent_valid = ent[i][vi]
-                thr = torch.quantile(ent_valid.float(), 1 - self.config.top_k_percent / 100.0)
-                keep = torch.zeros_like(vi)
-                keep[vi] = ent_valid >= thr
-                if keep.any():
-                    kd_terms.append(kl_pos[i][keep].mean())
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else:
+            # ---- entropy for selection (T=1 for selection is common) ----
+            ent = token_entropy(t_pred).to(self.student_device)         # [B, L-1]
+            ent = ent.masked_fill(~valid_next, float('-inf'))           # ignore invalid
+
+            pct = max(0.0, min(1.0, self.config.top_k_percent / 100.0))
+
+            if self.config.distill_type == "vanilla":
+                # vanilla: compute KL everywhere valid
                 denom = valid_next.sum().clamp(min=1)
-                kd_loss = (kl_pos * valid_next).sum() / denom
+                # KL over all tokens (sum over vocab only)
+                kl_all = self._kl_loss(t_lp, s_lp)                      # [B, L-1]
+                kd_loss = (kl_all * valid_next).sum() / denom
+            else:
+                # EKD top-k: select positions first, then compute KL only on those
+                kd_terms = []
+                B = valid_next.size(0)
+                for i in range(B):
+                    vi = valid_next[i]
+                    n_valid = int(vi.sum().item())
+                    if n_valid < 2:
+                        continue
+                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+
+                    valid_idx = torch.nonzero(vi, as_tuple=False).squeeze(-1)      # [n_valid]
+                    ent_valid = ent[i][valid_idx]                                  # [n_valid]
+                    _, topk_rel = torch.topk(ent_valid, k=k, largest=True, sorted=False)
+                    sel_idx = valid_idx[topk_rel]                                   # [k]
+
+                    # Compute KL only on selected positions (sum over vocab → [k])
+                    kl_sel = self._kl_loss(t_lp[i, sel_idx, :], s_lp[i, sel_idx, :])  # [k]
+                    kd_terms.append(kl_sel.mean())
+
+                if kd_terms:
+                    kd_loss = torch.stack(kd_terms).mean()
+                else:
+                    # fallback to vanilla on valid positions if nothing selected
+                    denom = valid_next.sum().clamp(min=1)
+                    kl_all = self._kl_loss(t_lp, s_lp)
+                    kd_loss = (kl_all * valid_next).sum() / denom
+
+            # Temperature factor (keep gradients comparable across T)
+            kd_loss = kd_loss * (T * T)
+        elif self.config.distill_type == "random-sampled-ekd":
+            # In addition to top-k% entropy, randomly sample tokens from the rest so that distribution is more balanced
+            pass
+
 
         # Multiply by T^2 as in standard distillation
         kd_loss = kd_loss * T2
