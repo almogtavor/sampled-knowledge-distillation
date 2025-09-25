@@ -8,10 +8,12 @@ import subprocess
 import sys
 import tempfile
 import hashlib
+import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -29,33 +31,77 @@ try:
 except ImportError:
     log_evaluation_to_wandb = log_evaluation_to_tensorboard = lambda *args, **kwargs: None
 
+# ---------- Pydantic Models for Configuration ----------
+class GenerationConfig(BaseModel):
+    max_new_tokens: int = 256
+    do_sample: bool = False
+    temperature: float = 0.0
+
+class MetricConfig(BaseModel):
+    metric: str
+    aggregation: str = "mean"
+    higher_is_better: bool = True
+
+class TaskConfig(BaseModel):
+    task: str  # lm-eval expects "task" field
+    dataset_path: str
+    dataset_name: Optional[str] = None
+    output_type: str = "generate_until"
+    generation_kwargs: GenerationConfig = Field(default_factory=GenerationConfig)
+    metric_list: List[MetricConfig] = Field(default_factory=list)
+    process_docs: Optional[str] = None
+    process_results: Optional[str] = None
+    num_fewshot: int = 0
+
+class BenchmarkConfig(BaseModel):
+    manual_tasks: List[TaskConfig]
+
+def load_benchmark_config(config_path: Path) -> BenchmarkConfig:
+    """Load and validate benchmark configuration from YAML."""
+    with open(config_path, 'r') as f:
+        data = yaml.safe_load(f)
+    return BenchmarkConfig(**data)
+
 # ---------- Utility ----------
 def run(cmd: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str]:
-    print(f"\n$ {' '.join(cmd)}")
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[{timestamp}] $ {' '.join(cmd)}")
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True, timeout=timeout)
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{end_timestamp}] Command completed:")
         print(out)
         return 0, out
     except subprocess.CalledProcessError as e:
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{end_timestamp}] Command failed:")
         print(e.output)
         return e.returncode, e.output
     except subprocess.TimeoutExpired as e:
-        print(f"Command timed out after {timeout} seconds: {e}")
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{end_timestamp}] Command timed out after {timeout} seconds: {e}")
         return 124, f"Timeout after {timeout} seconds"
 
 def run_async(cmd: List[str], env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
-    print(f"\n$ (async) {' '.join(cmd)}")
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[{timestamp}] $ (async) {' '.join(cmd)}")
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
 
 def wait_with_timeout(proc: subprocess.Popen, timeout: int) -> Tuple[int, str]:
     try:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{timestamp}] Waiting for process (timeout={timeout}s)...")
         out, _ = proc.communicate(timeout=timeout)
         rc = proc.returncode
         if rc is None:
             rc = 0
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{end_timestamp}] Process completed with code {rc}")
         print(out or "")
         return rc, out or ""
     except subprocess.TimeoutExpired:
+        end_timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{end_timestamp}] Process timed out after {timeout}s, killing...")
         proc.kill()
         out, _ = proc.communicate()
         print(out or "")
@@ -164,8 +210,7 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("svamp", 100),            # accuracy
     ("arc_challenge", 300),    # acc_norm
     ("hellaswag", 500),        # acc_norm
-    ("gpqa_diamond", None),    # accuracy (tiny)
-    ("aime24", None),          # exact-match (tiny, if available)
+    ("aime25", None),          # exact-match (tiny)
 ]
 # Optional tiny adds (off by default): BoolQ 200, HumanEval full
 LIGHT_ENABLE_OPTIONALS = os.environ.get("LIGHT_EXTRAS", "0") == "1"
@@ -183,7 +228,6 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("aime24", None),
     ("aime25", None),
     ("olympiadbench", None),
-    ("gpqa_diamond", None),
     # General reasoning
     ("bbh", None),                  # BIG-Bench Hard group
     ("agieval", None),              # AGIEval group
@@ -204,7 +248,6 @@ TASK_TIMEOUTS = {
     "hellaswag": 1200,
     "svamp": 900,
     "gsm8k": 1200,
-    "gpqa_diamond": 900,
     "aime24": 900,
     "aime25": 900,
     # heavy add-ons
@@ -213,7 +256,7 @@ TASK_TIMEOUTS = {
     "olympiadbench": 5400,
     "bbh": 5400,
     "agieval": 5400,
-    "squadv2": 2400,
+    "squadv2": 1200,
     "hotpotqa": 3600,
     "nq_open": 3600,
 }
@@ -247,12 +290,33 @@ def run_lmeval_suite(
         print("No LM-Eval tasks selected.")
         return None
 
+    # Validate benchmark config if it exists
+    include_dir = Path(__file__).parent
+    benchmark_config_path = include_dir / "benchmark_tasks.yaml"
+    if benchmark_config_path.exists():
+        try:
+            config = load_benchmark_config(benchmark_config_path)
+            manual_tasks = [task.task for task in config.task]
+            print(f"✅ Validated benchmark config with {len(manual_tasks)} custom tasks: {manual_tasks}")
+        except Exception as e:
+            print(f"⚠️ Warning: Invalid benchmark config: {e}")
+
+    # preflight: load task registry to filter unknown tasks (but allow external include_path)
+    try:
+        from lm_eval import tasks as _tasks_mod  # type: ignore
+        _available = set(getattr(_tasks_mod, "TASK_REGISTRY", {}).keys())
+    except Exception:
+        _available = set()
+
+    # Include local task YAMLs if present
+    include_dir = Path(__file__).parent.as_posix()
     base_args = [
         "lm-eval",
         "--model", "hf",
         "--model_args", f"pretrained={model_dir},trust_remote_code=True",
-        "--batch_size", "4",
+        "--batch_size", "8",
         "--output_path", str(out_dir),
+        "--include_path", include_dir,
     ]
 
     # CPU fallback (sequential)
@@ -275,7 +339,8 @@ def run_lmeval_suite(
         procs = []
         wave = tasks_with_limits[i : i + len(gpu_ids)]
         wave_names = [t for (t, _) in wave]
-        print(f"[lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
         for (task, limit), gid in zip(wave, gpu_ids):
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
@@ -287,13 +352,14 @@ def run_lmeval_suite(
             procs.append((task, p, timeout))
         for task, p, to in procs:
             rc, out = wait_with_timeout(p, timeout=to)
+            timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
-                print(f"✅ Task {task} completed successfully")
+                print(f"[{timestamp}] ✅ Task {task} completed successfully")
                 good_any = True
             elif rc == 124:
-                print(f"⏰ Task {task} timed out after {to} seconds")
+                print(f"[{timestamp}] ⏰ Task {task} timed out after {to} seconds")
             else:
-                print(f"❌ Task {task} failed with code {rc}")
+                print(f"[{timestamp}] ❌ Task {task} failed with code {rc}")
         i += len(gpu_ids)
     return out_dir if good_any else None
 

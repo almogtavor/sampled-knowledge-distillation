@@ -28,11 +28,14 @@ tqdm==4.67.1
 pandas==2.3.2
 
 # ---- Eval harnesses (pins; avoid resolver backtracking) ----
+# Use stable PyPI release per request
 lm-eval==0.4.9.1
 # extras unrolled to avoid the lm-eval vs lm-eval[extras] conflict
 langdetect==1.0.9                  # from [ifeval]
-math_verify[antlr4_11_0]==0.8.0    # from [math]
-antlr4-python3-runtime==4.11.0     # pinned to match math_verify extra
+# NOTE: math_verify is intentionally omitted to avoid conflict with lighteval over
+# latex2sympy2_extended (lighteval==0.10.0 requires ==1.0.6, while math_verify==0.8.0
+# requires ==1.10.2). If you need MATH-style verification, install a compatible pair
+# separately in a dedicated env or upgrade lighteval to a version that matches.
 
 lighteval==0.10.0
 rouge-score==0.1.2

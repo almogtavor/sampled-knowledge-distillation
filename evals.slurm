@@ -41,15 +41,46 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 source "$VENV_DIR/bin/activate"
 PY="$VENV_DIR/bin/python"
+
+echo "=== ENVIRONMENT DIAGNOSTICS ==="
+echo "Date: $(date)"
+echo "User: $USER"
+echo "Working directory: $(pwd)"
 echo "Python: $($PY -V)"
+echo "Python executable: $(which python)"
+echo "Python path: $($PY -c 'import sys; print(sys.executable)')"
+echo "Pip version: $(pip --version)"
+echo "Virtual env: $VIRTUAL_ENV"
+echo "PATH: $PATH"
+echo "SLURM_JOB_ID: ${SLURM_JOB_ID:-N/A}"
+echo "SLURM_NODE_LIST: ${SLURM_NODE_LIST:-N/A}"
+echo "SLURM_GPUS: ${SLURM_GPUS:-N/A}"
+echo "================================"
+
 $PY - <<'PY'
 import torch
 print("CUDA available:", torch.cuda.is_available(), "| torch", torch.__version__, "| cuda", getattr(torch.version, "cuda", None))
 PY
 
-# ---------- install eval deps (idempotent) ----------
-echo "Installing evaluation dependencies (idempotent)..."
-pip install -q lm-eval lighteval evalplus wandb tensorboard python-dotenv || true
+# ---------- install/upgrade eval deps (idempotent) ----------
+echo "Installing/upgrading evaluation dependencies from requirements.txt..."
+echo "=== PIP INSTALL DIAGNOSTICS ==="
+pip install -q --upgrade pip wheel setuptools || {
+    echo "WARNING: pip/wheel/setuptools upgrade failed"
+    pip --version
+}
+
+echo "Installing from requirements.txt..."
+if ! pip install -q --upgrade -r requirements.txt; then
+    echo "ERROR: pip install failed. Showing detailed error:"
+    pip install --upgrade -r requirements.txt
+    echo "Continuing anyway..."
+fi
+
+echo "=== POST-INSTALL PACKAGE CHECK ==="
+echo "Key packages installed:"
+pip show lm-eval lighteval transformers torch | grep -E "Name|Version" || echo "Some packages missing"
+echo "==================================="
 
 # ---------- reorder GPUs by free VRAM and advertise to the script ----------
 if command -v nvidia-smi >/dev/null 2>&1; then

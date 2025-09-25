@@ -1,0 +1,30 @@
+manual_tasks:
+  - task: svamp
+    dataset_path: ChilleD/SVAMP
+    output_type: generate_until
+    generation_kwargs:
+      max_new_tokens: 256
+      do_sample: false
+      temperature: 0.0
+    process_docs: !function utils.process_docs
+    metric_list:
+      - metric: exact_match
+        aggregation: mean
+        higher_is_better: true
+    process_results: !function utils.process_results
+    num_fewshot: 0
+
+  - task: aime25
+    dataset_path: AI-MO/aimo-validation-aime
+    dataset_name: aime25
+    output_type: generate_until
+    generation_kwargs:
+      max_new_tokens: 256
+      do_sample: false
+      temperature: 0.0
+    metric_list:
+      - metric: exact_match
+        aggregation: mean
+        higher_is_better: true
+    process_results: !function utils.process_results
+    num_fewshot: 0
