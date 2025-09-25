@@ -39,8 +39,19 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   echo "ERROR: venv missing at $VENV_DIR. Run train.slurm once to create a pinned env."
   exit 1
 fi
+
 source "$VENV_DIR/bin/activate"
 PY="$VENV_DIR/bin/python"
+
+# Check Python version but don't fail - just warn if not 3.10
+PYTHON_VERSION=$($PY -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [[ "$PYTHON_VERSION" == "3.10" ]]; then
+  echo "✅ Python version verified: $PYTHON_VERSION"
+elif [[ "$PYTHON_VERSION" == "3.12" ]]; then
+  echo "⚠️  Using Python $PYTHON_VERSION (prefer 3.10 but 3.12 should work)"
+else
+  echo "⚠️  Using Python $PYTHON_VERSION (untested version)"
+fi
 
 echo "=== ENVIRONMENT DIAGNOSTICS ==="
 echo "Date: $(date)"

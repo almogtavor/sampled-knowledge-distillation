@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -56,9 +56,7 @@ class TaskConfig(BaseModel):
 
 class BenchmarkConfig(BaseModel):
     task: List[TaskConfig] = Field(alias="manual_tasks")
-
-    class Config:
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
 class _BenchmarkSafeLoader(yaml.SafeLoader):
     """YAML loader that gracefully handles custom tags like !function."""
@@ -125,6 +123,11 @@ def materialize_manual_tasks(config: BenchmarkConfig, cache_root: Path) -> Path:
         existing.unlink()
     for task in config.task:
         (manual_dir / f"{task.task}.yaml").write_text(_render_manual_task(task))
+    src_utils = Path(__file__).with_name("utils.py")
+    if src_utils.exists():
+        target_dir = manual_dir / "ekd" / "evaluations"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_utils, target_dir / "utils.py")
     return manual_dir
 
 # ---------- Utility ----------
@@ -272,7 +275,7 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 # LIGHT suite (coffee-break): strict caps via --limit (first-N selection by harness)
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
-    ("gsm8k", 100),
+    ("gsm8k", 50),
     ("svamp", 100),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
@@ -302,7 +305,6 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("piqa", None),
     ("lambada_openai", None),
      # General reasoning
-    ("bbh", None),
     ("agieval", None),
     ("bbh", None), # BIG-Bench Hard
     ("agieval", None),
@@ -381,6 +383,7 @@ def run_lmeval_suite(
             print(f"⚠️ Warning: Invalid benchmark config: {e}")
 
     include_path = (manual_include_dir or include_root).as_posix()
+    repo_root = Path(__file__).resolve().parents[2].as_posix()
 
     if not gpu_ids:
         print("[lm-eval] No GPUs detected/selected; skipping suite.")
@@ -421,7 +424,10 @@ def run_lmeval_suite(
         for (task, limit), gid in zip(wave, gpu_ids):
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
-            env["PYTHONPATH"] = include_path + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            py_path_parts = [include_path, repo_root]
+            if env.get("PYTHONPATH"):
+                py_path_parts.append(env["PYTHONPATH"])
+            env["PYTHONPATH"] = ":".join(py_path_parts)
             cmd = _task_cmd(task, limit, "cuda:0")
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
@@ -573,10 +579,14 @@ def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
     if not lmeval_dir or not lmeval_dir.exists():
         return {}
     results: Dict[str, Dict[str, float]] = {}
-    for p in lmeval_dir.rglob("results.json"):
+    # Look for both per-task and aggregated outputs
+    targets = list(lmeval_dir.rglob("results.json")) + list(lmeval_dir.rglob("aggregated_results.json"))
+    if not targets:
+        return {}
+    for p in targets:
         try:
             blob = json.load(open(p))
-            r = blob.get("results", {})
+            r = blob.get("results", blob if "results" not in blob else {})
             for task, metrics in r.items():
                 results.setdefault(task, {})
                 for mk, mv in metrics.items():
@@ -676,6 +686,9 @@ def merge_model_results(per_source: List[Dict[str, Dict[str, float]]]) -> Dict[s
 def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]) -> None:
     all_metrics = sorted({m for model in all_models_metrics.values() for task in model.values() for m in task.keys()})
     tasks = sorted({t for model in all_models_metrics.values() for t in model.keys()})
+    if not all_metrics or not tasks:
+        print("\n% No metrics found — check timeouts/include_path. Skipping table.\n")
+        return
     print("\n% ---- LaTeX table (booktabs) ----")
     print(r"\begin{table}")
     print(r"\centering")

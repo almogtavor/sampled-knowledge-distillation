@@ -229,3 +229,4 @@ kd_vanilla_run_out_model/
 kd_ekd_run_out_model/
 tb/
 evalplus_results/
+.tensorboard-info/

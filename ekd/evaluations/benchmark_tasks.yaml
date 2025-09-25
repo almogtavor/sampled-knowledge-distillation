@@ -6,8 +6,8 @@ manual_tasks:
       max_new_tokens: 256
       do_sample: false
       temperature: 0.0
-    process_docs: !function utils.process_docs_svamp
-    process_results: !function utils.process_results_numeric_em
+    process_docs: !function ekd.evaluations.utils.process_docs_svamp
+    process_results: !function ekd.evaluations.utils.process_results_numeric_em
     num_fewshot: 0
 
   - task: aime25
@@ -18,6 +18,6 @@ manual_tasks:
       max_new_tokens: 256
       do_sample: false
       temperature: 0.0
-    process_docs: !function utils.process_docs_aimo
-    process_results: !function utils.process_results_numeric_em
+    process_docs: !function ekd.evaluations.utils.process_docs_aimo
+    process_results: !function ekd.evaluations.utils.process_results_numeric_em
     num_fewshot: 0
