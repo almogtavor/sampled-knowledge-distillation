@@ -44,7 +44,7 @@ evalplus==0.3.1
 alpaca-eval==0.6.6
 
 # ---- Optional safety (script skips if missing env/configs)
-jailbreakbench==1.0.0
+#jailbreakbench==1.0.0
 litellm==1.77.1
 PyYAML>=6.0.1
 

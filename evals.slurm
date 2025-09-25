@@ -65,21 +65,21 @@ PY
 # ---------- install/upgrade eval deps (idempotent) ----------
 echo "Installing/upgrading evaluation dependencies from requirements.txt..."
 echo "=== PIP INSTALL DIAGNOSTICS ==="
-pip install -q --upgrade pip wheel setuptools || {
+$PY -m pip install -q --upgrade pip wheel setuptools || {
     echo "WARNING: pip/wheel/setuptools upgrade failed"
-    pip --version
+  $PY -m pip --version
 }
 
 echo "Installing from requirements.txt..."
-if ! pip install -q --upgrade -r requirements.txt; then
+if ! $PY -m pip install -q --upgrade -r requirements.txt; then
     echo "ERROR: pip install failed. Showing detailed error:"
-    pip install --upgrade -r requirements.txt
+  $PY -m pip install --upgrade -r requirements.txt
     echo "Continuing anyway..."
 fi
 
 echo "=== POST-INSTALL PACKAGE CHECK ==="
 echo "Key packages installed:"
-pip show lm-eval lighteval transformers torch | grep -E "Name|Version" || echo "Some packages missing"
+$PY -m pip show lm-eval lighteval transformers torch | grep -E "Name|Version" || echo "Some packages missing"
 echo "==================================="
 
 # ---------- reorder GPUs by free VRAM and advertise to the script ----------

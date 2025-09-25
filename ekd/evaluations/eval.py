@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import importlib
 
 load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -54,13 +55,77 @@ class TaskConfig(BaseModel):
     num_fewshot: int = 0
 
 class BenchmarkConfig(BaseModel):
-    manual_tasks: List[TaskConfig]
+    task: List[TaskConfig] = Field(alias="manual_tasks")
+
+    class Config:
+        allow_population_by_field_name = True
+
+class _BenchmarkSafeLoader(yaml.SafeLoader):
+    """YAML loader that gracefully handles custom tags like !function."""
+
+def _construct_unknown_tag(loader: _BenchmarkSafeLoader, tag_suffix: str, node: yaml.Node):
+    if isinstance(node, yaml.ScalarNode):
+        return loader.construct_scalar(node)
+    if isinstance(node, yaml.SequenceNode):
+        return loader.construct_sequence(node)
+    if isinstance(node, yaml.MappingNode):
+        return loader.construct_mapping(node)
+    raise TypeError(f"Unsupported YAML node type for custom tag: {type(node)}")
+
+_BenchmarkSafeLoader.add_multi_constructor("!", _construct_unknown_tag)
 
 def load_benchmark_config(config_path: Path) -> BenchmarkConfig:
     """Load and validate benchmark configuration from YAML."""
-    with open(config_path, 'r') as f:
-        data = yaml.safe_load(f)
+    with open(config_path, "r") as f:
+        data = yaml.load(f, Loader=_BenchmarkSafeLoader)
     return BenchmarkConfig(**data)
+
+
+def _bool_to_yaml(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _render_manual_task(task: TaskConfig) -> str:
+    lines = [f"task: {task.task}", f"dataset_path: {task.dataset_path}"]
+    if task.dataset_name:
+        lines.append(f"dataset_name: {task.dataset_name}")
+    g = task.generation_kwargs
+    lines.append(f"output_type: {task.output_type}")
+    lines.append('doc_to_text: "{{input}}"')
+    lines.append('doc_to_target: "{{answer}}"')
+    lines.append("generation_kwargs:")
+    lines.append(f"  max_new_tokens: {g.max_new_tokens}")
+    lines.append(f"  do_sample: {_bool_to_yaml(g.do_sample)}")
+    lines.append(f"  temperature: {g.temperature}")
+    lines.append("  until:")
+    lines.append('    - "\\\\n\\\\n"')
+    lines.append('    - "</s>"')
+    lines.append('    - "<|im_end|>"')
+    if task.process_docs:
+        lines.append(f"process_docs: !function {task.process_docs}")
+    if task.metric_list:
+        lines.append("metric_list:")
+        for metric in task.metric_list:
+            lines.extend([
+                f"  - metric: {metric.metric}",
+                f"    aggregation: {metric.aggregation}",
+                f"    higher_is_better: {_bool_to_yaml(metric.higher_is_better)}",
+            ])
+    if task.process_results:
+        lines.append(f"process_results: !function {task.process_results}")
+    lines.extend([f"num_fewshot: {task.num_fewshot}", ""])
+    return "\n".join(lines)
+
+
+def materialize_manual_tasks(config: BenchmarkConfig, cache_root: Path) -> Path:
+    """Create per-task YAML files lm-eval can consume from the benchmark config."""
+    manual_dir = cache_root / "_manual_tasks"
+    ensure_dir(manual_dir)
+    for existing in manual_dir.glob("*.yaml"):
+        existing.unlink()
+    for task in config.task:
+        (manual_dir / f"{task.task}.yaml").write_text(_render_manual_task(task))
+    return manual_dir
 
 # ---------- Utility ----------
 def run(cmd: List[str], env: Optional[Dict[str, str]] = None, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Tuple[int, str]:
@@ -206,11 +271,17 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 # in older harness versions; failures are tolerated and reported.
 # LIGHT suite (coffee-break): strict caps via --limit (first-N selection by harness)
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
-    ("gsm8k", 100),            # accuracy
-    ("svamp", 100),            # accuracy
-    ("arc_challenge", 300),    # acc_norm
-    ("hellaswag", 500),        # acc_norm
-    ("aime25", None),          # exact-match (tiny)
+    # accuracy (percentage of correct answers)
+    ("gsm8k", 100),
+    ("svamp", 100),
+    ("lambada_openai", None), 
+    # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
+    ("arc_challenge", 300),
+    ("arc_easy", 300),
+    ("hellaswag", 500),
+    ("piqa", 500),
+    # exact-match
+    ("aime25", None),
 ]
 # Optional tiny adds (off by default): BoolQ 200, HumanEval full
 LIGHT_ENABLE_OPTIONALS = os.environ.get("LIGHT_EXTRAS", "0") == "1"
@@ -223,20 +294,25 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # Reasoning & math
     ("gsm8k", None),
     ("svamp", None),
-    ("asdiv", None),               # arithmetic subset (ASDiv-A handled inside task)
-    ("hendrycks_math", None),      # MATH
+    ("asdiv", None), # arithmetic subset (ASDiv-A handled inside task)
+    ("hendrycks_math", None),  # MATH
     ("aime24", None),
     ("aime25", None),
     ("olympiadbench", None),
-    # General reasoning
-    ("bbh", None),                  # BIG-Bench Hard group
-    ("agieval", None),              # AGIEval group
+    ("piqa", None),
+    ("lambada_openai", None),
+     # General reasoning
+    ("bbh", None),
+    ("agieval", None),
+    ("bbh", None), # BIG-Bench Hard
+    ("agieval", None),
     # QA / multi-hop
     ("squadv2", None),
     ("hotpotqa", None),
     ("nq_open", None),
-    # Commonsense
+     # Commonsense
     ("hellaswag", None),
+    ("arc_easy", None),
     ("arc_challenge", None),
 ]
 
@@ -278,28 +354,37 @@ def run_lmeval_suite(
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
 
-    tasks_with_limits: List[Tuple[str, Optional[int]]]
-    if suite == "light":
-        tasks_with_limits = list(LIGHT_LMEVAL_TASKS)
-        if LIGHT_ENABLE_OPTIONALS:
-            tasks_with_limits += list(LIGHT_OPTIONALS)
-    else:
-        tasks_with_limits = list(HEAVY_LMEVAL_TASKS)
+    tasks_with_limits: List[Tuple[str, Optional[int]]] = list(
+        LIGHT_LMEVAL_TASKS if suite == "light" else HEAVY_LMEVAL_TASKS
+    )
+    if suite == "light" and LIGHT_ENABLE_OPTIONALS:
+        tasks_with_limits += list(LIGHT_OPTIONALS)
 
     if not tasks_with_limits:
         print("No LM-Eval tasks selected.")
         return None
 
     # Validate benchmark config if it exists
-    include_dir = Path(__file__).parent
-    benchmark_config_path = include_dir / "benchmark_tasks.yaml"
+    include_root = Path(__file__).parent
+    manual_include_dir: Optional[Path] = None
+    benchmark_config_path = include_root / "benchmark_tasks.yaml"
     if benchmark_config_path.exists():
         try:
             config = load_benchmark_config(benchmark_config_path)
-            manual_tasks = [task.task for task in config.task]
-            print(f"✅ Validated benchmark config with {len(manual_tasks)} custom tasks: {manual_tasks}")
+            manual_task_names = [task.task for task in config.task]
+            manual_include_dir = materialize_manual_tasks(config, results_dir)
+            print(
+                f"✅ Validated benchmark config with {len(manual_task_names)} custom tasks: {manual_task_names}\n"
+                f"➡️  Materialized manual tasks at {manual_include_dir}"
+            )
         except Exception as e:
             print(f"⚠️ Warning: Invalid benchmark config: {e}")
+
+    include_path = (manual_include_dir or include_root).as_posix()
+
+    if not gpu_ids:
+        print("[lm-eval] No GPUs detected/selected; skipping suite.")
+        return None
 
     # preflight: load task registry to filter unknown tasks (but allow external include_path)
     try:
@@ -309,28 +394,20 @@ def run_lmeval_suite(
         _available = set()
 
     # Include local task YAMLs if present
-    include_dir = Path(__file__).parent.as_posix()
     base_args = [
         "lm-eval",
         "--model", "hf",
-        "--model_args", f"pretrained={model_dir},trust_remote_code=True",
-        "--batch_size", "8",
+        "--model_args", f"pretrained={model_dir},trust_remote_code=True,dtype=float16",
+        "--batch_size", "auto", # Let the harness pick the largest safe batch size
         "--output_path", str(out_dir),
-        "--include_path", include_dir,
+        "--include_path", include_path,
     ]
 
-    # CPU fallback (sequential)
-    if not gpu_ids:
-        print("[lm-eval] No GPUs detected; running sequentially on CPU.")
-        good_any = False
-        for (task, limit) in tasks_with_limits:
-            args = base_args + ["--tasks", task, "--device", "cpu"]
-            if isinstance(limit, (int, float)):
-                args += ["--limit", str(limit)]
-            timeout = TASK_TIMEOUTS.get(task, 3600)
-            code, _ = run(args, timeout=timeout)
-            good_any |= (code == 0)
-        return out_dir if good_any else None
+    def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
+        cmd = base_args + ["--tasks", task, "--device", device]
+        if isinstance(limit, (int, float)):
+            cmd += ["--limit", str(limit)]
+        return cmd
 
     # Parallel across physical GPUs (mask each process to one GPU)
     good_any = False
@@ -344,9 +421,8 @@ def run_lmeval_suite(
         for (task, limit), gid in zip(wave, gpu_ids):
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
-            cmd = base_args + ["--tasks", task, "--device", "cuda:0"]
-            if isinstance(limit, (int, float)):
-                cmd += ["--limit", str(limit)]
+            env["PYTHONPATH"] = include_path + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            cmd = _task_cmd(task, limit, "cuda:0")
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
             procs.append((task, p, timeout))
@@ -371,22 +447,21 @@ def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> O
         return None
     out_path = results_dir / f"lighteval_{tag}.json"
     tasks = [t.replace("-", "_") for t in LIGHTEVAL_TASKS]  # normalize hyphen → underscore
-    cmd = [
-        "lighteval",
-        "--model", "hf", str(model_dir),
-        "--tasks", ",".join(tasks),
-        "--results", str(out_path),
-    ]
-    code, _ = run(cmd)
-    if code != 0:
-        # Fallback: module invocation
-        cmd = [
+    code = 1
+    for cmd in (
+        [
+            "lighteval", "--model", "hf", str(model_dir),
+            "--tasks", ",".join(tasks), "--results", str(out_path),
+        ],
+        [
             sys.executable, "-m", "lighteval",
             "--model", "hf", str(model_dir),
-            "--tasks", ",".join(tasks),
-            "--results", str(out_path),
-        ]
+            "--tasks", ",".join(tasks), "--results", str(out_path),
+        ],
+    ):
         code, _ = run(cmd)
+        if code == 0:
+            break
     return out_path if code == 0 and out_path.exists() else None
 
 # ---------- EvalPlus (code: HumanEval/MBPP) ----------
@@ -398,6 +473,10 @@ def run_evalplus(model_dir: Path, tag: str, datasets: List[str], suite: str) -> 
     out = {}
     evalplus_home = Path(os.environ.get("TMPDIR", "/tmp")) / "evalplus_home"
     (evalplus_home / ".cache").mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["HOME"] = str(evalplus_home)
+    env["XDG_CACHE_HOME"] = str(evalplus_home / ".cache")
+    env.setdefault("EVALPLUS_TRUST_REMOTE_CODE", "1")
     for ds_name in datasets:
         cmd = [
             "evalplus.evaluate",
@@ -406,10 +485,6 @@ def run_evalplus(model_dir: Path, tag: str, datasets: List[str], suite: str) -> 
             "--backend", "hf",
             "--greedy",
         ]
-        env = os.environ.copy()
-        env["HOME"] = str(evalplus_home)             # avoid $HOME
-        env["XDG_CACHE_HOME"] = str(evalplus_home / ".cache")
-        env.setdefault("EVALPLUS_TRUST_REMOTE_CODE", "1")
         code, _ = run(cmd, env=env)
         results_root = Path("evalplus_results") / ds_name
         out[ds_name] = results_root if results_root.exists() and code == 0 else None
@@ -495,9 +570,9 @@ def run_harmbench(model_dir: Path, tag: str, results_dir: Path, suite: str) -> O
 
 # ---------- Results aggregation ----------
 def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
-    results = {}
     if not lmeval_dir or not lmeval_dir.exists():
-        return results
+        return {}
+    results: Dict[str, Dict[str, float]] = {}
     for p in lmeval_dir.rglob("results.json"):
         try:
             blob = json.load(open(p))
@@ -517,79 +592,77 @@ def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
     return results
 
 def collect_lighteval_metrics(out_file: Path) -> Dict[str, Dict[str, float]]:
-    results = {}
     if not out_file or not out_file.exists():
-        return results
+        return {}
     try:
         blob = json.load(open(out_file))
-        for task, task_res in blob.items():
-            results[task] = {}
-            for mk, mv in task_res.items():
-                if isinstance(mv, (int, float)):
-                    results[task][mk] = float(mv)
+        return {
+            task: {mk: float(mv) for mk, mv in task_res.items() if isinstance(mv, (int, float))}
+            for task, task_res in blob.items()
+        }
     except Exception as e:
         print(f"Failed to parse {out_file}: {e}")
-    return results
+    return {}
 
 def collect_evalplus_metrics(root: Optional[Path], ds_name: str) -> Dict[str, Dict[str, float]]:
-    results = {}
     if not root or not root.exists():
-        return results
-    candidates = list(root.rglob("summary.json")) + list(root.rglob("report.json")) + list(root.rglob("scores.json"))
+        return {}
+    candidates = [p for name in ("summary.json", "report.json", "scores.json") for p in root.rglob(name)]
     if not candidates:
-        return results
+        return {}
     p = max(candidates, key=lambda x: x.stat().st_mtime)
     try:
         blob = json.load(open(p))
-        task = f"{ds_name}"
-        results[task] = {}
-        for k in ["pass@1", "pass@5", "pass@10", "pass@100", "mbpp_score", "humaneval_score"]:
-            if k in blob and isinstance(blob[k], (int, float)):
-                results[task][k] = float(blob[k])
-        for k, v in blob.items():
-            if k not in results[task] and isinstance(v, (int, float)) and ("pass" in k or "score" in k or "acc" in k):
-                results[task][k] = float(v)
+        metrics = {
+            k: float(blob[k])
+            for k in ["pass@1", "pass@5", "pass@10", "pass@100", "mbpp_score", "humaneval_score"]
+            if isinstance(blob.get(k), (int, float))
+        }
+        metrics.update(
+            {
+                k: float(v)
+                for k, v in blob.items()
+                if k not in metrics and isinstance(v, (int, float)) and ("pass" in k or "score" in k or "acc" in k)
+            }
+        )
+        return {ds_name: metrics}
     except Exception as e:
         print(f"Failed to parse EvalPlus summary at {p}: {e}")
-    return results
+    return {}
 
 def collect_alpacaeval_metrics(out_dir: Optional[Path]) -> Dict[str, Dict[str, float]]:
-    results = {}
     if not out_dir or not out_dir.exists():
-        return results
-    candidates = list(out_dir.rglob("*.json"))
-    for p in candidates:
+        return {}
+    for p in out_dir.rglob("*.json"):
         try:
             blob = json.load(open(p))
             if isinstance(blob, dict):
-                task = "AlpacaEval2"
-                vals = {}
-                for k in ["length_controlled_win_rate", "win_rate", "pairwise_win_rate", "length_controlled"]:
-                    if k in blob and isinstance(blob[k], (int, float)):
-                        vals[k] = float(blob[k])
+                vals = {
+                    k: float(blob[k])
+                    for k in ["length_controlled_win_rate", "win_rate", "pairwise_win_rate", "length_controlled"]
+                    if isinstance(blob.get(k), (int, float))
+                }
                 if vals:
-                    results[task] = vals
-                    break
+                    return {"AlpacaEval2": vals}
         except Exception:
             continue
-    return results
+    return {}
 
 def collect_simple_json(root: Optional[Path], task_name: str, filename: str) -> Dict[str, Dict[str, float]]:
-    results = {}
     if not root:
-        return results
+        return {}
     p = root / filename
-    if p.exists():
-        try:
-            blob = json.load(open(p))
-            if isinstance(blob, dict):
-                results[task_name] = {}
-                for k, v in blob.items():
-                    if isinstance(v, (int, float)):
-                        results[task_name][k] = float(v)
-        except Exception as e:
-            print(f"Failed to parse {p}: {e}")
-    return results
+    if not p.exists():
+        return {}
+    try:
+        blob = json.load(open(p))
+        if isinstance(blob, dict):
+            return {
+                task_name: {k: float(v) for k, v in blob.items() if isinstance(v, (int, float))}
+            }
+    except Exception as e:
+        print(f"Failed to parse {p}: {e}")
+    return {}
 
 def merge_model_results(per_source: List[Dict[str, Dict[str, float]]]) -> Dict[str, Dict[str, float]]:
     merged = {}
