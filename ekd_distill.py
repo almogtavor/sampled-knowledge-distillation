@@ -252,7 +252,7 @@ def main():
     )
 
     print("Loading student on its own GPU...", flush=True)
-    student, _ = load_model(  # your existing helper is fine for student
+    student = load_model(  # your existing helper is fine for student
         config.student_model,
         device_map=student_gpu,     # {'': 1}
         quant_bits=config.student_quant_bits,
