@@ -202,8 +202,6 @@ class Distiller:
                 # Fallback to vanilla if no bucket tokens found
                 denom = valid_next.sum().clamp(min=1)
                 kd_loss = (kl_pos * valid_next).sum() / denom
-        else:
-            raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
         elif self.config.distill_type == "random":
             kd_terms = []
             Bsz = kl_pos.size(0)
@@ -226,7 +224,9 @@ class Distiller:
             else:
                 denom = valid_next.sum().clamp(min=1)
                 kd_loss = (kl_pos * valid_next).sum() / denom
-
+        else:
+            raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
+        
         # Multiply by T^2 as in standard distillation
         kd_loss = kd_loss * T2
 
