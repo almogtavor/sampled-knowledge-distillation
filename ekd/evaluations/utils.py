@@ -7,13 +7,15 @@ def _strip(s: str) -> str:
 
 
 def _num_from_text(s: str) -> str | None:
+    s = str(s).replace("−", "-")
     dollars = re.findall(r"\$([^$]+)\$", s)
     if dollars:
         s = dollars[-1]
     boxed = re.search(r"\\boxed\{([^}]+)\}", s)
     if boxed:
         s = boxed.group(1)
-    match = re.search(r"(-?\d+(?:\.\d+)?)", s.replace(",", ""))
+    s = s.replace(",", "")
+    match = re.search(r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", s)
     return match.group(1) if match else None
 
 
