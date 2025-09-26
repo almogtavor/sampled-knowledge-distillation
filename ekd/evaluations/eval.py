@@ -82,6 +82,14 @@ def load_benchmark_config(config_path: Path) -> BenchmarkConfig:
 def _bool_to_yaml(value: bool) -> str:
     return "true" if value else "false"
 
+def _normalize_func_ref(ref: str) -> str:
+    # Accept "path/to/file.py:fn" or "pkg.mod:fn". Convert the latter to a file path.
+    if ":" not in ref:
+        return ref
+    head, func = ref.split(":", 1)
+    if head.endswith(".py") or "/" in head:
+        return f"{head}:{func}"
+    return f"{head.replace('.', '/')}.py:{func}"
 
 def _render_manual_task(task: TaskConfig) -> str:
     lines = [f"task: {task.task}", f"dataset_path: {task.dataset_path}"]
@@ -100,7 +108,7 @@ def _render_manual_task(task: TaskConfig) -> str:
     lines.append('    - "</s>"')
     lines.append('    - "<|im_end|>"')
     if task.process_docs:
-        lines.append(f"process_docs: !function {task.process_docs}")
+        lines.append(f"process_docs: !function {_normalize_func_ref(task.process_docs)}")
     if task.metric_list:
         lines.append("metric_list:")
         for metric in task.metric_list:
@@ -110,7 +118,7 @@ def _render_manual_task(task: TaskConfig) -> str:
                 f"    higher_is_better: {_bool_to_yaml(metric.higher_is_better)}",
             ])
     if task.process_results:
-        lines.append(f"process_results: !function {task.process_results}")
+        lines.append(f"process_results: !function {_normalize_func_ref(task.process_results)}")
     lines.extend([f"num_fewshot: {task.num_fewshot}", ""])
     return "\n".join(lines)
 
@@ -580,21 +588,41 @@ def collect_lmeval_metrics(lmeval_dir: Path) -> Dict[str, Dict[str, float]]:
         return {}
     results: Dict[str, Dict[str, float]] = {}
     # Look for both per-task and aggregated outputs
-    targets = list(lmeval_dir.rglob("results.json")) + list(lmeval_dir.rglob("aggregated_results.json"))
+    patterns = [
+        "results.json",
+        "aggregated_results.json",
+        "*results*.json",
+        "*aggregated*.json",
+        "*results*.yaml",
+    ]
+    targets: List[Path] = []
+    for pat in patterns:
+        targets.extend(lmeval_dir.rglob(pat))
+    if not targets:
+        return {}
     if not targets:
         return {}
     for p in targets:
         try:
-            blob = json.load(open(p))
-            r = blob.get("results", blob if "results" not in blob else {})
+            if p.suffix == ".yaml":
+                blob = yaml.safe_load(open(p))
+            else:
+                blob = json.load(open(p))
+            r = blob.get("results", blob if isinstance(blob, dict) else {})
+            if not isinstance(r, dict):
+                continue
             for task, metrics in r.items():
+                if not isinstance(metrics, dict):
+                    continue
                 results.setdefault(task, {})
                 for mk, mv in metrics.items():
                     if isinstance(mv, dict) and "value" in mv:
-                        if isinstance(mv["value"], (int, float)):
-                            results[task][mk] = float(mv["value"])
-                        if "stderr" in mv and isinstance(mv["stderr"], (int, float)):
-                            results[task][f"{mk}_stderr"] = float(mv["stderr"])
+                        v = mv.get("value")
+                        if isinstance(v, (int, float)):
+                            results[task][mk] = float(v)
+                        se = mv.get("stderr")
+                        if isinstance(se, (int, float)):
+                            results[task][f"{mk}_stderr"] = float(se)
                     elif isinstance(mv, (int, float)):
                         results[task][mk] = float(mv)
         except Exception as e:

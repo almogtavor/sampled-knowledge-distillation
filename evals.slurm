@@ -122,18 +122,14 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 # ---------- args ----------
-# Usage: sbatch evals.slurm <vanilla|ekd> <checkpoint_filename.pt> <suite: heavy|light> [base_model_dir]
+# Usage: sbatch evals.slurm <vanilla|top-k-tok|ekd> <checkpoint_filename.pt> <suite: heavy|light> [base_model_dir]
 RUN_TAG=${1:-}
 CKPT_FILE=${2:-}
 SUITE=${3:-}
 BASE_MODEL_DIR=${4:-"Qwen/Qwen3-0.6B"}
 
 if [[ -z "$RUN_TAG" || -z "$CKPT_FILE" || -z "$SUITE" ]]; then
-  echo "Error: missing args. Usage: sbatch evals.slurm <vanilla|ekd> <checkpoint_filename.pt> <suite: heavy|light> [base_model_dir]"
-  exit 2
-fi
-if [[ "$RUN_TAG" != "vanilla" && "$RUN_TAG" != "ekd" ]]; then
-  echo "Error: RUN_TAG must be 'vanilla' or 'ekd'"
+  echo "Error: missing args. Usage: sbatch evals.slurm <vanilla|top-k-tok|ekd> <checkpoint_filename.pt> <suite: heavy|light> [base_model_dir]"
   exit 2
 fi
 if [[ "$SUITE" != "heavy" && "$SUITE" != "light" ]]; then
@@ -142,8 +138,21 @@ if [[ "$SUITE" != "heavy" && "$SUITE" != "light" ]]; then
 fi
 
 VANILLA_DIR=kd_vanilla_run_out_model/checkpoints
-EKD_DIR=kd_ekd_run_out_model/checkpoints
-CKPT_DIR=$([[ "$RUN_TAG" == "vanilla" ]] && echo "$VANILLA_DIR" || echo "$EKD_DIR")
+EKD_DIR=kd_ekd_run_out_model/checkpoints  # Legacy ekd directory
+TOP_K_TOK_DIR=kd_top_k_tok_run_out_model/checkpoints  # New top-k-tok directory
+
+# Support both old 'ekd' and new 'top-k-tok' tags
+if [[ "$RUN_TAG" == "vanilla" ]]; then
+  CKPT_DIR="$VANILLA_DIR"
+elif [[ "$RUN_TAG" == "ekd" ]]; then
+  CKPT_DIR="$EKD_DIR"
+elif [[ "$RUN_TAG" == "top-k-tok" ]]; then
+  CKPT_DIR="$TOP_K_TOK_DIR"
+else
+  echo "Error: RUN_TAG must be 'vanilla', 'ekd', or 'top-k-tok'"
+  exit 2
+fi
+
 CKPT_PATH="$CKPT_DIR/$CKPT_FILE"
 echo "Evaluating tag=$RUN_TAG checkpoint=$CKPT_PATH base=$BASE_MODEL_DIR suite=$SUITE"
 mkdir -p logs eval_runs
@@ -166,4 +175,5 @@ echo "Done. Logs: eval_runs/${RUN_TAG}.${SLURM_JOB_ID}.${SUITE}.log"
 
 # Example usage:
 # sbatch evals.slurm vanilla latest_checkpoint.pt light Qwen/Qwen3-0.6B
-# sbatch evals.slurm ekd latest_checkpoint.pt heavy Qwen/Qwen3-0.6B
+# sbatch evals.slurm top-k-tok latest_checkpoint.pt heavy Qwen/Qwen3-0.6B
+# sbatch evals.slurm ekd latest_checkpoint.pt heavy Qwen/Qwen3-0.6B  # Legacy support

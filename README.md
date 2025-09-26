@@ -44,17 +44,17 @@ python ekd_distill.py \
     --answer_col answer \
     --output_dir ./kd_vanilla_run
 
-# Entropy-guided KD
+# Entropy-guided KD (top-k token selection)
 python ekd_distill.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
-    --distill_type ekd \
+    --distill_type top-k-tok \
     --top_k_percent 20 \
     --datasets gsm8k \
     --dataset_config main \
     --prompt_col question \
     --answer_col answer \
-    --output_dir ./kd_ekd_run
+    --output_dir ./kd_top_k_tok_run
 ```
 
 ## Requirements

@@ -4,12 +4,15 @@ set -euo pipefail
 # This script is called by train.slurm.
 # The virtual environment should already be activated.
 
-# Get distillation type parameter (default to "ekd" if not provided)
-DISTILL_TYPE=${1:-"ekd"}
+# Get distillation type parameter (default to "top-k-tok" if not provided)
+DISTILL_TYPE=${1:-"top-k-tok"}
 echo "Training with distillation type: $DISTILL_TYPE"
 
+# Convert hyphens to underscores for directory names
+DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
+
 # Set output directory based on distillation type
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE}_run_out_model"
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_model"
 
 # The python script with all its arguments.
 # Adjust arguments here as needed.

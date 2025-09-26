@@ -13,6 +13,7 @@ class TrainingConfig(BaseModel):
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
     distill_type: Literal["vanilla", "top-k-tok"] = "vanilla"
     top_k_percent: int = Field(default=20, description="for top-k-tok")
+    enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
     
     # Dataset settings
     datasets: List[str]

@@ -191,20 +191,24 @@ class Distiller:
         elif self.config.distill_type == "random-sampled-ekd":
             # In addition to top-k% entropy, randomly sample tokens from the rest so that distribution is more balanced
             pass
+        
         # --- CE loss (only valid targets) ---
-        logits = s_pred  # [B, L-1, V]
-        targets = input_ids_s[:, 1:] # [B, L-1]
-        targets = targets.masked_fill(~valid_next, -100)
+        if self.config.enable_ce:
+            logits = s_pred  # [B, L-1, V]
+            targets = input_ids_s[:, 1:] # [B, L-1]
+            targets = targets.masked_fill(~valid_next, -100)
 
-        V = logits.size(-1)
-        flat_logits = logits.reshape(-1, V)
-        flat_targets = targets.reshape(-1)
-        keep = flat_targets.ne(-100)
+            V = logits.size(-1)
+            flat_logits = logits.reshape(-1, V)
+            flat_targets = targets.reshape(-1)
+            keep = flat_targets.ne(-100)
 
-        if keep.any():
-            ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
+            if keep.any():
+                ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
+            else:
+                ce_loss = flat_logits.sum() * 0.0
         else:
-            ce_loss = flat_logits.sum() * 0.0
+            ce_loss = torch.tensor(0.0, device=self.student_device)
 
         # Final loss
         total = kd_loss + self.alpha_ce * ce_loss
