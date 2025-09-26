@@ -123,7 +123,7 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
         "step": chk.get("step"),
         "global_step": chk.get("global_step"),
         "distill_type": chk.get("distill_type"),
-        "top_k_percent": chk.get("top_k_percent"),
+        "k_percent": chk.get("k_percent"),
         "export_time_utc": datetime.utcnow().isoformat() + "Z",
         "ckpt_sha256": ckpt_hash,
     }

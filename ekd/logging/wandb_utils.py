@@ -231,17 +231,20 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
     if experiment_name is None:
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
         job_id = os.getenv("SLURM_JOB_ID", "local")
-        experiment_name = (
-            f"distill-{config.distill_type}-{current_date}_{job_id}"
-            + (f"_k={config.top_k_percent}" if config.distill_type == "vanilla" else "")
-        )
+        experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+        if config.distill_type == "ekd" or config.distill_type == "random":
+            experiment_name += f"_k={config.k_percent}"
+        elif config.distill_type == "bucket":
+            experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
     
     wandb_config = {
         # Training config
         "teacher_model": config.teacher_model,
         "student_model": config.student_model,
         "distill_type": config.distill_type,
-        "top_k_percent": config.top_k_percent,
+        "k_percent": config.k_percent,
+        "bucket_lower_percent": getattr(config, 'bucket_lower_percent', None),
+        "bucket_upper_percent": getattr(config, 'bucket_upper_percent', None),
         "epochs": config.epochs,
         "batch_size": config.batch_size,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
@@ -255,9 +258,17 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
     
     tags = [
         config.distill_type,
-        f"k={config.top_k_percent}" if config.distill_type == "vanilla" else "ekd",
+        f"k={config.k_percent}" if config.distill_type != "vanilla" else "vanilla",
         "training"
     ]
+    
+    # Add mode-specific tags
+    if config.distill_type == "ekd":
+        tags.append(f"k={config.k_percent}")
+    elif config.distill_type == "bucket":
+        tags.append(f"bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}")
+    elif config.distill_type == "vanilla":
+        tags.append("all-tokens")
     
     return WandBLogger(
         project=getattr(config, 'wandb_project', 'selective-entropy-knowledge-distillation'),

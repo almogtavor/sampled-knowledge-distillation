@@ -69,7 +69,7 @@ class Distiller:
             'model_state_dict': self.student.state_dict(),
             'optimizer_state_dict': self.opt.state_dict(),
             'distill_type': self.config.distill_type,
-            'top_k_percent': self.config.top_k_percent,
+            'k_percent': self.config.k_percent,
         }
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
@@ -149,9 +149,10 @@ class Distiller:
 
         # --- KD loss ---
         if self.config.distill_type == "vanilla":
+            # Vanilla: distill on ALL tokens
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-        else:
+        elif self.config.distill_type == "ekd":
             # EKD: top-k% entropy among valid positions only
             ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
             kd_terms = []
@@ -161,7 +162,7 @@ class Distiller:
                 if vi.sum() < 2:
                     continue
                 ent_valid = ent[i][vi]
-                thr = torch.quantile(ent_valid.float(), 1 - self.config.top_k_percent / 100.0)
+                thr = torch.quantile(ent_valid.float(), 1 - self.config.k_percent / 100.0)
                 keep = torch.zeros_like(vi)
                 keep[vi] = ent_valid >= thr
                 if keep.any():
@@ -171,7 +172,61 @@ class Distiller:
             else:
                 denom = valid_next.sum().clamp(min=1)
                 kd_loss = (kl_pos * valid_next).sum() / denom
-
+        elif self.config.distill_type == "bucket":
+            # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
+            # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
+            # This excludes both the lowest 70% and highest 20% entropy tokens
+            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+            kd_terms = []
+            Bsz = kl_pos.size(0)
+            for i in range(Bsz):
+                vi = valid_next[i]
+                if vi.sum() < 3:  # Need at least 3 tokens for bucket selection
+                    continue
+                ent_valid = ent[i][vi]
+                
+                # Calculate both thresholds
+                lower_thr = torch.quantile(ent_valid.float(), self.config.bucket_lower_percent / 100.0)
+                upper_thr = torch.quantile(ent_valid.float(), self.config.bucket_upper_percent / 100.0)
+                
+                # Select tokens in the bucket [lower_thr, upper_thr]
+                keep = torch.zeros_like(vi)
+                keep[vi] = (ent_valid >= lower_thr) & (ent_valid <= upper_thr)
+                
+                if keep.any():
+                    kd_terms.append(kl_pos[i][keep].mean())
+            
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:
+                # Fallback to vanilla if no bucket tokens found
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
+        elif self.config.distill_type == "random":
+            kd_terms = []
+            Bsz = kl_pos.size(0)
+            for i in range(Bsz):
+                vi = valid_next[i]
+                valid_count = vi.sum().item()
+                if valid_count < 2:
+                    continue
+                k_count = max(1, int(valid_count * self.config.k_percent / 100.0))
+                valid_indices = torch.where(vi)[0]
+                if len(valid_indices) >= k_count:
+                    perm = torch.randperm(len(valid_indices), device=self.student_device)
+                    selected_indices = valid_indices[perm[:k_count]]
+                    keep = torch.zeros_like(vi)
+                    keep[selected_indices] = True
+                    if keep.any():
+                        kd_terms.append(kl_pos[i][keep].mean())
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
+        else:
+            raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
+        
         # Multiply by T^2 as in standard distillation
         kd_loss = kd_loss * T2
 

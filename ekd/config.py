@@ -11,8 +11,12 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "ekd"] = "vanilla"
-    top_k_percent: int = Field(default=20, description="for EKD only")
+    distill_type: Literal["vanilla", "ekd", "random", "bucket"] = "vanilla"
+    k_percent: int = Field(default=20, description="for EKD and random only")
+    
+    # Bucket mode parameters (for distill_type="bucket")
+    bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")
+    bucket_upper_percent: int = Field(default=80, description="Upper bound for bucket mode (e.g., 80% means skip top 20%)")
     
     # Dataset settings
     datasets: List[str]
@@ -46,7 +50,7 @@ class CheckpointData(BaseModel):
     step: int
     global_step: int
     distill_type: str
-    top_k_percent: int
+    k_percent: int
     model_state_dict: dict
     optimizer_state_dict: dict
     

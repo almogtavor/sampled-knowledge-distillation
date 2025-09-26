@@ -25,11 +25,13 @@ ollama run qwen3:8b
 
 3. Run distillation:
 
-We provide two distillation types:
+We provide three distillation types:
 * **vanilla** — KL between teacher & student on **all** tokens.
 * **ekd** — KL computed **only** on *fork tokens*, i.e. those whose
-  teacher-entropy is in the top-`--top_k_percent` percentile inside each
+  teacher-entropy is in the top-`--k_percent` percentile inside each
   example.
+* **bucket** — KL computed on tokens with entropy in a specific percentile range,
+  e.g., 70th-80th percentile (excludes both very low and very high entropy tokens).
 
 We use Ollama's Qwen3-8B in 4-bit as teacher:
 ```bash
@@ -49,12 +51,25 @@ python ekd_distill.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type ekd \
-    --top_k_percent 20 \
+    --k_percent 20 \
     --datasets gsm8k \
     --dataset_config main \
     --prompt_col question \
     --answer_col answer \
     --output_dir ./kd_ekd_run
+
+# Bucket distillation (e.g., distill on 70th-80th percentile entropy tokens)
+python ekd_distill.py \
+    --teacher_model Qwen/Qwen3-8B \
+    --student_model Qwen/Qwen3-0.6B \
+    --distill_type bucket \
+    --bucket_lower_percent 70 \
+    --bucket_upper_percent 80 \
+    --datasets gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
+    --output_dir ./kd_bucket_run
 ```
 
 ## Requirements

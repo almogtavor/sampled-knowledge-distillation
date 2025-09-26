@@ -171,8 +171,12 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "ekd"], default="vanilla")
-    parser.add_argument("--top_k_percent", type=int, default=20, help="for EKD only")
+    parser.add_argument("--distill_type", choices=["vanilla", "ekd", "random", "bucket"], default="vanilla")
+    parser.add_argument("--k_percent", type=int, default=20, help="for EKD and random only")
+    parser.add_argument("--bucket_lower_percent", type=int, default=70, 
+                        help="For bucket mode: lower bound percentile (skip bottom X%)")
+    parser.add_argument("--bucket_upper_percent", type=int, default=80,
+                        help="For bucket mode: upper bound percentile (skip top Y%)")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
                         help="name of text prompt column for HF datasets")
@@ -248,7 +252,7 @@ def main():
     )
 
     print("Loading student on its own GPU...", flush=True)
-    student, _ = load_model(  # your existing helper is fine for student
+    student = load_model(  # your existing helper is fine for student
         config.student_model,
         device_map=student_gpu,     # {'': 1}
         quant_bits=config.student_quant_bits,
@@ -314,10 +318,11 @@ def main():
     # Initialize logging with experiment name
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = (
-        f"distill-{config.distill_type}-{current_date}_{job_id}"
-        + (f"_k={config.top_k_percent}" if config.distill_type != "vanilla" else "")
-    )
+    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+    if config.distill_type == "ekd" or config.distill_type == "random":
+        experiment_name += f"_k={config.k_percent}"
+    elif config.distill_type == "bucket":
+        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
     
     # Initialize combined logger (W&B + TensorBoard)
     combined_logger = create_training_combined_logger(

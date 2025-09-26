@@ -63,20 +63,4 @@ def load_model(
     )
     print("✅ Model loaded successfully, now loading tokenizer...")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,           # ← stabilize on clusters
-        trust_remote_code=True,
-        local_files_only=True
-    )
-    print("Tokenizer loaded", flush=True)
-    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-        print("Added PAD as EOS", flush=True)
-    else:
-        print(f"PAD set? id={tokenizer.pad_token_id}", flush=True)
-    # tiny smoke test
-    _ = tokenizer("ping")
-    print("Model and tokenizer ready!", flush=True)
-
-    return model, tokenizer
+    return model
