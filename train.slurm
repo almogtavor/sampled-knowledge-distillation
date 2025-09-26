@@ -13,7 +13,7 @@
 set -euo pipefail
 cd /home/joberant/NLP_2425b/$USER/ekd
 
-DISTILL_TYPE=${1:-"ekd"}
+DISTILL_TYPE=${1:-"top-k-tok"}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # ---------- caches / env ----------
@@ -134,7 +134,9 @@ except Exception as e:
 PY
 
 # ---------- launch ----------
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE}_run_out_model"
+# Convert hyphens to underscores for directory names
+DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_model"
 unset PYTHONPATH PYTHONHOME
 exec "$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \

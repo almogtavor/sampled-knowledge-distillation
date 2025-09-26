@@ -171,12 +171,14 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "ekd", "random", "bucket"], default="vanilla")
-    parser.add_argument("--k_percent", type=int, default=20, help="for EKD and random only")
+    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket"], default="vanilla")
+    parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--bucket_lower_percent", type=int, default=70, 
                         help="For bucket mode: lower bound percentile (skip bottom X%)")
     parser.add_argument("--bucket_upper_percent", type=int, default=80,
                         help="For bucket mode: upper bound percentile (skip top Y%)")
+    parser.add_argument("--enable_ce", action="store_true", default=False, 
+                        help="Enable cross-entropy loss in addition to KD loss")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
                         help="name of text prompt column for HF datasets")

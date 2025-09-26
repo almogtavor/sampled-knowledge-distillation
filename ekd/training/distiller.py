@@ -6,6 +6,7 @@ from torch.optim import AdamW
 import os
 from pathlib import Path
 import glob
+import math
 
 from ..config import TrainingConfig, CheckpointData, TrainingMetrics
 
@@ -106,6 +107,9 @@ class Distiller:
 
     @staticmethod
     def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
+        """Sanitize logits to prevent NaNs/Infs during training.
+        We might train with lower precision (e.g., fp16), so instability might occur.
+        """
         # cast to fp32 for stability, clamp, and replace NaN/Inf
         x = x.float()
         x = torch.clamp(x, min=-1e4, max=1e4)
@@ -116,62 +120,71 @@ class Distiller:
     
     def _forward_batch(self, batch):
         # Move inputs
-        input_ids = batch["input_ids"]
+        input_ids = batch["input_ids"] # [B, L]
         attn_mask = batch["attention_mask"]
         input_ids_t = input_ids.to(self.teacher_device)
         attn_t = attn_mask.to(self.teacher_device)
         input_ids_s = input_ids.to(self.student_device)
-        attn_s = attn_mask.to(self.student_device)
+        attn_mask_s = attn_mask.to(self.student_device)
 
         T = 2.0  # distillation temperature; feel free to move to config
         T2 = T * T
-
-        # ---- teacher ----
         with torch.no_grad():
             t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-            t_logits = self._sanitize_logits(t_logits, "teacher")
+            t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
 
-        # ---- student ----
-        s_logits = self.student(input_ids_s, attention_mask=attn_s).logits
+        s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
         s_logits = self._sanitize_logits(s_logits, "student")
 
         # Align to next-token prediction
-        t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
+        t_pred = t_logits[:, :-1, :]  # [B, L-1, V] (remove last token)
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
-        valid_next = attn_s[:, 1:].bool()  # [B, L-1]
+        valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
 
-        # Softened log-probs for KD
-        t_lp = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
-        s_lp = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
-
-        # KL per position (sum over vocab → [B, L-1])
-        kl_pos = self._kl_loss(t_lp.to(self.student_device), s_lp)
+        # Softened log-probs for KD with temperature scaling
+        t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
 
         # --- KD loss ---
         if self.config.distill_type == "vanilla":
-            # Vanilla: distill on ALL tokens
+            # KL for all positions for vanilla (sum over vocab so it becomes [B, L-1])
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-        elif self.config.distill_type == "ekd":
-            # EKD: top-k% entropy among valid positions only
-            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+        elif self.config.distill_type == "top-k-tok":
+            # top-k% tokens by entropy among valid positions only
+            # selection by entropy (T=1 for selection is common) ----
+            ent = token_entropy(t_pred).to(self.student_device) # [B, L-1]
+            ent = ent.masked_fill(~valid_next, float('-inf')) # ignore invalid
+
+            pct = max(0.0, min(1.0, self.config.top_k_percent / 100.0)) # e.g. 0.2
+
+            # top-k-tok: select positions first, then compute KL only on those
             kd_terms = []
-            Bsz = kl_pos.size(0)
-            for i in range(Bsz):
-                vi = valid_next[i]
-                if vi.sum() < 2:
-                    continue
-                ent_valid = ent[i][vi]
-                thr = torch.quantile(ent_valid.float(), 1 - self.config.k_percent / 100.0)
-                keep = torch.zeros_like(vi)
-                keep[vi] = ent_valid >= thr
-                if keep.any():
-                    kd_terms.append(kl_pos[i][keep].mean())
+            batch_size = valid_next.size(0)
+            for i in range(batch_size):
+                valid_next_i = valid_next[i]  # [L-1] - valid positions for sequence i
+                n_valid = int(valid_next_i.sum().item())  # Count valid positions
+                if n_valid < 3:
+                    continue # Skip sequences with too few valid tokens
+                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                # Find indices of valid positions (all that aren't 0)
+                valid_idx = torch.nonzero(valid_next_i, as_tuple=False).squeeze(-1)      # [n_valid]
+                ent_valid_pos = ent[i][valid_idx] # [n_valid], entropy of valid positions
+                _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
+                # Convert relative indices back to absolute sequence positions
+                selected_topk_idx = valid_idx[selected_topk_pos] # [k]
+
+                # Compute KL only on selected positions (sum over vocab, so [k])
+                kl_sel = self._kl_loss(t_log_probs[i, selected_topk_idx, :].to(self.student_device),
+                                       s_log_probs[i, selected_topk_idx, :])  # [k]
+                kd_terms.append(kl_sel.mean())
+
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
             else:
-                denom = valid_next.sum().clamp(min=1)
-                kd_loss = (kl_pos * valid_next).sum() / denom
+                # skip the batch if nothing selected
+                pass
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
@@ -227,23 +240,26 @@ class Distiller:
         else:
             raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
         
-        # Multiply by T^2 as in standard distillation
+        # Temperature factor (keep gradients comparable across T, as in standard distillation)
         kd_loss = kd_loss * T2
 
         # --- CE loss (only valid targets) ---
-        logits = s_pred                      # [B, L-1, V]
-        targets = input_ids_s[:, 1:]         # [B, L-1]
-        targets = targets.masked_fill(~valid_next, -100)
+        if self.config.enable_ce:
+            logits = s_pred  # [B, L-1, V]
+            targets = input_ids_s[:, 1:] # [B, L-1]
+            targets = targets.masked_fill(~valid_next, -100)
 
-        V = logits.size(-1)
-        flat_logits = logits.reshape(-1, V)
-        flat_targets = targets.reshape(-1)
-        keep = flat_targets.ne(-100)
+            V = logits.size(-1)
+            flat_logits = logits.reshape(-1, V)
+            flat_targets = targets.reshape(-1)
+            keep = flat_targets.ne(-100)
 
-        if keep.any():
-            ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
+            if keep.any():
+                ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
+            else:
+                ce_loss = flat_logits.sum() * 0.0
         else:
-            ce_loss = flat_logits.sum() * 0.0
+            ce_loss = torch.tensor(0.0, device=self.student_device)
 
         # Final loss
         total = kd_loss + self.alpha_ce * ce_loss

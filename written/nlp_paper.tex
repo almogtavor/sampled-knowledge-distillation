@@ -83,7 +83,7 @@ We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs. Ou
 
 \begin{itemize}
 \item introduce \textbf{token-selective distillation}: choose a subset of tokens for KD using scores such as teacher entropy, teacher-student KL, and student CE;
-\item estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD}—importance-sampling teacher classes and reweighting—so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
+\item estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD} - importance-sampling teacher classes and reweighting—so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
 \item maintain standard cross-entropy (CE) on \emph{all} tokens to stabilize training and calibration \citep{guo2017calibration}; and
 \item add simple curricula (increasing KD coverage over time) and optional EMA-based self-distillation for robustness.
 \end{itemize}
@@ -98,13 +98,28 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 
 \paragraph{Sparse logit KD and calibration.} Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide \emph{unbiased} estimates that match full-KD gradients in expectation with minimal overhead. Trustworthy distillation explicitly studies calibration and proposes processing the top-$k$ teacher tokens to reduce miscalibration \citep{shum2024first}. We measure calibration via Expected Calibration Error (ECE) \citep{guo2017calibration}.
 
-\paragraph{Selecting where to supervise.} Beyond “how” to form the target, several works decide “where” to apply supervision. In NMT, \citet{wang2021selectivekd} select \emph{words} by cross-entropy using batch-level and global (FIFO) queues (GLS). For post-training, token-level uncertainty-aware objectives select \emph{tokens} by loss/entropy and add self-distillation to prevent OOD overfitting \citep{liu2025tokenlevel}. In reasoning, KPOD learns keypoint weights and a progressive schedule within chain-of-thought rationales \citep{feng2024kpod}. Data-centric selection via Selective Reflection Distillation curates training instances with a curriculum \citep{liu2025srd}. Our work differs by coupling \emph{token-level} selection with \emph{unbiased} logit sampling at selected positions, yielding efficiency without the calibration drawbacks of deterministic truncation.
+\paragraph{Token-/word-level selective supervision.} Several strands selectively apply supervision at the granularity we target. In NMT, \citet{wang2021selectivekd} select high cross-entropy \emph{words} using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}. In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}. In CoT reasoning, KPOD learns token importance weights and a progressive schedule within rationales \citep{feng2024kpod}. Compared to these, our EKD selects tokens using teacher-centric uncertainty (entropy and teacher-student KL) and couples selection with \emph{unbiased} class-level Random-Sampling KD at selected positions; we also keep CE on all tokens for stability.
+
+\paragraph{Entropy/uncertainty-guided KD.} Beyond selection, multiple KD variants weight supervision by uncertainty or entropy. Entropy-based adaptive KD (EA-KD) prioritizes \emph{samples} with higher entropy \citep{su2023eakd}, while DE-MKD uses teacher-prediction entropy to weight among multiple teachers \citep{cheng2024demkd}. Uncertainty-aware mixup reduces KD cost while maintaining quality \citep{xu2023unix}. Recent work also shows entropy-weighted distillation can improve reliability/calibration in classification \citep{guo2024entropykd}. Our EKD differs in using entropy/KL primarily to decide \emph{which tokens} receive external-teacher KD, not to reweight losses globally.
+
+\paragraph{Entropy/perplexity for data selection.} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2022perplexprune} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
 \paragraph{Self-distillation and EMA teachers.} Self-distillation regularizes students via a teacher derived from the student itself, e.g., Born-Again Networks \citep{furlanello2018ban} and Mean Teacher (EMA) consistency \citep{tarvainen2017meanteacher}. We adopt an optional EMA self-distill term as a light regularizer complementary to external-teacher KD.
 
 \paragraph{Evaluation under shift.} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
 
 \paragraph{Summary.} Prior work either improves the \emph{where} (token/word/sample selection, curricula) \emph{or} the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
+
+% --------------------------
+% Suggested BibTeX keys (map to your .bib)
+% hinton2015distillation, sanh2019distilbert, kim2016sequencekd, gu2023minillm,
+% agarwal2024gkd, boizard2024uld, raman2023slim, anshumann2025sparse,
+% shum2024first, guo2017calibration, wang2021selectivekd, liu2025tokenlevel,
+% zhang2023continualkd, feng2024kpod, su2023eakd, cheng2024demkd, xu2023unix,
+% guo2024entropykd, moore2010cediff, axelrod2015few, axelrod2017cynical,
+% ankner2022perplexprune, datasel2024survey, zhang2022alsurvey, furlanello2018ban,
+% tarvainen2017meanteacher, zhang2023shiftkd
+
 
 % --------------------------
 % Suggested BibTeX keys (map to your .bib)
