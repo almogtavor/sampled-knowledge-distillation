@@ -237,6 +237,78 @@ class Distiller:
             else:
                 denom = valid_next.sum().clamp(min=1)
                 kd_loss = (kl_pos * valid_next).sum() / denom
+        elif self.config.distill_type == "rs-kd":
+            # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
+            # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
+            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+            kd_terms = []
+            Bsz = t_pred.size(0)
+            alpha = float(getattr(self.config, "rs_alpha", 1.0))
+            eps = float(getattr(self.config, "rs_epsilon", 0.02))
+            q_floor = float(getattr(self.config, "rs_floor", 1e-6))
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+        
+            for i in range(Bsz):
+                vi = valid_next[i]  # [L-1] bool of valid positions
+                valid_count = int(vi.sum().item())
+                if valid_count < 2:
+                    continue
+                
+                # Entropy over valid positions
+                ent_valid = ent[i][vi].float()                    # [n_valid]
+                # Make strictly positive for exponentiation
+                ent_valid = torch.clamp(ent_valid, min=1e-8)
+        
+                # q_un ∝ H^alpha
+                if alpha == 0.0:
+                    q_un = torch.ones_like(ent_valid)            # uniform if alpha=0
+                else:
+                    q_un = ent_valid.pow(alpha)
+        
+                q_un_sum = q_un.sum()
+                if q_un_sum <= 0:
+                    # fallback to uniform if degenerate
+                    q = torch.full_like(q_un, 1.0 / q_un.numel())
+                else:
+                    q = q_un / q_un_sum                          # normalize
+                    # mixture with uniform for tail coverage
+                    q = (1.0 - eps) * q + eps * (1.0 / q.numel())
+                    # floor to avoid zero probs
+                    q = torch.clamp(q, min=q_floor)
+                    q = q / q.sum()                              # renormalize
+        
+                k_count = max(1, int(valid_count * pct))
+                # Sample indices within the "valid positions" subspace
+                # torch.multinomial expects probs sum to 1
+                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
+        
+                # Map relative -> absolute indices
+                valid_idx = torch.where(vi)[0]                   # absolute positions
+                selected_abs = valid_idx[sel_rel]                # [k]
+        
+                # KL on selected positions (like top-k branch)
+                kl_sel = self._kl_loss(
+                    t_log_probs[i, selected_abs, :].to(self.student_device),
+                    s_log_probs[i, selected_abs, :]
+                )  # [k]
+        
+                if bool(getattr(self.config, "rs_use_importance", False)):
+                    # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.
+                    q_sel = q[sel_rel]                           # [k]
+                    w = 1.0 / torch.clamp(q_sel, min=q_floor)
+                    w = w / w.sum()
+                    kd_terms.append((kl_sel * w).sum())
+                else:
+                    kd_terms.append(kl_sel.mean())
+        
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:
+                # Fallback: average over all valid positions (vanilla on mask)
+                # Compute per-position KL if not yet available:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
         else:
             raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
         

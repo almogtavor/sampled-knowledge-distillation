@@ -171,8 +171,19 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket"], default="vanilla")
+    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "rs-kd"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
+    parser.add_argument("--rs_kd_proposal_temp", type=int, default=1, help="for rs-kd only")
+    parser.add_argument("--kd_temperature", type=int, default=1, help="for rs-kd only")
+    # RS-KD (position-sampling) hyperparams
+    parser.add_argument("--rs_alpha", type=float, default=1.0,
+                        help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
+    parser.add_argument("--rs_epsilon", type=float, default=0.02,
+                        help="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
+    parser.add_argument("--rs_floor", type=float, default=1e-6,
+                        help="Minimum probability floor to avoid huge weights / degeneracy")
+    parser.add_argument("--rs_use_importance", action="store_true", default=False, 
+                        help="Use importance weights (∝ 1/q(i)) when averaging KL over sampled positions")
     parser.add_argument("--bucket_lower_percent", type=int, default=70, 
                         help="For bucket mode: lower bound percentile (skip bottom X%)")
     parser.add_argument("--bucket_upper_percent", type=int, default=80,
