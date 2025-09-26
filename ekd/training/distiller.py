@@ -157,7 +157,7 @@ class Distiller:
             ent = token_entropy(t_pred).to(self.student_device) # [B, L-1]
             ent = ent.masked_fill(~valid_next, float('-inf')) # ignore invalid
 
-            pct = max(0.0, min(1.0, self.config.top_k_percent / 100.0)) # e.g. 0.2
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0)) # e.g. 0.2
 
             # top-k-tok: select positions first, then compute KL only on those
             kd_terms = []
