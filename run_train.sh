@@ -20,7 +20,7 @@ python3 ekd_distill.py \
     --teacher_model "Qwen/Qwen3-8B" \
     --student_model "Qwen/Qwen3-0.6B" \
     --distill_type "$DISTILL_TYPE" \
-    --top_k_percent 20 \
+    --k_percent 20 \
     --datasets "gsm8k" \
     --dataset_config "main" \
     --prompt_col "question" \
