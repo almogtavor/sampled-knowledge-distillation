@@ -30,8 +30,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-
-VENV_DIR="$PWD/ekd310"
+VENV_DIR="$PWD/fastenv310_3_new"
 
 # ---------- pick a python3 available on the node ----------
 PY_SYS="$(command -v python3 || true)"
