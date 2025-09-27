@@ -38,7 +38,6 @@ class Distiller:
             logger=None,  # Combined logger for W&B + TensorBoard
     ):
         self.teacher = teacher_model.eval()  # frozen
-        # self.teacher = teacher_model # todo: is it okay not to use the frozen? sounds like it should be frozen
         self.student = student_model.train()
         self.tok = tokenizer
         self.dataloader = dataloader
@@ -104,52 +103,25 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
-    @staticmethod
-    def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
-        """Sanitize logits to prevent NaNs/Infs during training.
-        We might train with lower precision (e.g., fp16), so instability might occur.
+    def _compute_kd_loss(self, t_pred: torch.Tensor, t_log_probs: torch.Tensor, 
+                         s_log_probs: torch.Tensor, valid_next: torch.Tensor) -> torch.Tensor:
+        """Compute knowledge distillation loss based on the configured distillation type.
+        
+        Args:
+            t_pred: Teacher predictions [B, L-1, V]
+            t_log_probs: Teacher log probabilities [B, L-1, V] 
+            s_log_probs: Student log probabilities [B, L-1, V]
+            valid_next: Valid next token positions [B, L-1]
+            
+        Returns:
+            kd_loss: Computed KD loss tensor
         """
-        # cast to fp32 for stability, clamp, and replace NaN/Inf
-        x = x.float()
-        x = torch.clamp(x, min=-1e4, max=1e4)
-        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
-        if not torch.isfinite(x).all():
-            print(f"[warn] non-finite after sanitize in {name}")
-        return x
-    
-    def _forward_batch(self, batch):
-        # Move inputs
-        input_ids = batch["input_ids"] # [B, L]
-        attn_mask = batch["attention_mask"]
-        input_ids_t = input_ids.to(self.teacher_device)
-        attn_t = attn_mask.to(self.teacher_device)
-        input_ids_s = input_ids.to(self.student_device)
-        attn_mask_s = attn_mask.to(self.student_device)
-
-        T = 2.0  # distillation temperature; feel free to move to config
-        T2 = T * T
-        with torch.no_grad():
-            t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-            t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
-
-        s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
-        s_logits = self._sanitize_logits(s_logits, "student")
-
-        # Align to next-token prediction
-        t_pred = t_logits[:, :-1, :]  # [B, L-1, V] (remove last token)
-        s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
-        valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
-
-        # Softened log-probs for KD with temperature scaling
-        t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
-        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
-
-        # --- KD loss ---
         if self.config.distill_type == "vanilla":
             # KL for all positions for vanilla (sum over vocab so it becomes [B, L-1])
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
+            
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens by entropy among valid positions only
             # selection by entropy (T=1 for selection is common) ----
@@ -180,8 +152,10 @@ class Distiller:
                         s_log_probs[i, selected_topk_idx, :])  # [k]
                 kd_terms.append(kl_sel.mean())
 
-            if kd_terms: # skip the batch if nothing selected
+            if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
@@ -210,8 +184,10 @@ class Distiller:
                             s_log_probs[i][keep]
                         ).mean()
                     )
-            if kd_terms:  # skip the batch if nothing selected
+            if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
 
         elif self.config.distill_type == "random":
             kd_terms = []
@@ -236,8 +212,10 @@ class Distiller:
                                 s_log_probs[i][keep]
                             ).mean()
                         )
-            if kd_terms:  # skip the batch if nothing selected
+            if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         elif self.config.distill_type == "pos-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
             # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
@@ -292,10 +270,57 @@ class Distiller:
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                 w = w / w.sum()
                 kd_terms.append((kl_sel * w).sum())
-            if kd_terms: # skip the batch if nothing selected
+            if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         else:
             raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
+            
+        return kd_loss
+
+    @staticmethod
+    def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
+        """Sanitize logits to prevent NaNs/Infs during training.
+        We might train with lower precision (e.g., fp16), so instability might occur.
+        """
+        # cast to fp32 for stability, clamp, and replace NaN/Inf
+        x = x.float()
+        x = torch.clamp(x, min=-1e4, max=1e4)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+        if not torch.isfinite(x).all():
+            print(f"[warn] non-finite after sanitize in {name}")
+        return x
+    
+    def _forward_batch(self, batch):
+        # Move inputs
+        input_ids = batch["input_ids"] # [B, L]
+        attn_mask = batch["attention_mask"]
+        input_ids_t = input_ids.to(self.teacher_device)
+        attn_t = attn_mask.to(self.teacher_device)
+        input_ids_s = input_ids.to(self.student_device)
+        attn_mask_s = attn_mask.to(self.student_device)
+
+        T = 2.0  # distillation temperature
+        T2 = T * T
+        with torch.no_grad():
+            t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
+            t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
+
+        s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
+        s_logits = self._sanitize_logits(s_logits, "student")
+
+        # Align to next-token prediction
+        t_pred = t_logits[:, :-1, :]  # [B, L-1, V] (remove last token)
+        s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
+        valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
+
+        # Softened log-probs for KD with temperature scaling
+        t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
+
+        # --- KD loss ---
+        kd_loss = self._compute_kd_loss(t_pred, t_log_probs, s_log_probs, valid_next)
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
         kd_loss = kd_loss * T2
