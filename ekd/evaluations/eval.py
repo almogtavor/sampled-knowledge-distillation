@@ -47,6 +47,9 @@ class TaskConfig(BaseModel):
     task: str  # lm-eval expects "task" field
     dataset_path: str
     dataset_name: Optional[str] = None
+    test_split: Optional[str] = None
+    validation_split: Optional[str] = None
+    train_split: Optional[str] = None
     output_type: str = "generate_until"
     generation_kwargs: GenerationConfig = Field(default_factory=GenerationConfig)
     metric_list: List[MetricConfig] = Field(default_factory=list)
@@ -95,6 +98,12 @@ def _render_manual_task(task: TaskConfig) -> str:
     lines = [f"task: {task.task}", f"dataset_path: {task.dataset_path}"]
     if task.dataset_name:
         lines.append(f"dataset_name: {task.dataset_name}")
+    if task.test_split:
+        lines.append(f"test_split: {task.test_split}")
+    if task.validation_split:
+        lines.append(f"validation_split: {task.validation_split}")
+    if task.train_split:
+        lines.append(f"train_split: {task.train_split}")
     g = task.generation_kwargs
     lines.append(f"output_type: {task.output_type}")
     lines.append('doc_to_text: "{{input}}"')
@@ -133,9 +142,8 @@ def materialize_manual_tasks(config: BenchmarkConfig, cache_root: Path) -> Path:
         (manual_dir / f"{task.task}.yaml").write_text(_render_manual_task(task))
     src_utils = Path(__file__).with_name("utils.py")
     if src_utils.exists():
-        target_dir = manual_dir / "ekd" / "evaluations"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_utils, target_dir / "utils.py")
+        # Copy as a flattened module name for lm-eval to find
+        shutil.copy2(src_utils, manual_dir / "ekd.evaluations.utils.py")
     return manual_dir
 
 # ---------- Utility ----------

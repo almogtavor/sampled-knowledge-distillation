@@ -1,6 +1,7 @@
 manual_tasks:
   - task: svamp
     dataset_path: ChilleD/SVAMP
+    test_split: test
     output_type: generate_until
     generation_kwargs:
       max_new_tokens: 256
@@ -12,7 +13,7 @@ manual_tasks:
 
   - task: aime25
     dataset_path: AI-MO/aimo-validation-aime
-    dataset_name: aime25
+    test_split: train
     output_type: generate_until
     generation_kwargs:
       max_new_tokens: 256
