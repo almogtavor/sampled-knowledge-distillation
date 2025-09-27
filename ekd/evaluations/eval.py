@@ -343,7 +343,7 @@ TASK_TIMEOUTS = {
     "svamp": 900,
     "gsm8k": 1200,
     "aime24": 900,
-    "aime25": 900,
+    "aime25": 1500,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,

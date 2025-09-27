@@ -30,7 +30,16 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-VENV_DIR="$PWD/ekd310"
+# Default virtual environment directory
+VENV_DIR="$PWD/fastenv310_3_new"
+
+# Check if a custom venv name is passed as a parameter
+for arg in "$@"; do
+  if [[ "$arg" == --venv=* ]]; then
+    VENV_DIR="${arg#--venv=}"
+    break
+  fi
+done
 
 # ---------- pick a python3 available on the node ----------
 PY_SYS="$(command -v python3 || true)"
