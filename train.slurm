@@ -14,6 +14,7 @@ set -euo pipefail
 cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
+K_PERCENT=${2:-20}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # ---------- caches / env ----------
@@ -29,7 +30,8 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-VENV_DIR="$PWD/fastenv310_3_new"
+
+VENV_DIR="$PWD/ekd310"
 
 # ---------- pick a python3 available on the node ----------
 PY_SYS="$(command -v python3 || true)"
@@ -136,7 +138,7 @@ PY
 # ---------- launch ----------
 # Convert hyphens to underscores for directory names
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_model"
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_model_${SLURM_JOB_ID}"
 unset PYTHONPATH PYTHONHOME
 exec "$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
