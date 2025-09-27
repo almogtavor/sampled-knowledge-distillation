@@ -40,11 +40,15 @@ class Distiller:
         self.teacher = teacher_model.eval()  # frozen
         # self.teacher = teacher_model # todo: is it okay not to use the frozen? sounds like it should be frozen
         self.student = student_model.train()
+        if hasattr(self.student.config, "use_cache"):
+            self.student.config.use_cache = False
+        if hasattr(self.student, "gradient_checkpointing_enable"):
+            self.student.gradient_checkpointing_enable()
         self.tok = tokenizer
         self.dataloader = dataloader
         self.config = config
         self.alpha_ce = 0.1  # Fixed value, could be added to config if needed
-        self.opt = AdamW(self.student.parameters(), lr=config.lr)
+        self.opt = AdamW(self.student.parameters(), lr=config.lr, foreach=False)
         self.teacher_device = teacher_device
         self.student_device = student_device
         
@@ -176,21 +180,26 @@ class Distiller:
                 selected_topk_idx = valid_idx[selected_topk_pos] # [k]
 
                 # Compute KL only on selected positions (sum over vocab, so [k])
-                kl_sel = self._kl_loss(t_log_probs[i, selected_topk_idx, :].to(self.student_device),
-                                       s_log_probs[i, selected_topk_idx, :])  # [k]
+                idx_t = selected_topk_idx.to(t_log_probs.device)
+                kl_sel = self._kl_loss(t_log_probs[i, idx_t, :].to(self.student_device),
+                s_log_probs[i, selected_topk_idx, :])
                 kd_terms.append(kl_sel.mean())
 
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
             else:
-                # skip the batch if nothing selected
-                pass
+                # Fallback: average KL over all valid positions
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+                denom = valid_next.sum().clamp(min=1)
+                kd_loss = (kl_pos * valid_next).sum() / denom
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
             # This excludes both the lowest 70% and highest 20% entropy tokens
             ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
             kd_terms = []
+            # Need per-position KL:
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             Bsz = kl_pos.size(0)
             for i in range(Bsz):
                 vi = valid_next[i]
@@ -217,6 +226,8 @@ class Distiller:
                 kd_loss = (kl_pos * valid_next).sum() / denom
         elif self.config.distill_type == "random":
             kd_terms = []
+            # Need per-position KL:
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             Bsz = kl_pos.size(0)
             for i in range(Bsz):
                 vi = valid_next[i]
@@ -287,8 +298,9 @@ class Distiller:
                 selected_abs = valid_idx[sel_rel]                # [k]
         
                 # KL on selected positions (like top-k branch)
+                idx_t = selected_abs.to(t_log_probs.device)
                 kl_sel = self._kl_loss(
-                    t_log_probs[i, selected_abs, :].to(self.student_device),
+                    t_log_probs[i, idx_t, :].to(self.student_device),
                     s_log_probs[i, selected_abs, :]
                 )  # [k]
         
@@ -341,7 +353,7 @@ class Distiller:
             print("[warn] skipping batch due to non-finite loss "
                 f"(total={total.item()}, kd={kd_loss.item()}, ce={ce_loss.item()})")
             # Return a tiny zero-like loss with grad so autograd graph stays valid
-            zero = (flat_logits.sum() * 0.0) + (flat_targets[keep][:0].sum() * 0.0)
+            zero = s_pred.sum() * 0.0
             return zero + zero, 0.0, 0.0
 
         return total, kd_loss.item(), ce_loss.item()
@@ -351,7 +363,7 @@ class Distiller:
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
-            self.opt.zero_grad()  # Initialize gradients
+            self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
             for step, batch in enumerate(self.dataloader):
                 loss, kl_val, ce_val = self._forward_batch(batch)
@@ -364,7 +376,7 @@ class Distiller:
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
                     self.opt.step()
-                    self.opt.zero_grad()
+                    self.opt.zero_grad(set_to_none=True)
                     self.global_step += 1
                     
                     # Save checkpoint if needed
