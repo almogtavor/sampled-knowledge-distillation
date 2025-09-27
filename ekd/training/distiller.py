@@ -248,7 +248,7 @@ class Distiller:
             else:
                 denom = valid_next.sum().clamp(min=1)
                 kd_loss = (kl_pos * valid_next).sum() / denom
-        elif self.config.distill_type == "rs-kd":
+        elif self.config.distill_type == "tok-select-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
             # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
             ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]

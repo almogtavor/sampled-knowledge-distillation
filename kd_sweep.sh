@@ -24,7 +24,7 @@ if [[ "$MODE" == "compare_k" ]]; then
 
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k
-  for METHOD in vanilla top-k-tok random rs-kd; do
+  for METHOD in vanilla top-k-tok random tok-select-rs-kd; do
     sbatch train.slurm "$METHOD" "$K_FIXED"
   done
 
