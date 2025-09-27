@@ -332,7 +332,7 @@ def main():
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
     experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "ekd" or config.distill_type == "random":
+    if config.distill_type == "top-k-tok" or config.distill_type == "random":
         experiment_name += f"_k={config.k_percent}"
     elif config.distill_type == "bucket":
         experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
