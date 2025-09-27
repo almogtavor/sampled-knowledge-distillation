@@ -33,9 +33,13 @@ def process_docs_svamp(dataset):
         a = str(row.get("answer") or row.get("Answer") or "")
         return {"input": f"Question: {q}\nAnswer:", "answer": a}
 
-    split = "test" if "test" in dataset else next(iter(dataset.keys()))
-    test = dataset[split].map(_map)
-    return {"test": test}
+    # Handle both DatasetDict and Dataset objects
+    if hasattr(dataset, 'keys'):  # DatasetDict
+        split = "test" if "test" in dataset else next(iter(dataset.keys()))
+        test = dataset[split].map(_map)
+        return {"test": test}
+    else:  # Single Dataset (when test_split is specified)
+        return dataset.map(_map)
 
 
 def process_docs_aimo(dataset):
@@ -50,6 +54,10 @@ def process_docs_aimo(dataset):
         )
         return {"input": body, "answer": a}
 
-    split = "test" if "test" in dataset else next(iter(dataset.keys()))
-    test = dataset[split].map(_map)
-    return {"test": test}
+    # Handle both DatasetDict and Dataset objects
+    if hasattr(dataset, 'keys'):  # DatasetDict
+        split = "test" if "test" in dataset else next(iter(dataset.keys()))
+        test = dataset[split].map(_map)
+        return {"test": test}
+    else:  # Single Dataset (when test_split is specified)
+        return dataset.map(_map)
