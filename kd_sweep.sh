@@ -13,18 +13,18 @@ MODE="$1"
 K_FIXED="${2:-20}"
 
 if [[ "$MODE" == "compare_k" ]]; then
-  # Sweep k = 0..100 step 10 (ekd, except k=0 as vanilla)
-  for K in 0 10 20 30 40 50 60 70 80 90 100; do
+  # Sweep k = 0..100 step 10 (top-k-tok, except k=0 as vanilla)
+  for K in 0 20 50; do
     if [[ "$K" -eq 0 ]]; then
       sbatch train.slurm vanilla "$K"
     else
-      sbatch train.slurm ekd "$K"
+      sbatch train.slurm top-k-tok "$K"
     fi
   done
 
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k
-  for METHOD in vanilla ekd random; do
+  for METHOD in vanilla top-k-tok random rs-kd; do
     sbatch train.slurm "$METHOD" "$K_FIXED"
   done
 
