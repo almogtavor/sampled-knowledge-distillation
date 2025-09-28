@@ -150,6 +150,33 @@ class Distiller:
             ent_list.append(token_entropy(t_pred[i]).to(self.student_device))  # [L-1]
         return torch.stack(ent_list, dim=0)  # [B, L-1]
 
+    @staticmethod
+    def _normalize_component(values: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
+        """Normalize `values` over the True positions of `mask` according to `mode`.
+
+        Returns a tensor of the same shape as `values` (no masking applied).
+        """
+        if mode == "none":
+            return values
+
+        valid_vals = values[mask]
+        if valid_vals.numel() == 0:
+            return values
+
+        if mode == "z":
+            mean = valid_vals.mean()
+            std = valid_vals.std(unbiased=False)
+            if std < 1e-6:
+                return values - mean
+            return (values - mean) / std
+        elif mode == "minmax":
+            min_val = valid_vals.min()
+            max_val = valid_vals.max()
+            denom = (max_val - min_val).clamp_min(1e-6)
+            return (values - min_val) / denom
+        else:
+            raise ValueError(f"Unknown normalization mode: {mode}")
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.student_device)
@@ -279,6 +306,90 @@ class Distiller:
                 kd_loss = torch.stack(kd_terms).mean()
             else: # skip the batch if nothing selected
                 kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+        elif self.config.distill_type == "score-kd":
+            weights = (
+                float(getattr(self.config, "score_entropy_weight", 1.0)),
+                float(getattr(self.config, "score_ce_weight", 1.0)),
+                float(getattr(self.config, "score_kl_weight", 1.0)),
+            )
+            if all(abs(w) < 1e-8 for w in weights):
+                raise ValueError("Score-based KD requires at least one non-zero component weight.")
+
+            if t_pred is None or t_log_probs is None:
+                raise ValueError("Score-based KD requires teacher predictions and log probabilities.")
+
+            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+
+            targets = input_ids[:, 1:].to(self.student_device)
+            targets = targets.masked_fill(~valid_next, 0)
+            target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
+
+            ent_for_score = ent.detach().masked_fill(~valid_next, 0.0)
+            kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+
+            selection_mode = getattr(self.config, "score_selection", "top-k")
+            norm_mode = getattr(self.config, "score_normalize", "z")
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+
+            kd_terms = []
+            Bsz = s_log_probs.size(0)
+            for i in range(Bsz):
+                mask = valid_next[i]
+                valid_count = int(mask.sum().item())
+                if valid_count < 3:
+                    continue
+
+                combined = torch.zeros_like(ent[i])
+                component_used = False
+
+                if abs(weights[0]) > 0:
+                    comp = ent_for_score[i].clone()
+                    comp = self._normalize_component(comp, mask, norm_mode)
+                    combined = combined + weights[0] * comp
+                    component_used = True
+
+                if abs(weights[1]) > 0:
+                    comp = student_ce[i].clone()
+                    comp = self._normalize_component(comp, mask, norm_mode)
+                    combined = combined + weights[1] * comp
+                    component_used = True
+
+                if abs(weights[2]) > 0:
+                    comp = kl_for_score[i].clone()
+                    comp = self._normalize_component(comp, mask, norm_mode)
+                    combined = combined + weights[2] * comp
+                    component_used = True
+
+                if not component_used:
+                    continue
+
+                combined = combined.masked_fill(~mask, float('-inf'))
+
+                if selection_mode == "top-k":
+                    k = max(1, min(valid_count, math.ceil(pct * valid_count)))
+                    score_valid = combined[mask]
+                    _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
+                    valid_idx = torch.where(mask)[0]
+                    selected_abs = valid_idx[rel_idx]
+                    kd_terms.append(kl_pos[i, selected_abs].mean())
+                elif selection_mode == "bucket":
+                    score_valid = combined[mask].float()
+                    lower_thr = torch.quantile(score_valid, self.config.bucket_lower_percent / 100.0)
+                    upper_thr = torch.quantile(score_valid, self.config.bucket_upper_percent / 100.0)
+                    valid_idx = torch.where(mask)[0]
+                    bucket_mask = (score_valid >= lower_thr) & (score_valid <= upper_thr)
+                    if bucket_mask.any():
+                        selected_abs = valid_idx[bucket_mask]
+                        kd_terms.append(kl_pos[i, selected_abs].mean())
+                else:
+                    raise ValueError(f"Unknown score_selection: {selection_mode}")
+
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         elif self.config.distill_type == "pos-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
             # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
@@ -377,7 +488,7 @@ class Distiller:
         # Decide whether we need full teacher logits now
         cached_items = None
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
-        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd"}
+        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd", "score-kd"}
         if use_vocab_rs_kd:
             # try offline cache to avoid teacher forward; fall back to teacher if cache missing
             cached_items = self._lookup_cache_batch(input_ids)

@@ -10,7 +10,7 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"] = "vanilla"
+    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "score-kd"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
     alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")    
@@ -31,6 +31,13 @@ class TrainingConfig(BaseModel):
     # Bucket mode parameters (for distill_type="bucket")
     bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")
     bucket_upper_percent: int = Field(default=80, description="Upper bound for bucket mode (e.g., 80% means skip top 20%)")
+
+    # Score-KD parameters
+    score_selection: Literal["top-k", "bucket"] = "top-k"
+    score_normalize: Literal["none", "z", "minmax"] = "z"
+    score_entropy_weight: float = Field(default=1.0, description="Weight for teacher entropy component in score-based KD")
+    score_ce_weight: float = Field(default=1.0, description="Weight for student cross-entropy component in score-based KD")
+    score_kl_weight: float = Field(default=1.0, description="Weight for teacher-student KL component in score-based KD")
     
     # Dataset settings
     datasets: List[str]

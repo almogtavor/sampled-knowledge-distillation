@@ -171,7 +171,7 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"], default="vanilla")
+    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "score-kd"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--rs_kd_proposal_temp", type=int, default=1, help="for pos-rs-kd only")
     parser.add_argument("--kd_temperature", type=int, default=1, help="for pos-rs-kd only")
@@ -184,6 +184,16 @@ def parse_args_to_config() -> TrainingConfig:
                         help="For bucket mode: lower bound percentile (skip bottom X%)")
     parser.add_argument("--bucket_upper_percent", type=int, default=80,
                         help="For bucket mode: upper bound percentile (skip top Y%)")
+    parser.add_argument("--score_selection", choices=["top-k", "bucket"], default="top-k",
+                        help="Selection strategy for score-based KD (top-k uses --k_percent; bucket uses bucket percentiles)")
+    parser.add_argument("--score_normalize", choices=["none", "z", "minmax"], default="z",
+                        help="Normalization applied per example to score components before weighting")
+    parser.add_argument("--score_entropy_weight", type=float, default=1.0,
+                        help="Weight for teacher entropy component in score-based KD")
+    parser.add_argument("--score_ce_weight", type=float, default=1.0,
+                        help="Weight for student cross-entropy component in score-based KD")
+    parser.add_argument("--score_kl_weight", type=float, default=1.0,
+                        help="Weight for teacher-student KL component in score-based KD")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
     parser.add_argument("--alpha_ce", type=float, default=0.1,
