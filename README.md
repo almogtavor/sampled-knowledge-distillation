@@ -25,18 +25,19 @@ ollama run qwen3:8b
 
 3. Run distillation:
 
-We provide four distillation types:
+We provide three distillation types:
 * **vanilla** — KL between teacher & student on **all** tokens.
 * **ekd** — KL computed **only** on *fork tokens*, i.e. those whose
   teacher-entropy is in the top-`--k_percent` percentile inside each
   example.
 * **bucket** — KL computed on tokens with entropy in a specific percentile range,
   e.g., 70th-80th percentile (excludes both very low and very high entropy tokens).
-* **score-kd** — KL computed on tokens ranked by a composite score that mixes
-  teacher entropy, student cross-entropy, and teacher-student KL. Configure the
-  score with `--score_entropy_weight`, `--score_ce_weight`, `--score_kl_weight`,
-  and choose `--score_selection top-k|bucket` plus an optional normalization via
-  `--score_normalize`.
+
+Add `--score_token_selection` to the **top-k-tok** or **bucket** modes to rank
+tokens by a composite score that mixes teacher entropy, student
+cross-entropy, and teacher-student KL. Tune the mix with
+`--score_entropy_weight`, `--score_ce_weight`, `--score_kl_weight`, and pick a
+normalization via `--score_normalize`.
 
 We use Ollama's Qwen3-8B in 4-bit as teacher:
 ```bash
@@ -56,7 +57,7 @@ python ekd_distill.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type top-k-tok \
-    --top_k_percent 20 \
+  --k_percent 20 \
     --datasets gsm8k \
     --dataset_config main \
     --prompt_col question \
@@ -76,13 +77,13 @@ python ekd_distill.py \
     --answer_col answer \
     --output_dir ./kd_bucket_run
 
-# Score-based KD (entropy + CE + KL score, top-20% tokens)
+# Top-k selection with score-based ranking (entropy + CE + KL)
 python ekd_distill.py \
   --teacher_model Qwen/Qwen3-8B \
   --student_model Qwen/Qwen3-0.6B \
-  --distill_type score-kd \
+  --distill_type top-k-tok \
   --k_percent 20 \
-  --score_selection top-k \
+  --score_token_selection \
   --score_entropy_weight 1.0 \
   --score_ce_weight 1.0 \
   --score_kl_weight 1.0 \
