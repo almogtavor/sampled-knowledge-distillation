@@ -116,7 +116,7 @@ def main():
     log.info(f"DataLoader ready: batches={len(dl)} bs={args.batch_size}")
 
     log.info("Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(model_path_for_load, dtype=model_dtype)
+    model = AutoModelForCausalLM.from_pretrained(model_path_for_load, torch_dtype=model_dtype)
     model.to(device)
     model.eval()
     log.info("Model loaded and moved to device")
