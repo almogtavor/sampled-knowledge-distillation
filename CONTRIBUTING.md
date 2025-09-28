@@ -127,7 +127,67 @@ tail -f logs/eval.<jobid>.log
 - **Cache management**: Handled via SLURM environment variables
 - **Results**: Logged to W&B and TensorBoard
 
-## 📁 Output Locations
+## � Entropy Ablation (Top‑k overlap)
+
+Use `ablate.slurm` to run the entropy agreement ablation between exact entropy and truncated Top‑k+Tail.
+
+General form (sbatch forwards flags directly to the Python tool):
+
+```bash
+sbatch ablate.slurm --model <MODEL_OR_DIR> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]
+```
+
+Examples:
+
+- AIME (AI‑MO validation set)
+- Columns: problem, answer | Dataset: AI-MO/aimo-validation-aime
+```bash
+sbatch ablate.slurm \
+    --model eval_runs/exports/ekd_export_checkpoint_epoch2_step5055 \
+    --dataset AI-MO/aimo-validation-aime \
+    --prompt_col problem \
+    --answer_col answer \
+    --batch_size 4 \
+    --max_seq_len 512 \
+    --k_percent 20 \
+    --m 20
+```
+
+- SVAMP
+- Columns: Body, Answer | Dataset: ChilleD/SVAMP
+```bash
+sbatch ablate.slurm \
+    --model Qwen/Qwen3-0.6B \
+    --dataset ChilleD/SVAMP \
+    --prompt_col Body \
+    --answer_col Answer \
+    --batch_size 4 \
+    --max_seq_len 512 \
+    --k_percent 20 \
+    --m 20
+```
+
+- GSM8K (main config)
+- Columns: question, answer | Dataset: gsm8k with config 'main'
+```bash
+sbatch ablate.slurm \
+    --model Qwen/Qwen3-0.6B \
+    --dataset gsm8k \
+    --dataset_config main \
+    --prompt_col question \
+    --answer_col answer \
+    --batch_size 4 \
+    --max_seq_len 512 \
+    --k_percent 20 \
+    --m 20
+```
+
+Notes:
+- The script picks the most free GPU and runs on cuda:0 inside that view.
+- You can pin GPUs by setting CUDA_VISIBLE_DEVICES before sbatch.
+- If you see OOM, reduce `--batch_size` or `--max_seq_len`.
+
+## �📁 Output Locations
 
 - **EKD model**: `/home/joberant/NLP_2425b/YOUR_USER/kd_ekd_run_out_model`
 - **Vanilla model**: `/home/joberant/NLP_2425b/YOUR_USER/kd_vanilla_run_out_model`

@@ -178,8 +178,6 @@ def parse_args_to_config() -> TrainingConfig:
     # RS-KD (position-sampling) hyperparams
     parser.add_argument("--rs_alpha", type=float, default=1.0,
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
-    parser.add_argument("--rs_epsilon", type=float, default=0.02,
-                        help="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
     parser.add_argument("--rs_floor", type=float, default=1e-6,
                         help="Minimum probability floor to avoid huge weights / degeneracy")
     parser.add_argument("--bucket_lower_percent", type=int, default=70, 
@@ -214,6 +212,18 @@ def parse_args_to_config() -> TrainingConfig:
         default=None,
         help="(Optional) HF dataset config, e.g. for gsm8k use '--dataset_config main' or 'socratic'"
     )
+    parser.add_argument("--offline_cache", action="store_true", default=True,
+                        help="Enable offline caching mode: automatically create/use teacher cache for entropy approximation and vocab RS-KD.")
+    parser.add_argument("--no_offline_cache", dest="offline_cache", action="store_false",
+                        help="Disable offline caching mode (use online teacher forward pass).")
+    parser.add_argument("--offline_cache_dir", type=str, default=None,
+                        help="Where to store/read the offline teacher cache (defaults under output_dir).")
+    parser.add_argument("--entropy_approx_m", type=int, default=20,
+                        help="Top-k for truncated-entropy approximation (Sec. 3.6), m=20 by default.")
+    parser.add_argument("--rs_vocab_samples", type=int, default=64,
+                        help="How many vocab tokens to sample per position for RS-KD.")
+    parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
+                        help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
     args = parser.parse_args()
     
     # Convert argparse Namespace to TrainingConfig
