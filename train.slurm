@@ -15,6 +15,7 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
+EVAL_SUITE=${3:-}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # ---------- caches / env ----------
@@ -148,11 +149,11 @@ PY
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
 OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
 unset PYTHONPATH PYTHONHOME
-exec "$PY" ekd_distill.py \
+"$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
-  --k_percent 20 \
+  --k_percent "$K_PERCENT" \
   --datasets "gsm8k" \
   --dataset_config "main" \
   --prompt_col "question" \
@@ -166,3 +167,11 @@ exec "$PY" ekd_distill.py \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR"
+
+if [[ -n "$EVAL_SUITE" ]]; then
+  echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE"
+  echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
+else
+  echo "No eval suite provided → skipping eval submission."
+fi
