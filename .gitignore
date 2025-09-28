@@ -234,3 +234,6 @@ kd_pos_rs_kd_run_out_models/
 tb/
 evalplus_results/
 .tensorboard-info/
+
+# LaTeX code snippets
+tex.code-snippets
