@@ -10,6 +10,8 @@
 % Standard package includes
 \usepackage{times}
 \usepackage{latexsym}
+\usepackage{amsmath} % Added for \tfrac and other math commands
+\usepackage{amssymb} % Added for \mathbb and additional math symbols
 
 % For proper rendering and hyphenation of words containing Latin characters (including in bib files)
 \usepackage[T1]{fontenc}
@@ -37,7 +39,8 @@
 %
 % and set <dim> to something 5cm or larger.
 
-\title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
+\title{SampledKD: Extreme Sampling, Full Distillation Accuracy.}
+% \title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
 % \title{SampledKD: How Efficient Could Distillation Get While Match Accuracy?}
 % \title{SampledKD: Could Distillation be So Much More Efficient?}
 
@@ -57,20 +60,22 @@
 %         Author 2 \\ Address line \\ ... \\ Address line \And
 %         Author 3 \\ Address line \\ ... \\ Address line}
 
-\author{Almog Tavor *\\
+\author{Almog Tavor*\\
   Tel Aviv University \\
   \texttt{email@domain} \\\And
-  Itay Ebenspander *\\
+  Itay Ebenspanger*\\
   Tel Aviv University \\
   \texttt{email@domain} \\\And
-  Neil Cnaan *\\
+  Neil Cnaan*\\
   Tel Aviv University \\
   \texttt{email@domain} \\
   }
 
 \begin{document}
 \maketitle
-\let\thefootnote\relax\footnotetext{* Equal contribution.}
+\let\thefootnote\relax
+\footnotemark
+\footnotetext{* Equal contribution.}
 \begin{abstract}
 Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to auto-regressive models. We propose Entropy Knowledge Distillation (EKD), a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. EKD enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
 \end{abstract}
@@ -94,6 +99,115 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 
 \paragraph{Contributions.} (1) A unified framework for \emph{token-level} selection with \emph{unbiased} class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
+\section{Entropy Approximation}
+\label{sec:entropy}
+We estimate token uncertainty via a \emph{Top-$k$-plus-tail} construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
+$$
+p_i = \frac{e^{u_i}}{Z},\qquad Z = \sum_{j=1}^{V} e^{u_j}
+$$
+denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an \emph{upper bound} on the full log-partition by
+\begin{align}
+Z_m \;&=\; \log \sum_{j \leq m} e^{u_{(j)}}\,,\\
+Z_{\text{ub}} \;&=\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
+\end{align}
+The bound $Z_{\text{ub}}$ follows by pessimistically setting all tail logits to the $m$-th largest value $u_{(m)}$. Consequently, for $j \leq m$ we obtain \emph{conservative} (lower) probabilities
+$$
+p^{\min}_{(j)} = \exp\big(u_{(j)} - Z_{\text{ub}}\big),\quad
+  \tau_{\max} = 1 - \sum_{j \leq m} p^{\min}_{(j)}\,.
+$$
+Here $\tau_{\max}$ upper-bounds the probability mass outside the top-$m$ (the \emph{tail}). A valid \textbf{lower bound} on the entropy $H(p) = -\sum_i p_i \log p_i$ is then
+\[
+H_{\text{lb}} = -\sum_{j \leq m} p^{\min}_{(j)} \log p^{\min}_{(j)} \; - \; \tau_{\max} \log \tau_{\max}\,.
+\]
+This follows from entropy's monotonicity under coarse-graining: the smallest entropy consistent with the constraints is achieved by merging all tail mass into a single bin.
+One may also define an \emph{upper} estimate $H_{\text{ub}} = H_{\text{lb}} + \tau_{\max}\log(V-m)$ and a midpoint $\widehat{H}_m = \tfrac{1}{2}(H_{\text{lb}}+H_{\text{ub}})$. We rank tokens using $H_{\text{lb}}$ and use TkT-LB with $m{=}20$ for a strong efficiency-accuracy tradeoff.
+
+This cuts computation and storage from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with a 30K vocab and $m{=}20$, we process $\sim20$ terms (plus one tail) instead of 30{,}000—about $1{,}500\times$ fewer—and keep only 20 logits, while remaining a strong proxy for entropy ranking.
+
+\section{Position-Selective Distillation (RS-KD over Positions)}
+\label{sec:posrs}
+
+The KD objective for an autoregressive step is a mean over positions:
+\[
+\mathcal{L}_{\text{KD}} \;=\; \frac{1}{N_{\text{pos}}} \sum_{t=1}^{N_{\text{pos}}} 
+\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
+Full KD evaluates all positions; we instead \emph{sample positions} using a proposal
+$q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
+
+\paragraph{Sampling rule.}
+We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
+(e.g., the TkT-LB lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
+\[
+\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
+\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
+\frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+which is unbiased for the uniform positional mean. In practice we sample \emph{without} replacement within each sequence for lower variance and use a Hájek-style normalization: $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S} w_t=1$, then take $\sum_{t\in S} w_t\,\mathrm{KL}(p_t\|s_t)$.
+A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
+
+\paragraph{Discussion.}
+This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
+We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
+
+\vspace{0.5em}
+\noindent\textbf{Defaults.}
+$\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally anneal $\alpha$ upward during training to shift from exploration to focused supervision.
+
+
+\section{Two-Axis Offline Sampling with Entropy Proxies (SampledKD)}
+\label{sec:twoaxis}
+
+We combine (i) \emph{position-selective} KD (Y axis) with (ii) \emph{RS-KD over classes} (X axis) and (iii) a lightweight \emph{entropy approximation} to build an efficient, unbiased estimator we call \textbf{SampledKD}.
+Crucially, we separate \emph{offline} teacher processing from \emph{online} student training.
+
+\paragraph{Offline stage (teacher, once).}
+For each training sequence and position $t$:
+\begin{enumerate}
+\item Compute a top-$m$ entropy proxy $H_t$ via TkT-LB (\S\ref{sec:entropy}) to drive position selection.
+\item Construct a class proposal $q_{\text{voc}}(\cdot\,|\,t)$ (typically $q_{\text{voc}}\!=\!p_t$, or a tempered variant) and draw $R$ samples with replacement. Let $C_t(i)$ be the sampled count of class $i$.
+\item Form a sub-distribution over the sampled classes using importance weights
+\[
+\tilde p_t(i) \;\propto\; \frac{p_t(i)}{q_{\text{voc}}(i\,|\,t)} \, C_t(i), 
+\qquad i \in \mathcal{S}_t,
+\]
+then normalize over $\mathcal{S}_t=\{i: C_t(i)>0\}$. Choosing $R$ so that $\mathbb{E}[|\mathcal{S}_t|]\!\approx\!K_{\text{voc}}$ yields a budget comparable to top-$K_{\text{voc}}$ but without truncation bias.
+\end{enumerate}
+Only $(\mathcal{S}_t, \tilde p_t)$ and the scalar $H_t$ are stored (no full logits), typically in fp16.
+
+\paragraph{Online stage (student, many epochs).}
+At each batch we:
+\begin{enumerate}
+\item For each sequence, sample a subset $S$ of positions using $q_{\text{pos}}(t)\!\propto\!H_t^\alpha$ (without replacement, $|S|{=}K_{\text{pos}}$) and weights $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S}w_t{=}1$.
+\item For each $t \in S$, compute the \emph{sampled} KD term only on the cached subset:
+\begin{align}
+\mathrm{KL}\!\left(\tilde p_t \,\middle\|\, s_t(\cdot\,;\,\mathcal{S}_t)\right)
+\;&=\; \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log \tilde p_t(i) \\
+&\quad - \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
+\end{align}
+\item Aggregate over positions with the positional weights and add CE on all tokens:
+\begin{align}
+\mathcal{L} \;&=\; \sum_{t\in S} w_t\, \mathrm{KL}\!\left(\tilde p_t \,\|\, s_t\right) \\
+&\quad + \alpha_{\text{ce}} \cdot \text{CE}(\text{gold}, s).
+\end{align}
+\end{enumerate}
+
+\paragraph{Why it works.}
+RS-KD's importance weighting ensures that, for fixed $t$, the expectation of the class-sampled KD equals full KD at $t$; positional importance weighting targets the uniform mean over positions.
+TkT-LB supplies $H_t$ at $\mathcal{O}(m)$ cost, so both sampling decisions avoid any full-$V$ passes.
+Together, SampledKD reduces cost from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence while matching full-KD gradients in expectation.
+
+\paragraph{Complexity and knobs.}
+Storage per position is $\mathcal{O}(K_{\text{voc}})$ (indices $+$ probs). Online compute scales with $K_{\text{pos}}\!\times\!K_{\text{voc}}$. Good defaults:
+$K_{\text{voc}}\!\approx\!12$ expected uniques (choose $R$ accordingly),
+$\tau{=}1$ for $q_{\text{voc}}$ temperature,
+$K_{\text{pos}}\!\in\![8,32]$,
+$\alpha{=}1$,
+$\alpha_{\text{ce}}\!\in\![0.05,0.2]$.
+A tiny probability floor prevents numerical blow-ups in $1/q$.
+
+
 \section{Related Work}
 
 \paragraph{KD for LLMs.} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
@@ -104,11 +218,7 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 
 \paragraph{Entropy/uncertainty-guided KD.} Beyond selection, multiple KD variants weight supervision by uncertainty or entropy. Entropy-based adaptive KD (EA-KD) prioritizes \emph{samples} with higher entropy \citep{su2023eakd}, while DE-MKD uses teacher-prediction entropy to weight among multiple teachers \citep{cheng2024demkd}. Uncertainty-aware mixup reduces KD cost while maintaining quality \citep{xu2023unix}. Recent work also shows entropy-weighted distillation can improve reliability/calibration in classification \citep{guo2024entropykd}. Our EKD differs in using entropy/KL primarily to decide \emph{which tokens} receive external-teacher KD, not to reweight losses globally.
 
-\paragraph{Entropy approximation.} We estimate token uncertainty via a \emph{Top-k-plus-Tail} entropy bound\citep{kaltchenko2025entropyheatmap}. Let $u$ be logits, $u_{(1)} \geq \cdots \geq u_{(m)}$ the top-$m$. With $Z_m = \log \sum_{j \leq m} e^{u_{(j)}}$ and $Z_{\text{ub}} = \log\big(e^{Z_m} + (V-m)e^{u_{(m)}}\big)$, define $p^{\min}_{(j)} = \exp(u_{(j)} - Z_{\text{ub}})$, $\tau_{\max} = 1 - \sum_{j \leq m} p^{\min}_{(j)}$. The \textbf{lower bound}
-\[\small
-H_{\text{lb}} = -\sum_{j \leq m} p^{\min}_{(j)} \log p^{\min}_{(j)} - \tau_{\max} \log \, \tau_{\max}
-\]
-follows from entropy's monotonicity under coarse-graining; we also report a \textbf{midpoint} estimator $\widehat{H}_m = \tfrac{1}{2}\big(H_{\text{lb}} + \tau_{\max} \log(V-m) + H_{\text{lb}}\big)$ for ranking. (TkT-LB with $m=20$)
+% (moved) Entropy approximation paragraph relocated before Related Work.
 
 \paragraph{Entropy/perplexity for data selection.} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2022perplexprune} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
@@ -176,12 +286,6 @@ To produce a PDF file, pdf\LaTeX{} is strongly recommended (over original \LaTeX
 \hline
 \textbf{Output} & \textbf{natbib command} & \textbf{Old ACL-style command}\\
 \hline
-\citep{ct1965} & \verb|\citep| & \verb|\cite| \\
-\citealp{ct1965} & \verb|\citealp| & no equivalent \\
-\citet{ct1965} & \verb|\citet| & \verb|\newcite| \\
-\citeyearpar{ct1965} & \verb|\citeyearpar| & \verb|\shortcite| \\
-\citeposs{ct1965} & \verb|\citeposs| & no equivalent \\
-\citep[FFT;][]{ct1965} &  \verb|\citep[FFT;][]| & no equivalent\\
 \hline
 \end{tabular}
 \caption{\label{citation-guide}
@@ -245,21 +349,6 @@ Users of older versions of \LaTeX{} may encounter the following error during com
 \end{quote}
 This happens when pdf\LaTeX{} is used and a citation splits across a page boundary. The best way to fix this is to upgrade \LaTeX{} to 2018-12-01 or later.
 
-\subsection{Citations}
-
-
-
-Table~\ref{citation-guide} shows the syntax supported by the style files.
-We encourage you to use the natbib styles.
-You can use the command \verb|\citet| (cite in text) to get ``author (year)'' citations, like this citation to a paper by \citet{Gusfield:97}.
-You can use the command \verb|\citep| (cite in parentheses) to get ``(author, year)'' citations \citep{Gusfield:97}.
-You can use the command \verb|\citealp| (alternative cite without parentheses) to get ``author, year'' citations, which is useful for using citations within parentheses (e.g. \citealp{Gusfield:97}).
-
-\subsection{References}
-
-\nocite{Ando2005,augenstein-etal-2016-stance,andrew2007scalable,rasooli-tetrault-2015,goodman-etal-2016-noise,harper-2014-learning}
-
-The \LaTeX{} and Bib\TeX{} style files provided roughly follow the American Psychological Association format.
 If your own bib file is named \texttt{custom.bib}, then placing the following before any appendices in your \LaTeX{} file will generate the references section for you:
 \begin{quote}
 \begin{verbatim}

@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import hashlib
 import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -334,7 +334,7 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("arc_challenge", None),
 ]
 
-# Per-task timeouts (seconds). Be generous on heavy tasks.
+# Per-task timeouts (seconds).
 TASK_TIMEOUTS = {
     # light-ish baselines
     "boolq": 600,
@@ -343,7 +343,7 @@ TASK_TIMEOUTS = {
     "svamp": 900,
     "gsm8k": 1200,
     "aime24": 900,
-    "aime25": 1500,
+    "aime25": 2100,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,
@@ -417,13 +417,18 @@ def run_lmeval_suite(
         "lm-eval",
         "--model", "hf",
         "--model_args", f"pretrained={model_dir},trust_remote_code=True,dtype=float16",
-        "--batch_size", "auto", # Let the harness pick the largest safe batch size
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
 
     def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
         cmd = base_args + ["--tasks", task, "--device", device]
+        # Some generate_until tasks stall when probing batch_size=auto; force bs=1
+        GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
+        if task in GENERATE_BS1:
+            cmd += ["--batch_size", "1"]
+        else:
+            cmd += ["--batch_size", "auto"]
         if isinstance(limit, (int, float)):
             cmd += ["--limit", str(limit)]
         return cmd
@@ -725,6 +730,12 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
     if not all_metrics or not tasks:
         print("\n% No metrics found — check timeouts/include_path. Skipping table.\n")
         return
+    def _disp_metric(m: str) -> str:
+        # Clean up filter suffixes like ",none" in lm-eval keys for nicer LaTeX headers
+        if "," in m:
+            head, tail = m.split(",", 1)
+            return head if tail == "none" else m
+        return m
     print("\n% ---- LaTeX table (booktabs) ----")
     print(r"\begin{table}")
     print(r"\centering")
@@ -735,7 +746,7 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
     model_names = list(all_models_metrics.keys())
     for mname in model_names:
         for met in all_metrics:
-            header.append(f"{mname}:{met}")
+            header.append(f"{mname}:{_disp_metric(met)}")
     print(" & ".join(header) + r" \\")
     print(r"\midrule")
     for t in tasks:
@@ -745,7 +756,8 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
             for met in all_metrics:
                 val = mm.get(met, None)
                 if isinstance(val, float):
-                    row.append(f"{val:.2f}")
+                    # Avoid printing NaN/inf in LaTeX
+                    row.append(f"{val:.2f}" if math.isfinite(val) else "-")
                 elif isinstance(val, int):
                     row.append(str(val))
                 else:

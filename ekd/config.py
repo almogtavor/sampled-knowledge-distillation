@@ -1,6 +1,5 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from pathlib import Path
 
 
 class TrainingConfig(BaseModel):
@@ -14,7 +13,13 @@ class TrainingConfig(BaseModel):
     distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
-    alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
+    alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")    
+    # RS-KD parameters (for distill_type="pos-rs-kd")
+    rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
+    rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
+    rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
+    rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
+    kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
     
     # RS-KD parameters (for distill_type="pos-rs-kd")
     rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")

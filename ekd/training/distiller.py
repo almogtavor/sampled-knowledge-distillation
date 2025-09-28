@@ -7,18 +7,41 @@ import os
 from pathlib import Path
 import glob
 import math
+from typing import Dict, Any, List, Optional
 
-from ..config import TrainingConfig, CheckpointData, TrainingMetrics
+from ..config import TrainingConfig, TrainingMetrics
+from .offline_cache import TeacherOfflineCache, build_offline_cache_if_needed
+from .entropy_utils import token_entropy
 
 
-def token_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """Compute per-token entropy (the regular Entropy formula) in natural logarithm (base e).
-    Used find high-entropy "fork" tokens / low-entropy certain tokens.
+# importance-sampled KL over vocabulary using cached RS samples
+def kl_from_vocab_samples(
+    t_logp_sel: torch.Tensor, # [S] teacher log-probs at sampled tokens
+    s_logp_sel: torch.Tensor, # [S] student log-probs at same tokens
+    q_sel: torch.Tensor,  # [S] proposal probabilities used to draw the samples
+    self_norm: bool = True,
+) -> torch.Tensor:
+    """
+    Estimate KL(P||S) = sum_j p_j (log p_j - log s_j)
+    with samples j ~ q. Use weights w_j = p_j / q_j.
 
-    logits: [seq_len, vocab]
-    returns: [seq_len]"""
-    probs = torch.softmax(logits, dim=-1)
-    return -(probs * torch.log(probs + 1e-9)).sum(-1)  # [L, V] -> [L] where L is sequence length, V is vocabulary size
+    If self_norm=True (default): return sum_j (w_j / sum w) * (log p_j - log s_j)   (low-variance, slightly biased)
+    Else (unbiased Horvitz-Thompson): return mean_j w_j * (log p_j - log s_j) with expectation over q.
+
+    Inputs are 1D tensors for a single position. Returns a scalar tensor.
+    """
+    with torch.no_grad():
+        p_sel = (t_logp_sel).exp()  # [S]
+        w = p_sel / q_sel.clamp_min(1e-12)  # [S]
+        if self_norm:
+            w = w / w.sum().clamp_min(1e-12)
+    # (log p - log s)
+    diff = (t_logp_sel - s_logp_sel)  # [S]
+    if self_norm:
+        return (w * diff).sum()
+    else:
+        # Importance expectation E_q[w * diff] ≈ (1/S) * sum w * diff
+        return (w * diff).mean()
 
 
 class Distiller:
@@ -55,6 +78,12 @@ class Distiller:
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # offline teacher cache
+        self.cache = None
+        if getattr(self.config, "offline_cache", False):
+            cache_dir = Path(getattr(self.config, "offline_cache_dir", self.output_dir / "teacher_offline_cache"))
+            self.cache = TeacherOfflineCache(cache_dir)
+
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
         if self.config.checkpoint_steps <= 0:
@@ -87,6 +116,40 @@ class Distiller:
             os.remove(old_checkpoint)
             print(f"Removed old checkpoint: {old_checkpoint}")
 
+
+    def _lookup_cache_batch(self, input_ids: torch.Tensor) -> Optional[List[Dict[str, Any]]]:
+        if not self.cache:
+            return None
+        items = []
+        for i in range(input_ids.size(0)):
+            key = TeacherOfflineCache.key_from_ids(input_ids[i])
+            if not self.cache.has(key):
+                return None
+            items.append(self.cache.read_item(key))
+        return items
+
+    def _entropy_for_selection(self, input_ids: torch.Tensor, t_pred: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Return per-position entropy used only for *selection*.
+        If cache is available for the whole batch, use cached H_hat (truncated entropy approximation).
+        Otherwise, compute exact entropy online via t_pred.
+        Output shape: [B, L-1]
+        """
+        if self.cache is not None:
+            items = self._lookup_cache_batch(input_ids)
+            if items is not None:
+                # Stack cached per-example arrays
+                H = [torch.as_tensor(it["H_hat"]) for it in items]  # each [L-1]
+                return torch.stack(H, dim=0).to(self.student_device)  # [B, L-1]
+
+        # need exact from t_pred
+        assert t_pred is not None, "Exact entropy requested but teacher logits are unavailable."
+        B = t_pred.size(0)
+        ent_list = []
+        for i in range(B):
+            ent_list.append(token_entropy(t_pred[i]).to(self.student_device))  # [L-1]
+        return torch.stack(ent_list, dim=0)  # [B, L-1]
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.student_device)
@@ -104,7 +167,7 @@ class Distiller:
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
     def _compute_kd_loss(self, t_pred: torch.Tensor, t_log_probs: torch.Tensor, 
-                         s_log_probs: torch.Tensor, valid_next: torch.Tensor) -> torch.Tensor:
+                         s_log_probs: torch.Tensor, valid_next: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """Compute knowledge distillation loss based on the configured distillation type.
         
         Args:
@@ -125,7 +188,7 @@ class Distiller:
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens by entropy among valid positions only
             # selection by entropy (T=1 for selection is common) ----
-            ent = token_entropy(t_pred).to(self.student_device) # [B, L-1]
+            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             ent = ent.masked_fill(~valid_next, float('-inf')) # ignore invalid
 
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0)) # e.g. 0.2
@@ -160,7 +223,7 @@ class Distiller:
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
             # This excludes both the lowest 70% and highest 20% entropy tokens
-            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             kd_terms = []
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
@@ -219,7 +282,7 @@ class Distiller:
         elif self.config.distill_type == "pos-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
             # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
-            ent = token_entropy(t_pred).to(self.student_device)  # [B, L-1]
+            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             kd_terms = []
             Bsz = t_pred.size(0)
             alpha = float(getattr(self.config, "rs_alpha", 1.0))
@@ -296,31 +359,98 @@ class Distiller:
         # Move inputs
         input_ids = batch["input_ids"] # [B, L]
         attn_mask = batch["attention_mask"]
-        input_ids_t = input_ids.to(self.teacher_device)
-        attn_t = attn_mask.to(self.teacher_device)
         input_ids_s = input_ids.to(self.student_device)
         attn_mask_s = attn_mask.to(self.student_device)
 
         T = 2.0  # distillation temperature
         T2 = T * T
-        with torch.no_grad():
-            t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-            t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
 
+        # --- student forward (always) ---
         s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
         s_logits = self._sanitize_logits(s_logits, "student")
 
         # Align to next-token prediction
-        t_pred = t_logits[:, :-1, :]  # [B, L-1, V] (remove last token)
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
-
-        # Softened log-probs for KD with temperature scaling
-        t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
         s_log_probs = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
 
+        # Decide whether we need full teacher logits now
+        cached_items = None
+        use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
+        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd"}
+        if use_vocab_rs_kd:
+            # try offline cache to avoid teacher forward; fall back to teacher if cache missing
+            cached_items = self._lookup_cache_batch(input_ids)
+            if cached_items is not None:
+                need_teacher_full = False
+
+        if need_teacher_full:
+            input_ids_t = input_ids.to(self.teacher_device)
+            attn_t = attn_mask.to(self.teacher_device)
+            with torch.no_grad():
+                t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
+                t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
+            t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
+            t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+        else:
+            t_pred = t_log_probs = None
+
         # --- KD loss ---
-        kd_loss = self._compute_kd_loss(t_pred, t_log_probs, s_log_probs, valid_next)
+        # Compute per-position base KD according to mode (positions subset and weights),
+        # then replace vocab-sum with RS-KD estimator when enabled.
+        if not use_vocab_rs_kd:
+            kd_loss = self._compute_kd_loss(t_pred, t_log_probs, s_log_probs, valid_next, input_ids)
+        else:
+            kd_terms = []
+            B = s_log_probs.size(0)
+            for i in range(B):
+                valid_i = valid_next[i]
+                if valid_i.sum() == 0:
+                    continue
+
+                # Gather RS-KD lists from cache or online fallback using teacher logp
+                if cached_items is not None:
+                    rs = cached_items[i]["rs"]
+                    idx_list = rs["idx"]
+                    tlogp_list = rs["t_logp"]
+                    q_list = rs["q"]
+                else:
+                    # Need teacher logprobs for online proposal
+                    assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
+                    with torch.no_grad():
+                        t_full_i = t_log_probs[i]
+                        p_i = t_full_i.exp()
+                    beta = float(getattr(self.config, "rs_vocab_beta", 1.0))
+                    S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
+                    idx_list, tlogp_list, q_list = [], [], []
+                    for pos, is_valid in enumerate(valid_i.tolist()):
+                        if not is_valid:
+                            idx_list.append(torch.empty(0, dtype=torch.long))
+                            tlogp_list.append(torch.empty(0))
+                            q_list.append(torch.empty(0))
+                            continue
+                        p_pos = p_i[pos]
+                        q_un = p_pos.clamp_min(1e-12).pow(beta) if beta != 1.0 else p_pos.clamp_min(1e-12)
+                        q = q_un / q_un.sum()
+                        S = min(S_vocab, q.numel())
+                        idx = torch.multinomial(q, num_samples=S, replacement=False)
+                        idx_list.append(idx.cpu())
+                        tlogp_list.append(t_full_i[pos, idx].cpu())
+                        q_list.append(q[idx].cpu())
+
+                # For each position, compute KL estimate using only sampled tokens
+                for pos, is_valid in enumerate(valid_i.tolist()):
+                    if not is_valid:
+                        continue
+                    idx = idx_list[pos].to(self.student_device)
+                    if idx.numel() == 0:
+                        continue
+                    t_logp_sel = tlogp_list[pos].to(self.student_device)
+                    q_sel = q_list[pos].to(self.student_device)
+                    s_logp_sel = s_log_probs[i, pos, idx]
+                    kd_terms.append(kl_from_vocab_samples(t_logp_sel, s_logp_sel, q_sel, self_norm=True))
+
+            kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
         kd_loss = kd_loss * T2
@@ -358,6 +488,8 @@ class Distiller:
 
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
+        # make the offline pass once, if requested
+        build_offline_cache_if_needed(self)
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
