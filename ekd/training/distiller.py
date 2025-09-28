@@ -178,6 +178,75 @@ class Distiller:
         else:
             raise ValueError(f"Unknown normalization mode: {mode}")
 
+    def _prepare_score_context(
+        self,
+        ent_raw: torch.Tensor,
+        kl_pos: torch.Tensor,
+        s_log_probs: torch.Tensor,
+        valid_next: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Pre-compute tensors needed for score-based token ranking"""
+        weights = (
+            float(getattr(self.config, "score_entropy_weight", 1.0)),
+            float(getattr(self.config, "score_ce_weight", 1.0)),
+            float(getattr(self.config, "score_kl_weight", 1.0)),
+        )
+        if all(abs(w) < 1e-8 for w in weights):
+            raise ValueError("Score-based selection requires at least one non-zero component weight.")
+
+        norm_mode = getattr(self.config, "score_normalize", "z")
+
+        targets = input_ids[:, 1:].to(self.student_device)
+        targets = targets.masked_fill(~valid_next, 0)
+        target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
+
+        ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
+        kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+
+        return {
+            "weights": weights,
+            "norm_mode": norm_mode,
+            "entropy": ent_for_score,
+            "student_ce": student_ce,
+            "kl": kl_for_score,
+        }
+
+    def _build_score_vector(
+        self,
+        score_ctx: Dict[str, Any],
+        example_idx: int,
+        mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Construct combined score for one example or return None if no components are active."""
+        weights = score_ctx["weights"]
+        norm_mode = score_ctx["norm_mode"]
+
+        combined = torch.zeros_like(score_ctx["entropy"][example_idx])
+        component_used = False
+
+        if abs(weights[0]) > 0:
+            comp = self._normalize_component(score_ctx["entropy"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[0] * comp
+            component_used = True
+
+        if abs(weights[1]) > 0:
+            comp = self._normalize_component(score_ctx["student_ce"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[1] * comp
+            component_used = True
+
+        if abs(weights[2]) > 0:
+            comp = self._normalize_component(score_ctx["kl"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[2] * comp
+            component_used = True
+
+        if not component_used:
+            return None
+
+        combined = combined.masked_fill(~mask, float('-inf'))
+        return combined
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.student_device)
@@ -227,22 +296,9 @@ class Distiller:
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
             if score_enabled:
-                weights = (
-                    float(getattr(self.config, "score_entropy_weight", 1.0)),
-                    float(getattr(self.config, "score_ce_weight", 1.0)),
-                    float(getattr(self.config, "score_kl_weight", 1.0)),
-                )
-                if all(abs(w) < 1e-8 for w in weights):
-                    raise ValueError("Score-based selection requires at least one non-zero component weight.")
-                norm_mode = getattr(self.config, "score_normalize", "z")
-                # Student CE: surprise on the ground-truth token.  KL: teacher/student mismatch.
-                targets = input_ids[:, 1:].to(self.student_device)
-                targets = targets.masked_fill(~valid_next, 0)
-                target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-                student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
-                ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
-                kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
             # top-k-tok: select positions first, then compute KL only on those
             kd_terms = []
@@ -255,31 +311,9 @@ class Distiller:
                 k = max(1, min(n_valid, math.ceil(pct * n_valid)))
 
                 if score_enabled:
-                    combined = torch.zeros_like(ent_raw[i])
-                    component_used = False
-
-                    if abs(weights[0]) > 0:
-                        # Teacher entropy captures forkiness; keep in same scale per-example.
-                        comp = self._normalize_component(ent_for_score[i].clone(), mask, norm_mode)
-                        combined = combined + weights[0] * comp
-                        component_used = True
-
-                    if abs(weights[1]) > 0:
-                        # Student CE highlights tokens the student currently mispredicts.
-                        comp = self._normalize_component(student_ce[i].clone(), mask, norm_mode)
-                        combined = combined + weights[1] * comp
-                        component_used = True
-
-                    if abs(weights[2]) > 0:
-                        # Teacher/student KL measures disagreement even when CE is small.
-                        comp = self._normalize_component(kl_for_score[i].clone(), mask, norm_mode)
-                        combined = combined + weights[2] * comp
-                        component_used = True
-
-                    if not component_used:
+                    combined = self._build_score_vector(score_ctx, i, mask)
+                    if combined is None:
                         continue
-
-                    combined = combined.masked_fill(~mask, float('-inf'))
                     score_valid = combined[mask]
                     if score_valid.numel() == 0:
                         continue
@@ -308,21 +342,9 @@ class Distiller:
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
             if score_enabled:
-                weights = (
-                    float(getattr(self.config, "score_entropy_weight", 1.0)),
-                    float(getattr(self.config, "score_ce_weight", 1.0)),
-                    float(getattr(self.config, "score_kl_weight", 1.0)),
-                )
-                if all(abs(w) < 1e-8 for w in weights):
-                    raise ValueError("Score-based selection requires at least one non-zero component weight.")
-                norm_mode = getattr(self.config, "score_normalize", "z")
-                targets = input_ids[:, 1:].to(self.student_device)
-                targets = targets.masked_fill(~valid_next, 0)
-                target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-                student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
-                ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
-                kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
             kd_terms = []
             Bsz = t_log_probs.size(0)
@@ -333,28 +355,9 @@ class Distiller:
 
                 valid_idx = torch.where(mask)[0]
                 if score_enabled:
-                    combined = torch.zeros_like(ent_raw[i])
-                    component_used = False
-
-                    if abs(weights[0]) > 0:
-                        comp = self._normalize_component(ent_for_score[i].clone(), mask, norm_mode)
-                        combined = combined + weights[0] * comp
-                        component_used = True
-
-                    if abs(weights[1]) > 0:
-                        comp = self._normalize_component(student_ce[i].clone(), mask, norm_mode)
-                        combined = combined + weights[1] * comp
-                        component_used = True
-
-                    if abs(weights[2]) > 0:
-                        comp = self._normalize_component(kl_for_score[i].clone(), mask, norm_mode)
-                        combined = combined + weights[2] * comp
-                        component_used = True
-
-                    if not component_used:
+                    combined = self._build_score_vector(score_ctx, i, mask)
+                    if combined is None:
                         continue
-
-                    combined = combined.masked_fill(~mask, float('-inf'))
                     score_valid = combined[mask].float()
                     if score_valid.numel() == 0:
                         continue
