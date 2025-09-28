@@ -127,7 +127,7 @@ def _signature_hash(sig: Dict[str, Any]) -> str:
     return hashlib.sha1(b).hexdigest()
 
 
-def init_offline_cache_for_trainer(trainer) -> TeacherOfflineCache:
+def init_offline_cache_for_trainer(trainer: Any) -> TeacherOfflineCache:
     """Create or reuse a global logits cache dir under <repo_root>/logits_caches/<hash>.
     Also maintain an index.json mapping hash -> signature for clarity.
     Returns a TeacherOfflineCache instance.
