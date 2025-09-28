@@ -11,9 +11,17 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket"] = "vanilla"
+    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
+    alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
+    
+    # RS-KD parameters (for distill_type="pos-rs-kd")
+    rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
+    rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
+    rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
+    rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
+    kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
     
     # Bucket mode parameters (for distill_type="bucket")
     bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")

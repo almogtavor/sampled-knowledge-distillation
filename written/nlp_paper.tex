@@ -37,7 +37,9 @@
 %
 % and set <dim> to something 5cm or larger.
 
-\title{EKD: Entropy Knowledge Distillation for Efficient Language Model Compression}
+\title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
+% \title{SampledKD: How Efficient Could Distillation Get While Match Accuracy?}
+% \title{SampledKD: Could Distillation be So Much More Efficient?}
 
 % Author information can be set in various styles:
 % For several authors from the same institution:
@@ -101,6 +103,12 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 \paragraph{Token-/word-level selective supervision.} Several strands selectively apply supervision at the granularity we target. In NMT, \citet{wang2021selectivekd} select high cross-entropy \emph{words} using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}. In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}. In CoT reasoning, KPOD learns token importance weights and a progressive schedule within rationales \citep{feng2024kpod}. Compared to these, our EKD selects tokens using teacher-centric uncertainty (entropy and teacher-student KL) and couples selection with \emph{unbiased} class-level Random-Sampling KD at selected positions; we also keep CE on all tokens for stability.
 
 \paragraph{Entropy/uncertainty-guided KD.} Beyond selection, multiple KD variants weight supervision by uncertainty or entropy. Entropy-based adaptive KD (EA-KD) prioritizes \emph{samples} with higher entropy \citep{su2023eakd}, while DE-MKD uses teacher-prediction entropy to weight among multiple teachers \citep{cheng2024demkd}. Uncertainty-aware mixup reduces KD cost while maintaining quality \citep{xu2023unix}. Recent work also shows entropy-weighted distillation can improve reliability/calibration in classification \citep{guo2024entropykd}. Our EKD differs in using entropy/KL primarily to decide \emph{which tokens} receive external-teacher KD, not to reweight losses globally.
+
+\paragraph{Entropy approximation.} We estimate token uncertainty via a \emph{Top-k-plus-Tail} entropy bound\citep{kaltchenko2025entropyheatmap}. Let $u$ be logits, $u_{(1)} \geq \cdots \geq u_{(m)}$ the top-$m$. With $Z_m = \log \sum_{j \leq m} e^{u_{(j)}}$ and $Z_{\text{ub}} = \log\big(e^{Z_m} + (V-m)e^{u_{(m)}}\big)$, define $p^{\min}_{(j)} = \exp(u_{(j)} - Z_{\text{ub}})$, $\tau_{\max} = 1 - \sum_{j \leq m} p^{\min}_{(j)}$. The \textbf{lower bound}
+\[\small
+H_{\text{lb}} = -\sum_{j \leq m} p^{\min}_{(j)} \log p^{\min}_{(j)} - \tau_{\max} \log \, \tau_{\max}
+\]
+follows from entropy's monotonicity under coarse-graining; we also report a \textbf{midpoint} estimator $\widehat{H}_m = \tfrac{1}{2}\big(H_{\text{lb}} + \tau_{\max} \log(V-m) + H_{\text{lb}}\big)$ for ranking. (TkT-LB with $m=20$)
 
 \paragraph{Entropy/perplexity for data selection.} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2022perplexprune} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
