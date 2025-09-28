@@ -779,6 +779,13 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
     print(r"\end{tabular}")
     print(r"\end{table}")
 
+def save_json(obj: dict, path: Path) -> None:
+    """Persist a Python dict to pretty-printed UTF-8 JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    print(f"[json] Wrote {path}")
+
 # ---------- Main pipeline ----------
 def main():
     parser = argparse.ArgumentParser()
@@ -895,6 +902,12 @@ def main():
             hb_metrics
         ])
         all_models_metrics[tag] = merged
+
+        # --- Save results to JSON for this model ---
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_file = results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
+        payload = {"tag": tag, "suite": args.suite, "results": merged}
+        save_json(payload, out_file)
 
         # Log results to W&B and TensorBoard
         try:
