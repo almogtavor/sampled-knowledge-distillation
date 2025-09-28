@@ -15,13 +15,20 @@ cd /home/joberant/NLP_2425b/YOUR_USER/ekd/
 ### 3. Create virtual environment:
 ```bash
 python3.10 -m venv --without-pip fastenv310
-curl -sS https://bootstrap.pypa.io/get-pip.py | python
+source ./fastenv310/bin/activate
 ```
 
 ### 4. Install dependencies:
 ```bash
-source ./fastenv310/bin/activate
-python -m pip install --no-cache-dir --prefer-binary --only-binary=:all: --index-url https://download.pytorch.org/whl/cu118 -r requirements.txt
+curl -sS https://bootstrap.pypa.io/get-pip.py | python
+export TMPDIR="$PWD/tmp"; mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
+export PIP_CACHE_DIR="$TMPDIR/pip-cache"
+
+pip install --extra-index-url https://download.pytorch.org/whl/cu118 \
+    torch==2.2.2+cu118 torchvision==0.17.2+cu118 torchaudio==2.2.2+cu118
+
+pip install --prefer-binary -r requirements.txt
 ```
 
 ## 📁 Sync Local Changes to Remote
