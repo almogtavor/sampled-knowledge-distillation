@@ -811,8 +811,10 @@ def main():
     work_dir = Path(args.work_dir)
     exports_dir = work_dir / "exports"
     results_dir = work_dir / "results"
+    json_results_dir = Path("evaluation_json_results")
     ensure_dir(exports_dir)
     ensure_dir(results_dir)
+    ensure_dir(json_results_dir)
 
     # Build GPU pool
     if args.gpu_ids:
@@ -905,7 +907,7 @@ def main():
 
         # --- Save results to JSON for this model ---
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_file = results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
+        out_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
         payload = {"tag": tag, "suite": args.suite, "results": merged}
         save_json(payload, out_file)
 
