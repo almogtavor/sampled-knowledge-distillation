@@ -10,7 +10,7 @@ import math
 from typing import Dict, Any, List, Optional
 
 from ..config import TrainingConfig, TrainingMetrics
-from .offline_cache import TeacherOfflineCache, build_offline_cache_if_needed
+from .offline_cache import TeacherOfflineCache, build_offline_cache_if_needed, init_offline_cache_for_trainer
 from .entropy_utils import token_entropy
 
 
@@ -78,11 +78,8 @@ class Distiller:
         self.checkpoint_dir = self.output_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # offline teacher cache
-        self.cache = None
-        if getattr(self.config, "offline_cache", False):
-            cache_dir = Path(getattr(self.config, "offline_cache_dir", self.output_dir / "teacher_offline_cache"))
-            self.cache = TeacherOfflineCache(cache_dir)
+        # offline teacher logits cache: centralized initialization
+        self.cache = init_offline_cache_for_trainer(self)
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
@@ -98,6 +95,10 @@ class Distiller:
             'optimizer_state_dict': self.opt.state_dict(),
             'distill_type': self.config.distill_type,
             'k_percent': self.config.k_percent,
+            # Record base/student/teacher identifiers to allow later export without extra CLI
+            'base_model_dir': getattr(self.config, 'student_model', None),
+            'student_model': getattr(self.config, 'student_model', None),
+            'teacher_model': getattr(self.config, 'teacher_model', None),
         }
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
@@ -384,6 +385,19 @@ class Distiller:
             if cached_items is not None:
                 need_teacher_full = False
 
+        # Inform per-batch whether we hit the logits cache or run the teacher online
+        if not need_teacher_full:
+            if cached_items is not None:
+                print("[logits-cache] Using cached teacher logits/statistics for this batch (no online teacher forward).")
+            else:
+                # Shouldn't happen, but keep a message for safety
+                print("[logits-cache] Cache considered but no items retrieved; skipping online teacher forward due to mode.")
+        else:
+            if getattr(self.config, "offline_cache", False):
+                print("[logits-cache] Cache miss or not applicable for this batch – running online teacher forward.")
+            else:
+                print("[logits-cache] Disabled – running online teacher forward.")
+
         if need_teacher_full:
             input_ids_t = input_ids.to(self.teacher_device)
             attn_t = attn_mask.to(self.teacher_device)
@@ -394,6 +408,7 @@ class Distiller:
             t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
         else:
             t_pred = t_log_probs = None
+            # message already printed above
 
         # --- KD loss ---
         # Compute per-position base KD according to mode (positions subset and weights),
@@ -485,6 +500,7 @@ class Distiller:
             return zero + zero, 0.0, 0.0
 
         return total, kd_loss.item(), ce_loss.item()
+
 
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""

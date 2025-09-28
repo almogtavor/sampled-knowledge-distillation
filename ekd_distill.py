@@ -1,17 +1,15 @@
 import argparse
 from pathlib import Path
 from datetime import datetime
-import os, shutil
+import os
 from typing import List, Tuple, Optional
 
 import torch
-from transformers.utils import is_torch_cuda_available
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
-from ekd.models.ollama_loader import OllamaModel
 from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
@@ -20,13 +18,14 @@ from datasets import load_dataset
 try:
     from ekd.logging.wandb_utils import create_training_combined_logger
 except ImportError:
-    create_training_combined_logger = lambda *args, **kwargs: None
+    def create_training_combined_logger(*args, **kwargs):
+        return None
 
 
 def load_teacher_with_fallback(
     model_name: str,
-    prefer_gpus: List[int],          # GPUs to use for the teacher, in order of preference
-    student_gpu: Optional[int],      # GPU reserved for the student (exclude from teacher)
+    prefer_gpus: List[int],          # Local GPU indices to use for the teacher, in order of preference
+    student_gpu: Optional[int],      # Local GPU index reserved for the student (exclude from teacher)
 ) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
     """
     1) Try single-GPU FP16 on prefer_gpus[0]
@@ -35,9 +34,7 @@ def load_teacher_with_fallback(
     4) If still OOM, try 4-bit on single GPU
     Returns: (teacher_model, tokenizer, teacher_device_for_inputs)
     """
-    # Helper: make a local offload/cache dir (per job if SLURM)
-    job_id = os.environ.get("SLURM_JOB_ID", "nojid")
-    # Use TMPDIR which is already set up in the SLURM script
+    # Helper: make a local offload/cache dir (per job if SLURM), prefer node-local TMPDIR
     tmpdir = os.environ.get("TMPDIR", "/home/joberant/NLP_2425b/almogt/ekd/tmp")
     offload_dir = os.path.join(tmpdir, "hf_offload_teacher")
     os.makedirs(offload_dir, exist_ok=True)
@@ -234,6 +231,21 @@ def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
 
+    # Prefer node-local tmp to avoid NFS .nfs tombstones on cleanup
+    # If SLURM provides a local scratch (e.g., /dev/shm), use it; fall back to repo tmp
+    node_tmp = os.environ.get("TMPDIR")
+    if not node_tmp:
+        shm_candidate = f"/dev/shm/{os.environ.get('USER', 'user')}.ekd.{os.environ.get('SLURM_JOB_ID', 'local')}"
+        try:
+            os.makedirs(shm_candidate, exist_ok=True)
+            node_tmp = shm_candidate
+        except Exception:
+            node_tmp = f"/home/joberant/NLP_2425b/{os.environ.get('USER', 'user')}/ekd/tmp"
+        os.environ["TMPDIR"] = node_tmp
+    # Point HF caches to tmp (can still hit shared cache via symlink if needed)
+    os.environ.setdefault("HF_HOME", os.path.join(node_tmp, "hf"))
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
     # Set CUDA memory management settings for better memory efficiency
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # Clear any cached memory
@@ -255,29 +267,39 @@ def main():
         total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
     print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
 
-    # Dynamic GPU allocation based on CUDA_VISIBLE_DEVICES
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    avail = [int(x) for x in visible.split(",")] if visible else list(range(device_count))
-    student_gpu = avail[1] if len(avail) >= 2 else avail[0]
-    student_device = torch.device(f"cuda:{student_gpu}")
-    prefer_for_teacher = [g for g in avail if g != student_gpu]
+    # Dynamic GPU allocation normalized to local indices [0..N-1]
+    # When CUDA_VISIBLE_DEVICES=1,3,4,5, local torch sees devices as [0,1,2,3]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        physical = [int(x) for x in cvd.split(",") if x != ""]
+        # local indices are 0..len(physical)-1
+        local_avail = list(range(len(physical)))
+    else:
+        physical = list(range(device_count))
+        local_avail = list(range(device_count))
+
+    # Reserve one local GPU for student (pick 1 if exists else 0)
+    student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
+    student_device = torch.device(f"cuda:{student_local}")
+    # Teacher uses remaining local indices
+    teacher_locals = [g for g in local_avail if g != student_local]
     
-    print(f"CUDA_VISIBLE_DEVICES: {visible}")
-    print(f"Available GPUs: {avail}")
-    print(f"Student GPU: {student_gpu}")
-    print(f"Teacher GPUs: {prefer_for_teacher}")
+    print(f"CUDA_VISIBLE_DEVICES: {cvd}")
+    print(f"Available GPUs (local indices): {local_avail}")
+    print(f"Student GPU (local): {student_local}")
+    print(f"Teacher GPUs (local): {teacher_locals}")
 
     print("Loading teacher with GPU-first fallback...", flush=True)
     teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
         model_name=config.teacher_model,
-        prefer_gpus=prefer_for_teacher,
-        student_gpu=student_gpu,
+        prefer_gpus=teacher_locals,
+        student_gpu=student_local,
     )
 
     print("Loading student on its own GPU...", flush=True)
     student = load_model(  # your existing helper is fine for student
         config.student_model,
-        device_map=student_gpu,     # {'': 1}
+        device_map=student_local,     # {'': 1} but using local index
         quant_bits=config.student_quant_bits,
     )
 

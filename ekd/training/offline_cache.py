@@ -76,6 +76,86 @@ class TeacherOfflineCache:
         return torch.load(self.path_for(key), map_location="cpu")
 
 
+def _repo_root() -> Path:
+    # repo root is two levels up from this file's parent: ekd/training/ -> ekd/ -> project root
+    return Path(__file__).resolve().parents[2]
+
+
+def compute_cache_signature(trainer) -> Dict[str, Any]:
+    """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
+    return {
+        "teacher_name": getattr(getattr(trainer.teacher, "config", None), "_name_or_path", "unknown"),
+        "tokenizer_name": getattr(trainer.tok, "name_or_path", "unknown"),
+        "max_seq_len": int(trainer.config.max_seq_len),
+        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 20)),
+        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 64)),
+        "rs_vocab_beta": float(getattr(trainer.config, "rs_vocab_beta", 1.0)),
+        "dataset_len": int(len(trainer.dataloader.dataset)) if hasattr(trainer.dataloader, "dataset") else -1,
+    }
+
+
+def _cache_base_dir() -> Path:
+    # Single canonical location: <repo_root>/logits_caches
+    base = _repo_root() / "logits_caches"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _index_path() -> Path:
+    return _cache_base_dir() / "index.json"
+
+
+def _load_index() -> Dict[str, Any]:
+    p = _index_path()
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_index(idx: Dict[str, Any]) -> None:
+    p = _index_path()
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(idx, indent=2, sort_keys=True))
+    os.replace(tmp, p)
+
+
+def _signature_hash(sig: Dict[str, Any]) -> str:
+    b = json.dumps(sig, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(b).hexdigest()
+
+
+def init_offline_cache_for_trainer(trainer) -> TeacherOfflineCache:
+    """Create or reuse a global logits cache dir under <repo_root>/logits_caches/<hash>.
+    Also maintain an index.json mapping hash -> signature for clarity.
+    Returns a TeacherOfflineCache instance.
+    """
+    # If user overrode the dir in config, honor it
+    cfg_dir = getattr(trainer.config, "offline_cache_dir", None)
+    if cfg_dir:
+        cache_dir = Path(cfg_dir)
+    else:
+        sig = compute_cache_signature(trainer)
+        h = _signature_hash(sig)
+        idx = _load_index()
+        if h not in idx:
+            idx[h] = sig
+            _save_index(idx)
+        cache_dir = _cache_base_dir() / h
+
+    cache = TeacherOfflineCache(cache_dir)
+    try:
+        n_items = len(cache.manifest.get("items", {}))
+    except Exception:
+        n_items = 0
+    print(f"[logits-cache] Enabled. Using cache dir: {cache_dir} (items={n_items})")
+    # Optionally, point to the index for discoverability
+    print(f"[logits-cache] Index: {_index_path()}")
+    return cache
+
+
 def build_offline_cache_if_needed(self):
     """
     One pass over the dataset with the TEACHER to compute:
@@ -84,32 +164,21 @@ def build_offline_cache_if_needed(self):
 
     Skips entirely if manifest signature matches.
     """
-    if not self.cache:
-        return
+    # Initialize cache if not already set
+    if not getattr(self, "cache", None):
+        self.cache = init_offline_cache_for_trainer(self)
 
     # build signature (changes -> rebuild)
-    sig = {
-        "teacher_name": getattr(
-            getattr(self.teacher, "config", None), "_name_or_path", "unknown"
-        ),
-        "tokenizer_name": getattr(self.tok, "name_or_path", "unknown"),
-        "max_seq_len": int(self.config.max_seq_len),
-        "entropy_approx_m": int(getattr(self.config, "entropy_approx_m", 20)),
-        "rs_vocab_samples": int(getattr(self.config, "rs_vocab_samples", 64)),
-        "rs_vocab_beta": float(getattr(self.config, "rs_vocab_beta", 1.0)),
-        "dataset_len": int(
-            len(self.dataloader.dataset) if hasattr(self.dataloader, "dataset") else -1
-        ),
-    }
+    sig = compute_cache_signature(self)
 
     if self.cache.signature_matches(sig):
         print(
-            "[offline-cache] Cache found with matching signature – using existing cache."
+            f"[logits-cache] Cache found with matching signature – using existing cache at {self.cache.cache_dir}."
         )
         return
 
     print(
-        "[offline-cache] No cache found or signature changed – building teacher cache (one pass over dataset)..."
+        f"[logits-cache] No cache found or signature changed – building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
     )
     self.cache.set_signature(sig)
 
@@ -202,4 +271,8 @@ def build_offline_cache_if_needed(self):
                 }
                 self.cache.write_item(key, item)
                 maybe_cache += 1
-    print(f"[offline-cache] Done. Cached {maybe_cache} new items.")
+                # periodic progress print every 100 items
+                if maybe_cache % 100 == 0:
+                    print(f"[logits-cache] Progress: cached {maybe_cache} new items so far...")
+    total_items = len(self.cache.manifest.get("items", {}))
+    print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")

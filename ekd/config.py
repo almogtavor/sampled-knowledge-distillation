@@ -52,6 +52,14 @@ class TrainingConfig(BaseModel):
     wandb_entity: str = "selective-entropy-knowledge-distillation"
     wandb_enabled: bool = True
     
+    # Offline cache (teacher precomputation for entropy approx + RS-KD over vocab)
+    offline_cache: bool = True
+    offline_cache_dir: Optional[str] = None  # if None, defaults to f"{output_dir}/teacher_offline_cache"
+    # Params used by the offline cache builder
+    entropy_approx_m: int = Field(default=20, description="Top-m used in truncated entropy approximation")
+    rs_vocab_samples: int = Field(default=64, description="Number of vocab samples per position for RS-KD")
+    rs_vocab_beta: float = Field(default=1.0, description="Proposal exponent for RS-KD over vocab: q ∝ p^beta")
+    
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")
     keep_checkpoints: int = Field(default=3, description="Number of recent checkpoints to keep")

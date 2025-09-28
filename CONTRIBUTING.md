@@ -129,6 +129,34 @@ tail -f logs/eval.<jobid>.log
 - Final trained model: `kd_ekd_run_out_model/model.safetensors`
 
 ### Evaluation details:
+## 🧪 Model Evaluation
+
+### Submit evaluation job (HF dir or checkpoint)
+
+The evaluator now accepts a single model path:
+- HF model directory (preferred), e.g. `kd_top_k_tok_run_out_models/model_2617`
+- or a `.pt` checkpoint, which will be exported automatically to a temporary HF directory
+
+```bash
+# SLURM (recommended)
+sbatch evals.slurm <MODEL_PATH> <SUITE: light|heavy>
+
+# Direct (if you already have an env active)
+python -m ekd.evaluations.eval <MODEL_PATH> --suite light
+```
+
+**Examples:**
+```bash
+# Evaluate a ready HF model directory (no export)
+sbatch evals.slurm kd_top_k_tok_run_out_models/model_2617 light
+
+# Evaluate a raw checkpoint (auto-export)
+sbatch evals.slurm kd_top_k_tok_run_out_models/checkpoints/checkpoint_epoch2_step5055.pt heavy
+```
+
+No need to specify the original base model; the evaluator reads it from the checkpoint if needed.
+
+### Monitor evaluation
 - **Benchmarks**: LM-Eval, Lighteval, EvalPlus, AlpacaEval
 - **GPU allocation**: Automatic fallback (3→2→1 GPUs as available)
 - **Cache management**: Handled via SLURM environment variables
@@ -137,8 +165,9 @@ tail -f logs/eval.<jobid>.log
 ## � Entropy Ablation (Top‑k overlap)
 
 Use `ablate.slurm` to run the entropy agreement ablation between exact entropy and truncated Top‑k+Tail.
-
+sbatch ablate.slurm --model <HF_MODEL_DIR_OR_ID> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]
 General form (sbatch forwards flags directly to the Python tool):
+    --model kd_top_k_tok_run_out_models/model_2617 
 
 ```bash
 sbatch ablate.slurm --model <MODEL_OR_DIR> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]

@@ -343,7 +343,7 @@ TASK_TIMEOUTS = {
     "svamp": 900,
     "gsm8k": 1200,
     "aime24": 900,
-    "aime25": 2100,
+    "aime25": 2000,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,
@@ -413,6 +413,12 @@ def run_lmeval_suite(
         _available = set()
 
     # Include local task YAMLs if present
+    # Seed for downstream tools; default to env or EKD_EVAL_SEED set by main
+    seed = int(os.environ.get("EKD_EVAL_SEED", "42"))
+    # Check if lm-eval CLI supports --seed (older versions may not)
+    _help_code, _help_out = run(["lm-eval", "--help"])
+    _lm_eval_supports_seed = _help_code == 0 and ("--seed" in _help_out or "--fewshot-seed" in _help_out)
+
     base_args = [
         "lm-eval",
         "--model", "hf",
@@ -420,6 +426,8 @@ def run_lmeval_suite(
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
+    if _lm_eval_supports_seed:
+        base_args += ["--seed", str(seed)]
 
     def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
         cmd = base_args + ["--tasks", task, "--device", device]
@@ -449,6 +457,10 @@ def run_lmeval_suite(
             if env.get("PYTHONPATH"):
                 py_path_parts.append(env["PYTHONPATH"])
             env["PYTHONPATH"] = ":".join(py_path_parts)
+            # Propagate seed-related env for deterministic child runs
+            env.setdefault("PYTHONHASHSEED", str(seed))
+            env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+            env.setdefault("EKD_EVAL_SEED", str(seed))
             cmd = _task_cmd(task, limit, "cuda:0")
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
@@ -770,9 +782,8 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
 # ---------- Main pipeline ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model_dir", type=str, required=True, help="HF dir used to initialize the student (architecture + tokenizer).")
-    parser.add_argument("--vanilla_ckpt_dir", type=str, default="kd_vanilla_run_out_model")
-    parser.add_argument("--ekd_ckpt_dir", type=str, default="kd_ekd_run_out_model")
+    # Single input: trained student model path (either HF dir or .pt checkpoint). We'll auto-detect.
+    parser.add_argument("model", type=str, help="Path to trained student model: HF directory (preferred) or a .pt checkpoint.")
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
@@ -787,9 +798,7 @@ def main():
     # Suite selection
     parser.add_argument("--suite", type=str, choices=["light", "heavy"], default="light",
                         help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
-    # Optional: evaluate a single tag+checkpoint instead of both latest
-    parser.add_argument("--tag", type=str, choices=["vanilla", "ekd"], help="Evaluate only this run type (vanilla or ekd).")
-    parser.add_argument("--checkpoint_path", type=str, help="Path to a specific checkpoint .pt to evaluate (used with --tag).")
+    # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
@@ -807,27 +816,31 @@ def main():
         gpu_pool = gpu_pool[: args.max_parallel]
     print(f"[gpu] Using GPUs: {gpu_pool}" if gpu_pool else "[gpu] No GPUs detected/selected.")
 
-    # Prepare models (export with caching)
+    # Resolve the single model dir to evaluate
+    in_path = Path(args.model)
+    tag = in_path.stem if in_path.is_file() else in_path.name
     model_specs: List[Tuple[str, Path]] = []
-    if args.tag and args.checkpoint_path:
-        tag = args.tag
-        ckpt = Path(args.checkpoint_path)
-        if not ckpt.exists():
-            print(f"Error: checkpoint not found: {ckpt}")
+    if in_path.is_dir():
+        print(f"[models] Using HF model directory: {in_path}")
+        model_specs.append((tag, in_path))
+    elif in_path.is_file() and in_path.suffix == ".pt":
+        # Export HF dir based on base_model_dir recorded in checkpoint
+        try:
+            chk = torch.load(in_path, map_location="cpu")
+        except Exception as e:
+            print(f"Error loading checkpoint {in_path}: {e}")
             sys.exit(2)
-        export_dir = exports_dir / f"{tag}_export_{ckpt.stem}"
-        export_hf_model(args.base_model_dir, ckpt, export_dir)
+        base_model_dir = chk.get("base_model_dir") or chk.get("base_model") or chk.get("student_model")
+        if not base_model_dir:
+            print("Error: checkpoint does not record base_model_dir. Re-train with newer code or evaluate a ready HF model directory.")
+            sys.exit(2)
+        export_dir = exports_dir / f"export_{in_path.stem}"
+        print(f"[export] Exporting HF model from base='{base_model_dir}' and ckpt='{in_path.name}' -> '{export_dir}'")
+        export_hf_model(base_model_dir, in_path, export_dir)
         model_specs.append((tag, export_dir))
     else:
-        for tag, ckdir in [("vanilla", args.vanilla_ckpt_dir), ("ekd", args.ekd_ckpt_dir)]:
-            ckpt_dir = Path(ckdir)
-            ckpt = find_latest_checkpoint(ckpt_dir)
-            if ckpt is None:
-                print(f"Warning: no checkpoints in {ckpt_dir}, skipping {tag}")
-                continue
-            export_dir = exports_dir / f"{tag}_export"
-            export_hf_model(args.base_model_dir, ckpt, export_dir)
-            model_specs.append((tag, export_dir))
+        print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
+        sys.exit(2)
 
     if not model_specs:
         print("No models exported. Exiting.")
