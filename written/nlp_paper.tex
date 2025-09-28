@@ -116,7 +116,9 @@ Here $\tau_{\max}$ upper-bounds the probability mass outside the top-$m$ (the \e
 	H_{\text{lb}} = -\sum_{j \leq m} p^{\min}_{(j)} \log p^{\min}_{(j)} \; - \; \tau_{\max} \log \tau_{\max}\,.
 \]
 This follows from entropy's monotonicity under coarse-graining: the smallest entropy consistent with the constraints is achieved by merging all tail mass into a single bin.
-One may also define an \emph{upper} estimate $H_{\text{ub}} = H_{\text{lb}} + \tau_{\max}\log(V-m)$ and a midpoint $\widehat{H}_m = \tfrac{1}{2}(H_{\text{lb}}+H_{\text{ub}})$. We rank tokens using $H_{\text{lb}}$ and use TkT-LB with $m{=}20$ for a strong efficiency-accuracy tradeoff.
+One may also define an upper estimate $H_{\text{ub}} = H_{\text{lb}} + \tau_{\max}\log(V-m)$ and a midpoint $\widehat{H}_m = \tfrac{1}{2}(H_{\text{lb}}+H_{\text{ub}})$.
+We rank tokens using $H_{\text{lb}}$ and adopt TkT-LB with $m{=}20$, a safe choice since prior work shows the top-5 tokens already cover over 95\% of the mass \citep{shum2024first}.
+
 
 This cuts computation and storage from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with a 30K vocab and $m{=}20$, we process $\sim20$ terms (plus one tail) instead of 30{,}000—about $1{,}500\times$ fewer—and keep only 20 logits, while remaining a strong proxy for entropy ranking.
 
@@ -208,7 +210,11 @@ A tiny probability floor prevents numerical blow-ups in $1/q$.
 
 \subsection{KD for LLMs} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
 
-\subsection{Sparse logit KD and calibration} Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide \emph{unbiased} estimates that match full-KD gradients in expectation with minimal overhead. Trustworthy distillation explicitly studies calibration and proposes processing the top-$k$ teacher tokens to reduce miscalibration \citep{shum2024first}. We measure calibration via Expected Calibration Error (ECE) \citep{guo2017calibration}.
+\subsection{Sparse logit KD and calibration} 
+Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. 
+Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
+While exploring orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
+Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
 
 \subsection{Token-/word-level selective supervision} Several strands selectively apply supervision at the granularity we target. In NMT, \citet{wang2021selectivekd} select high cross-entropy \emph{words} using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}. In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}. In CoT reasoning, KPOD learns token importance weights and a progressive schedule within rationales \citep{feng2024kpod}. Compared to these, our EKD selects tokens using teacher-centric uncertainty (entropy and teacher-student KL) and couples selection with \emph{unbiased} class-level Random-Sampling KD at selected positions; we also keep CE on all tokens for stability.
 
@@ -223,24 +229,6 @@ A tiny probability floor prevents numerical blow-ups in $1/q$.
 \subsection{Evaluation under shift} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
 
 \subsection{Summary} Prior work either improves the \emph{where} (token/word/sample selection, curricula) \emph{or} the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
-
-% --------------------------
-% Suggested BibTeX keys (map to your .bib)
-% hinton2015distillation, sanh2019distilbert, kim2016sequencekd, gu2023minillm,
-% agarwal2024gkd, boizard2024uld, raman2023slim, anshumann2025sparse,
-% shum2024first, guo2017calibration, wang2021selectivekd, liu2025tokenlevel,
-% zhang2023continualkd, feng2024kpod, su2023eakd, cheng2024demkd, xu2023unix,
-% guo2024entropykd, moore2010cediff, axelrod2015few, axelrod2017cynical,
-% ankner2022perplexprune, datasel2024survey, zhang2022alsurvey, furlanello2018ban,
-% tarvainen2017meanteacher, zhang2023shiftkd
-
-
-% --------------------------
-% Suggested BibTeX keys (map to your .bib)
-% hinton2015distillation, sanh2019distilbert, kim2016sequencekd, gu2023minillm,
-% agarwal2024gkd, boizard2024uld, raman2023slim, anshumann2025sparse,
-% shum2024first, guo2017calibration, wang2021selectivekd, liu2025tokenlevel,
-% feng2024kpod, liu2025srd, furlanello2018ban, tarvainen2017meanteacher, zhang2023shiftkd
 
 \section{Engines}
 
