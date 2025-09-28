@@ -21,6 +21,13 @@ class TrainingConfig(BaseModel):
     rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
     kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
     
+    # RS-KD parameters (for distill_type="pos-rs-kd")
+    rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
+    rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
+    rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
+    rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
+    kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
+    
     # Bucket mode parameters (for distill_type="bucket")
     bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")
     bucket_upper_percent: int = Field(default=80, description="Upper bound for bucket mode (e.g., 80% means skip top 20%)")
