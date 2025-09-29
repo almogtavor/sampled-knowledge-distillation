@@ -10,6 +10,7 @@
 % Standard package includes
 \usepackage{times}
 \usepackage{latexsym}
+\usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 \usepackage{amsmath} % Added for \tfrac and other math commands
 \usepackage{amssymb} % Added for \mathbb and additional math symbols
 
@@ -97,30 +98,63 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 
 \section{Entropy Approximation}
 \label{sec:entropy}
-We estimate token uncertainty via a \emph{Top-$k$-plus-tail} construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
-\[
-	p_i = \frac{e^{u_i}}{Z},\qquad Z = \sum_{j=1}^{V} e^{u_j}
-\]
-denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an \emph{upper bound} on the full log-partition by
+We estimate token uncertainty with a \emph{Top-$m$-plus-tail} construction. Let $u\in\mathbb{R}^V$ be teacher logits and
+$
+	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}.
+$
+Order indices so $u_{(1)}\ge\cdots\ge u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition $Z_m=\log\!\sum_{j\le m} e^{u_{(j)}}$ and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,         \\
-	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
+	Z_{\text{ub}}=\log\!\big(e^{Z_m}+(V-m)e^{u_{(m)}}\big),
 \end{align*}
-The bound $Z_{\text{ub}}$ follows by pessimistically setting all tail logits to the $m$-th largest value $u_{(m)}$. Consequently, for $j \leq m$ we obtain \emph{conservative} (lower) probabilities
+i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities
+$
+	p^{\min}_{(j)}=\exp(u_{(j)}-Z_{\text{ub}}).
+$
+The remaining probability mass outside the top-$m$ is then bounded by
+\begin{align*}
+	\tau_{\max}=1-\sum_{j\le m}p^{\min}_{(j)},
+\end{align*}
+A valid lower bound on entropy $H(p)=-\sum_i p_i\log p_i$ is
 \[
-	p^{\min}_{(j)} = \exp\big(u_{(j)} - Z_{\text{ub}}\big),\quad
-	\tau_{\max} = 1 - \sum_{j \leq m} p^{\min}_{(j)}\,.
+	H_{\text{lb}}=-\sum_{j\le m} p^{\min}_{(j)}\log p^{\min}_{(j)}\;-\;\tau_{\max}\log\tau_{\max},
 \]
-Here $\tau_{\max}$ upper-bounds the probability mass outside the top-$m$ (the \emph{tail}). A valid \textbf{lower bound} on the entropy $H(p) = -\sum_i p_i \log p_i$ is then
-\[
-	H_{\text{lb}} = -\sum_{j \leq m} p^{\min}_{(j)} \log p^{\min}_{(j)} \; - \; \tau_{\max} \log \tau_{\max}\,.
-\]
-This follows from entropy's monotonicity under coarse-graining: the smallest entropy consistent with the constraints is achieved by merging all tail mass into a single bin.
-One may also define an upper estimate $H_{\text{ub}} = H_{\text{lb}} + \tau_{\max}\log(V-m)$ and a midpoint $\widehat{H}_m = \tfrac{1}{2}(H_{\text{lb}}+H_{\text{ub}})$.
-We rank tokens using $H_{\text{lb}}$ and adopt TkT-LB with $m{=}20$, a safe choice since prior work shows the top-5 tokens already cover over 95\% of the mass \citep{shum2024first}.
+achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep{kaltchenko2025entropyheatmap}, Sec.~3.6, for a self-contained proof and LLM application). A corresponding upper estimate is
+\begin{align*}
+	H_{\text{ub}}=H_{\text{lb}}+\tau_{\max}\log(V-m),
+\end{align*}
+(uniform tail), and the midpoint
+\begin{align*}
+	\widehat{H}_{\text{mid}} & =\tfrac12\!\left(H_{\text{lb}}+H_{\text{ub}}\right)                                   \\ 
+	                         & = -\sum_{j\le m}p^{\min}_{(j)}\log p^{\min}_{(j)} \;-\; \tau_{\max}\log\tau_{\max} \; \\
+	                         & \quad +\; \tfrac12\,\tau_{\max}\log(V-m).
+\end{align*}
 
+\paragraph{Choice of estimator and $m$.}
+We found that for positions ranking, using $\widehat{H}_{\text{mid}}$ with $m{=}12$ serves as the best accuracy--efficiency trade-off (Table~\ref{tab:entropy-ablation}). On \texttt{GSM8K} (7{,}473 sequences; 613K tokens; 438K valid), we ablated $m\in\{8,12,15,20\}$ and compared midpoint to lower bound, upper bound, unbiased importance sampling \emph{(IS)} and control-variated importance sampling \emph{(CV-IS)} tail estimators (both use random sampling from the tail; Appendix~\ref{app:tail-IS}).
+We found that midpoint gives the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant to the task of position selection. This reduces compute from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with $V{=}30$K and $m{=}12$, we touch $\sim\!12$ terms (plus one tail) instead of 30K, i.e., $\sim\!2{,}500\times$ fewer.
 
-This cuts computation and storage from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with a 30K vocab and $m{=}20$, we process $\sim20$ terms (plus one tail) instead of 30{,}000—about $1{,}500\times$ fewer—and keep only 20 logits, while remaining a strong proxy for entropy ranking.
+\vspace{-0.5em}
+\begin{table}[h]
+	\centering
+	\small
+	\setlength{\tabcolsep}{6pt}
+	\begin{tabular}{lcccccc}
+		\toprule
+		$m$ & \multicolumn{3}{c}{Avg Overlap $\uparrow$} & \multicolumn{3}{c}{Avg Corr $\uparrow$}                                                         \\
+		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+		    & Mid                                        & IS                                           & CV-IS  & Mid & IS              & CV-IS           \\
+		\midrule
+		8   & 0.947                                          & 0.868                                       & 0.867 & 0.966   & 0.981          & 0.981          \\
+		12  & \textbf{0.965}                                 & 0.918                                       & 0.918 & 0.972   & 0.991          & 0.991          \\
+		15  & 0.971                                          & 0.942                                       & 0.944 & 0.975   & 0.993          & 0.993          \\
+		20  & 0.976                                          & 0.956                                       & 0.957 & 0.977   & \textbf{0.995} & \textbf{0.995} \\
+		\bottomrule
+	\end{tabular}
+	\caption{GSM8K ablation (\(k\%=20\) for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
+	\label{tab:entropy-ablation}
+\end{table}
+\vspace{-0.75em}
+
 
 \section{Position-Selective Distillation (RS-KD over Positions)}
 \label{sec:posrs}
@@ -210,7 +244,7 @@ A tiny probability floor prevents numerical blow-ups in $1/q$.
 
 \subsection{KD for LLMs} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
 
-\subsection{Sparse logit KD and calibration} 
+\subsection{Sparse logit KD and calibration}
 Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. 
 Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
 While exploring orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
@@ -230,88 +264,6 @@ Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top
 
 \subsection{Summary} Prior work either improves the \emph{where} (token/word/sample selection, curricula) \emph{or} the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
 
-\section{Engines}
-
-To produce a PDF file, pdf\LaTeX{} is strongly recommended (over original \LaTeX{} plus dvips+ps2pdf or dvipdf). Xe\LaTeX{} also produces PDF files, and is especially suitable for text in non-Latin scripts.
-\begin{table}
-	\centering
-	\begin{tabular}{lc}
-		\hline
-		\textbf{Command} & \textbf{Output} \\
-		\hline
-		\verb|{\"a}|     & {\"a}           \\
-		\verb|{\^e}|     & {\^e}           \\
-		\verb|{\`i}|     & {\`i}           \\
-		\verb|{\.I}|     & {\.I}           \\
-		\verb|{\o}|      & {\o}            \\
-		\verb|{\'u}|     & {\'u}           \\
-		\verb|{\aa}|     & {\aa}           \\\hline
-	\end{tabular}
-	\begin{tabular}{lc}
-		\hline
-		\textbf{Command} & \textbf{Output} \\
-		\hline
-		\verb|{\c c}|    & {\c c}          \\
-		\verb|{\u g}|    & {\u g}          \\
-		\verb|{\l}|      & {\l}            \\
-		\verb|{\~n}|     & {\~n}           \\
-		\verb|{\H o}|    & {\H o}          \\
-		\verb|{\v r}|    & {\v r}          \\
-		\verb|{\ss}|     & {\ss}           \\
-		\hline
-	\end{tabular}
-	\caption{Example commands for accented characters, to be used in, \emph{e.g.}, Bib\TeX{} entries.}
-	\label{tab:accents}
-\end{table}
-\section{Preamble}
-\begin{table*}
-	\centering
-	\begin{tabular}{lll}
-		\hline
-		\textbf{Output} & \textbf{natbib command} & \textbf{Old ACL-style command} \\
-		\hline
-		\hline
-	\end{tabular}
-	\caption{\label{citation-guide}
-		Citation commands supported by the style file.
-		The style is based on the natbib package and supports all natbib citation commands.
-		It also supports commands defined in previous ACL style files for compatibility.
-	}
-\end{table*}
-The first line of the file must be
-\begin{quote}
-	\begin{verbatim}
-\documentclass[11pt]{article}
-\end{verbatim}
-\end{quote}
-To load the style file in the review version:
-\begin{quote}
-	\begin{verbatim}
-\usepackage[review]{ACL2023}
-\end{verbatim}
-\end{quote}
-For the final version, omit the \verb|review| option:
-\begin{quote}
-	\begin{verbatim}
-\usepackage{ACL2023}
-\end{verbatim}
-\end{quote}
-To use Times Roman, put the following in the preamble:
-\begin{quote}
-	\begin{verbatim}
-\usepackage{times}
-\end{verbatim}
-\end{quote}
-(Alternatives like txfonts or newtx are also acceptable.)
-Please see the \LaTeX{} source of this document for comments on other packages that may be useful.
-Set the title and author using \verb|\title| and \verb|\author|. Within the author list, format multiple authors using \verb|\and| and \verb|\And| and \verb|\AND|; please see the \LaTeX{} source for examples.
-By default, the box containing the title and author names is set to the minimum of 5 cm. If you need more space, include the following in the preamble:
-\begin{quote}
-	\begin{verbatim}
-\setlength\titlebox{<dim>}
-\end{verbatim}
-\end{quote}
-where \verb|<dim>| is replaced with a length. Do not set this length smaller than 5 cm.
 
 \section{Document Body}
 
@@ -352,7 +304,38 @@ Please see Section~\ref{sec:bibtex} for information on preparing Bib\TeX{} files
 
 \subsection{Appendices}
 
-Use \verb|\appendix| before any appendix section to switch the section numbering over to letters. See Appendix~\ref{sec:appendix} for an example.
+\appendix
+\section{Alternative tail estimators (unbiased IS and control variates)}
+\label{app:tail-IS}
+Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)=p_v/P_T$ the tail-normalized sampling distribution. The exact tail \emph{contribution to entropy} is
+\[
+H_T \;=\; -\sum_{v\in T} p_v \log p_v \;=\; -P_T\,\underset{v\sim q}{\mathbb{E}}\,[\log p_v].
+\]
+\textbf{Top-$m$ + naive IS.} With $s$ samples $v_i\!\sim q$,
+\[
+\widehat{H}_T^{\text{IS}}
+= -P_T \cdot \frac{1}{s}\sum_{i=1}^s \log p_{v_i}.
+\]
+\textbf{Top-$m$ + control-variated IS (uniform baseline).}
+Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
+\[
+\sum_{v\in T} p_v \log p_v
+= -P_T\log\!\frac{P_T}{V-m}
+\;+\; P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
+\]
+Thus the entropy tail is
+\[
+H_T^{\text{CV-IS}}
+= \underbrace{-P_T\log\!\frac{P_T}{V-m}}_{\text{baseline}}
+\;-\; P_T \cdot \underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right],
+\]
+with unbiased estimator (using $s$ samples):
+\[
+\widehat{H}_T^{\text{CV-IS}}
+= -P_T\log\!\frac{P_T}{V-m}
+\;-\; P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
+\]
+In all cases the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
 
 \section{Bib\TeX{} Files}
 \label{sec:bibtex}
