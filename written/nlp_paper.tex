@@ -40,7 +40,7 @@
 %
 % and set <dim> to something 5cm or larger.
 
-\title{SampledKD: Extreme Sampling, Full Distillation Accuracy.}
+\title{SampledKD: Extreme Sampling, Full Distillation Accuracy}
 % \title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
 % \title{SampledKD: How Efficient Could Distillation Get While Match Accuracy?}
 % \title{SampledKD: Could Distillation be So Much More Efficient?}
@@ -87,7 +87,7 @@ We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs. Ou
 
 \begin{itemize}
 	\item Introduce \textbf{token-selective distillation}: choose a subset of tokens for KD using scores such as teacher entropy, teacher-student KL, and student CE;
-	\item Estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD} - importance-sampling teacher classes and reweighting—so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
+	\item Estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD}---importance-sampling teacher classes and reweighting---so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
 	\item Maintain standard cross-entropy (CE) on \emph{all} tokens to stabilize training and calibration \citep{guo2017calibration}; and
 	\item Add simple curricula (increasing KD coverage over time) and optional EMA-based self-distillation for robustness.
 \end{itemize}
@@ -107,10 +107,10 @@ denote the softmax probabilities and partition function. Order indices so that $
 	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,         \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
-i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities
-$
+i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
+\[
 	p^{\min}_{(j)}=\exp(u_{(j)}-Z_{\text{ub}}).
-$
+\]
 The remaining probability mass outside the top-$m$ is then bounded by
 \begin{align*}
 	\tau_{\max}=1-\sum_{j\le m}p^{\min}_{(j)},
@@ -141,17 +141,17 @@ Midpoint gives the best top-$k$ position overlap with exact entropy at substanti
 	\setlength{\tabcolsep}{6pt}
 	\begin{tabular}{lcccccc}
 		\toprule
-		$m$ & \multicolumn{3}{c}{Avg Overlap $\uparrow$} & \multicolumn{3}{c}{Avg Corr $\uparrow$}                                                         \\
+		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                         \\
 		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
 		    & Mid                                        & IS                                           & CV-IS  & Mid & IS              & CV-IS           \\
 		\midrule
 		8   & 0.947                                          & 0.868                                       & 0.867 & 0.966   & 0.981          & 0.981          \\
 		12  & \textbf{0.965}                                 & 0.918                                       & 0.918 & 0.972   & 0.991          & 0.991          \\
 		15  & 0.971                                          & 0.942                                       & 0.944 & 0.975   & 0.993          & 0.993          \\
-		20  & 0.976                                          & 0.956                                       & 0.957 & 0.977   & \textbf{0.995} & \textbf{0.995} \\
+		20  & 0.976                                          & \textbf{0.956}                                       & \textbf{0.957} & \textbf{0.977}   & \textbf{0.995} & \textbf{0.995} \\
 		\bottomrule
 	\end{tabular}
-	\caption{GSM8K ablation (\(k\%=20\) for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
+	\caption{GSM8K ablation ($k\%{=}20$ for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
 	\label{tab:entropy-ablation}
 \end{table}
 \vspace{-0.75em}
@@ -257,28 +257,16 @@ Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top
 
 % (moved) Entropy approximation subsection relocated before Related Work.
 
-\subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2022perplexprune} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
+\subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2024perplexedperplexityperplexitybaseddata} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
 \subsection{Self-distillation and EMA teachers} Self-distillation regularizes students via a teacher derived from the student itself, e.g., Born-Again Networks \citep{furlanello2018ban} and Mean Teacher (EMA) consistency \citep{tarvainen2017meanteacher}. We adopt an optional EMA self-distill term as a light regularizer complementary to external-teacher KD.
 
 \subsection{Evaluation under shift} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
 
-\subsection{Summary} Prior work either improves the \emph{where} (token/word/sample selection, curricula) \emph{or} the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
+\subsection{Summary} Prior work either improves the \emph{where} (token/word/sample selection, curricula) or the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
 
-
-\section{Document Body}
-
-
-\subsection{Footnotes}
-
-Footnotes are inserted with the \verb|\footnote| command.\footnote{This is a footnote.}
-
-\subsection{Tables and figures}
-
-See Table~\ref{tab:accents} for an example of a table and its caption.
-\textbf{Do not override the default caption sizes.}
-
-
+\bibliography{anthology, custom}
+\bibliographystyle{acl_natbib}
 
 \appendix
 \section{Alternative tail estimators (unbiased IS and control variates)}
@@ -299,7 +287,7 @@ Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 = -P_T\log\!\frac{P_T}{V-m}
 \;+\; P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \]
-Thus the entropy tail is
+Thus, the entropy tail is
 \[
 H_T^{\text{CV-IS}}
 = \underbrace{-P_T\log\!\frac{P_T}{V-m}}_{\text{baseline}}
@@ -311,6 +299,6 @@ with unbiased estimator (using $s$ samples):
 &= -P_T\log\!\frac{P_T}{V-m} \\
 &\quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
-In all cases the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
+In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
 
 \end{document}
