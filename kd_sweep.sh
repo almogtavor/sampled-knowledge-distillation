@@ -14,6 +14,12 @@ usage() {
 MODE="$1"
 K_FIXED="${2:-20}"
 
+# One label to group all runs from this invocation
+export KD_SWEEP_NAME="${KD_SWEEP_NAME:-$(date +%Y%m%d_%H%M)-$MODE}"
+# Optional W&B defaults propagated to jobs
+export WANDB_PROJECT="${WANDB_PROJECT:-selective-entropy-knowledge-distillation}"
+# export WANDB_ENTITY="your_team"
+
 if [[ "$MODE" == "compare_k" ]]; then
   METHOD="${2:-top-k-tok}"
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)

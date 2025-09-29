@@ -54,6 +54,28 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
+# ---------- Weights & Biases ----------
+export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
+export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
+export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_DISABLED=${WANDB_DISABLED:-false}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
+# Group/name/id make the UI nice for shell-based sweeps
+export WANDB_GROUP="${WANDB_GROUP:-${KD_SWEEP_NAME:-manual}-$(echo "$DISTILL_TYPE" | tr '-' '_')}"
+export WANDB_NOTES="slurm_id=$SLURM_JOB_ID; k=$K_PERCENT; eval=${EVAL_SUITE:-none}; anneal=${ANNEAL_FLAG:-none}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID}_$K_PERCENT_${DISTILL_TYPE}}"
+
+echo "=== Weights & Biases ==="
+echo "W&B PROJECT        = $WANDB_PROJECT"
+echo "W&B ENTITY         = ${WANDB_ENTITY:-<user>}"
+echo "W&B GROUP          = $WANDB_GROUP"
+echo "W&B RUN_ID         = $WANDB_RUN_ID"
+echo "W&B MODE/DISABLED  = $WANDB_MODE / $WANDB_DISABLED"
+echo "======================"
+
 VENV_DIR="$PWD/fastenv310_3_new"
 
 # Check if a custom venv name is passed as a parameter
