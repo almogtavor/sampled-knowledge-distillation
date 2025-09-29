@@ -217,7 +217,7 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Where to store/read the offline teacher cache (defaults under output_dir).")
     parser.add_argument("--entropy_approx_m", type=int, default=20,
                         help="Top-k for truncated-entropy approximation (Sec. 3.6), m=20 by default.")
-    parser.add_argument("--rs_vocab_samples", type=int, default=64,
+    parser.add_argument("--rs_vocab_samples", type=int, default=12,
                         help="How many vocab tokens to sample per position for RS-KD.")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
