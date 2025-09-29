@@ -394,9 +394,9 @@ class Distiller:
                 print("[logits-cache] Cache considered but no items retrieved; skipping online teacher forward due to mode.")
         else:
             if getattr(self.config, "offline_cache", False):
-                print("[logits-cache] Cache miss or not applicable for this batch – running online teacher forward.")
+                print("[logits-cache] Cache miss or not applicable for this batch - running online teacher forward.")
             else:
-                print("[logits-cache] Disabled – running online teacher forward.")
+                print("[logits-cache] Disabled - running online teacher forward.")
 
         if need_teacher_full:
             input_ids_t = input_ids.to(self.teacher_device)

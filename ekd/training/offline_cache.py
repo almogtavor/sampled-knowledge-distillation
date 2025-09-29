@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import torch
-from .entropy_utils import truncated_entropy_topk_tail
+from .entropy_utils import truncated_entropy_topk_tail_midpoint
 
 
 class TeacherOfflineCache:
@@ -87,8 +87,8 @@ def compute_cache_signature(trainer) -> Dict[str, Any]:
         "teacher_name": getattr(getattr(trainer.teacher, "config", None), "_name_or_path", "unknown"),
         "tokenizer_name": getattr(trainer.tok, "name_or_path", "unknown"),
         "max_seq_len": int(trainer.config.max_seq_len),
-        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 20)),
-        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 64)),
+        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 12)),
+        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 12)),
         "rs_vocab_beta": float(getattr(trainer.config, "rs_vocab_beta", 1.0)),
         "dataset_len": int(len(trainer.dataloader.dataset)) if hasattr(trainer.dataloader, "dataset") else -1,
     }
@@ -173,18 +173,18 @@ def build_offline_cache_if_needed(self):
 
     if self.cache.signature_matches(sig):
         print(
-            f"[logits-cache] Cache found with matching signature – using existing cache at {self.cache.cache_dir}."
+            f"[logits-cache] Cache found with matching signature - using existing cache at {self.cache.cache_dir}."
         )
         return
 
     print(
-        f"[logits-cache] No cache found or signature changed – building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
+        f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
     )
     self.cache.set_signature(sig)
 
     T = 1.0  # use T=1 for the cached statistics
-    k_approx = int(getattr(self.config, "entropy_approx_m", 20))
-    S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
+    k_approx = int(getattr(self.config, "entropy_approx_m", 12))
+    S_vocab = int(getattr(self.config, "rs_vocab_samples", 12))
     beta = float(getattr(self.config, "rs_vocab_beta", 1.0))  # q ∝ p^beta
 
     self.teacher.eval()
@@ -232,7 +232,7 @@ def build_offline_cache_if_needed(self):
                         continue
 
                     # H_hat (Top-k + tail)
-                    H_hat = truncated_entropy_topk_tail(
+                    H_hat = truncated_entropy_topk_tail_midpoint(
                         pred_i[pos], k=k_approx
                     )  # scalar tensor
                     H_hat_list.append(H_hat)
