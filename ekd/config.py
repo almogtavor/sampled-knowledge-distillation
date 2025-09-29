@@ -46,6 +46,9 @@ class TrainingConfig(BaseModel):
     gradient_accumulation_steps: int = Field(default=4, description="Number of steps to accumulate gradients")
     max_seq_len: int = Field(default=512, description="Maximum sequence length to save memory")
     lr: float = Field(default=1e-5, description="Learning rate")
+    # Reproducibility
+    seed: int = Field(default=1337, description="Random seed for reproducibility")
+    deterministic: bool = Field(default=False, description="Enable deterministic algorithms (may slow down)")
     
     # Output and logging
     output_dir: str
