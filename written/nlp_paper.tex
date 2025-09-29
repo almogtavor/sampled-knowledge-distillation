@@ -94,17 +94,18 @@ We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs. Ou
 
 Empirically, we compare against (a) full Random-Sampling KD at every token, (b) deterministic top-$K$ logit truncation baselines including SLIM-style sparse logits \citep{raman2023slim}, and (c) token/data selection schemes such as GLS for NMT \citep{wang2021selectivekd}, token-level uncertainty-aware post-training \citep{liu2025tokenlevel}, and progressive chain-of-thought distillation \citep{feng2024kpod}. We evaluate both in-distribution and under distribution shift using the ShiftKD protocol \citep{zhang2023shiftkd}. Our results indicate that token-selective, \emph{unbiased} KD attains a stronger accuracy-efficiency Pareto frontier while preserving calibration.
 
-\subsection{Contributions} (1) A unified framework for \emph{token-level} selection with \emph{unbiased} class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
+\subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
 \section{Entropy Approximation}
 \label{sec:entropy}
-We estimate token uncertainty with a \emph{Top-$m$-plus-tail} construction. Let $u\in\mathbb{R}^V$ be teacher logits and
+We estimate token uncertainty via a Top-$k$-plus-tail construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
 $
-	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}.
+	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}
 $
-Order indices so $u_{(1)}\ge\cdots\ge u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition $Z_m=\log\!\sum_{j\le m} e^{u_{(j)}}$ and an upper bound on the full log-partition by
+denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_{\text{ub}}=\log\!\big(e^{Z_m}+(V-m)e^{u_{(m)}}\big),
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,         \\
+	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities
 $
@@ -131,7 +132,7 @@ achieved by merging all tail mass into a single bin (coarse-graining; see \citep
 
 \paragraph{Choice of estimator and $m$.}
 We found that for positions ranking, using $\widehat{H}_{\text{mid}}$ with $m{=}12$ serves as the best accuracy--efficiency trade-off (Table~\ref{tab:entropy-ablation}). On \texttt{GSM8K} (7{,}473 sequences; 613K tokens; 438K valid), we ablated $m\in\{8,12,15,20\}$ and compared midpoint to lower bound, upper bound, unbiased importance sampling \emph{(IS)} and control-variated importance sampling \emph{(CV-IS)} tail estimators (both use random sampling from the tail; Appendix~\ref{app:tail-IS}).
-We found that midpoint gives the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant to the task of position selection. This reduces compute from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with $V{=}30$K and $m{=}12$, we touch $\sim\!12$ terms (plus one tail) instead of 30K, i.e., $\sim\!2{,}500\times$ fewer.
+Midpoint gives the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant to the task of position selection. This reduces compute from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with $V{=}30$K and $m{=}12$, we touch $\sim\!12$ terms (plus one tail) instead of 30K, i.e., $\sim\!2{,}500\times$ fewer.
 
 \vspace{-0.5em}
 \begin{table}[h]
@@ -277,31 +278,6 @@ Footnotes are inserted with the \verb|\footnote| command.\footnote{This is a foo
 See Table~\ref{tab:accents} for an example of a table and its caption.
 \textbf{Do not override the default caption sizes.}
 
-\subsection{Hyperlinks}
-
-Users of older versions of \LaTeX{} may encounter the following error during compilation:
-\begin{quote}
-	\tt\verb|\pdfendlink| ended up in different nesting level than \verb|\pdfstartlink|.
-\end{quote}
-This happens when pdf\LaTeX{} is used and a citation splits across a page boundary. The best way to fix this is to upgrade \LaTeX{} to 2018-12-01 or later.
-
-If your own bib file is named \texttt{custom.bib}, then placing the following before any appendices in your \LaTeX{} file will generate the references section for you:
-\begin{quote}
-	\begin{verbatim}
-\bibliographystyle{acl_natbib}
-\bibliography{custom}
-\end{verbatim}
-\end{quote}
-You can obtain the complete ACL Anthology as a Bib\TeX{} file from \url{https://aclweb.org/anthology/anthology.bib.gz}.
-To include both the Anthology and your own .bib file, use the following instead of the above.
-\begin{quote}
-	\begin{verbatim}
-\bibliographystyle{acl_natbib}
-\bibliography{anthology,custom}
-\end{verbatim}
-\end{quote}
-Please see Section~\ref{sec:bibtex} for information on preparing Bib\TeX{} files.
-
 \subsection{Appendices}
 
 \appendix
@@ -330,11 +306,11 @@ H_T^{\text{CV-IS}}
 \;-\; P_T \cdot \underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right],
 \]
 with unbiased estimator (using $s$ samples):
-\[
+\begin{align*}
 \widehat{H}_T^{\text{CV-IS}}
-= -P_T\log\!\frac{P_T}{V-m}
-\;-\; P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
-\]
+&= -P_T\log\!\frac{P_T}{V-m} \\
+&\quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
+\end{align*}
 In all cases the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
 
 \section{Bib\TeX{} Files}
