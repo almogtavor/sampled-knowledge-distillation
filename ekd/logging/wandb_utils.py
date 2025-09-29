@@ -8,7 +8,7 @@ Weights & Biases and TensorBoard.
 
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from datetime import datetime
 
 # Optional imports
@@ -23,6 +23,10 @@ try:
     TENSORBOARD_AVAILABLE = True
 except ImportError:
     TENSORBOARD_AVAILABLE = False
+
+    if TYPE_CHECKING:
+        # For type checkers/linting only; avoids runtime import cycles
+        from ekd.config import TrainingConfig
 
 
 class WandBLogger:
