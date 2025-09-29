@@ -16,9 +16,9 @@ if [[ "$MODE" == "compare_k" ]]; then
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)
   for K in 1 2 5 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
-      sbatch train.slurm vanilla "$K"
+      sbatch train.slurm vanilla "$K" light
     else
-      sbatch train.slurm top-k-tok "$K"
+      sbatch train.slurm top-k-tok "$K" light
     fi
   done
 
