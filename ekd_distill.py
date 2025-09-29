@@ -172,6 +172,15 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
     parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
+    # KD temperature annealing controls
+    parser.add_argument("--anneal_kd_temperature", action="store_true", default=False,
+                        help="Enable annealing of kd_temperature during training")
+    parser.add_argument("--kd_temperature_start", type=float, default=2.0,
+                        help="Starting KD temperature when annealing is enabled")
+    parser.add_argument("--kd_temperature_end", type=float, default=1.0,
+                        help="Final KD temperature when annealing is enabled")
+    parser.add_argument("--kd_hold_frac", type=float, default=0.6,
+                        help="Fraction of total updates to hold at start temperature before linear decay")
     # RS-KD (position-sampling) hyperparams
     parser.add_argument("--rs_alpha", type=float, default=1.0,
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")

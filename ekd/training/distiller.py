@@ -20,7 +20,7 @@ def kl_from_vocab_samples(
     s_logp_sel: torch.Tensor, # [S] student log-probs at same tokens
     q_sel: torch.Tensor,  # [S] proposal probabilities used to draw the samples
     self_norm: bool = True,
-    temperature: float = 1.0,
+    T_kd: float = 1.0,
 ) -> torch.Tensor:
     """
     Estimate KL(P||S) = sum_j p_j (log p_j - log s_j)
@@ -32,18 +32,17 @@ def kl_from_vocab_samples(
     Inputs are 1D tensors for a single position. Returns a scalar tensor.
     """
     with torch.no_grad():
-        # Convert teacher log-probs at T=1 to probabilities at the configured T via p_T ∝ p_1^{1/T}
-        # Using self-normalized importance weights removes the unknown global normalization constant.
-        if temperature == 1.0:
-            p_sel = t_logp_sel.exp()  # [S]
-        else:
-            p_sel = (t_logp_sel / temperature).exp()
-        w = p_sel / q_sel.clamp_min(1e-12)  # [S]
+        # teacher probabilities at T=1 (cache stores t_logp_sel at T=1)
+        p1 = t_logp_sel.exp()
+        # retemper to current KD temperature: p_T ∝ p_1^{1/T_kd}
+        gamma = 1.0 / max(1e-12, T_kd)
+        pT_un = p1.pow(gamma)
+        w = pT_un / q_sel.clamp_min(1e-12)  # [S]
         if self_norm:
             w = w / w.sum().clamp_min(1e-12)
-    # (log p_T - log s_T) with teacher log-probs adjusted to T up to a constant shift
-    t_logp_T_sel = t_logp_sel if temperature == 1.0 else (t_logp_sel / temperature)
-    diff = (t_logp_T_sel - s_logp_sel)  # [S]
+    # approximate log p_T on sampled ids up to a constant
+    logpT_approx = torch.log(pT_un) - torch.log(pT_un.sum().clamp_min(1e-12))
+    diff = (logpT_approx - s_logp_sel)  # [S]
     if self_norm:
         return (w * diff).sum()
     else:
@@ -441,9 +440,10 @@ class Distiller:
                     # Need teacher logprobs for online proposal
                     assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
                     with torch.no_grad():
-                        # Use teacher log-probs at the same temperature T used by the student
-                        t_full_i = t_log_probs[i]
-                        p_i = t_full_i.exp()
+                        # Use teacher at current KD temperature for proposal, but t_logp_sel at T=1 for KL
+                        t_full_i_Tkd = t_log_probs[i]            # log p at T_kd
+                        p_i = t_full_i_Tkd.exp()
+                        t_full_i_T1 = torch.log_softmax(t_pred[i] / 1.0, dim=-1)  # log p at T=1
                     beta = float(getattr(self.config, "rs_vocab_beta", 1.0))
                     S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
                     idx_list, tlogp_list, q_list = [], [], []
@@ -459,7 +459,7 @@ class Distiller:
                         S = min(S_vocab, q.numel())
                         idx = torch.multinomial(q, num_samples=S, replacement=False)
                         idx_list.append(idx.cpu())
-                        tlogp_list.append(t_full_i[pos, idx].cpu())
+                        tlogp_list.append(t_full_i_T1[pos, idx].cpu())
                         q_list.append(q[idx].cpu())
 
                 # For each position, compute KL estimate using only sampled tokens
@@ -472,7 +472,9 @@ class Distiller:
                     t_logp_sel = tlogp_list[pos].to(self.student_device)
                     q_sel = q_list[pos].to(self.student_device)
                     s_logp_sel = s_log_probs[i, pos, idx]
-                    kd_terms.append(kl_from_vocab_samples(t_logp_sel, s_logp_sel, q_sel, self_norm=True, temperature=T))
+                    kd_terms.append(kl_from_vocab_samples(
+                        t_logp_sel, s_logp_sel, q_sel, self_norm=True, T_kd=T
+                    ))
 
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
         
@@ -515,6 +517,21 @@ class Distiller:
         """Run distillation training for specified number of epochs."""
         # make the offline pass once, if requested
         build_offline_cache_if_needed(self)
+        # Prepare KD temperature annealing schedule (in units of optimizer updates)
+        updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
+        total_updates = updates_per_epoch * max(1, epochs)
+
+        def kd_T_at(update_idx: int) -> float:
+            T0 = float(getattr(self.config, "kd_temperature_start", 2.0))
+            T1 = float(getattr(self.config, "kd_temperature_end", 1.0))
+            hold_frac = float(getattr(self.config, "kd_hold_frac", 0.6))
+            hold_u = int(hold_frac * total_updates)
+            if update_idx <= hold_u:
+                return T0
+            tail = max(1, (total_updates - hold_u))
+            pos = (update_idx - hold_u) / tail
+            return T0 + (T1 - T0) * pos
+
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
@@ -533,6 +550,9 @@ class Distiller:
                     self.opt.step()
                     self.opt.zero_grad(set_to_none=True)
                     self.global_step += 1
+                    # Update KD temperature per schedule if enabled
+                    if bool(getattr(self.config, "anneal_kd_temperature", False)):
+                        self.config.kd_temperature = kd_T_at(self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 

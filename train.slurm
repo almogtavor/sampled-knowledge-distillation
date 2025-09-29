@@ -15,6 +15,7 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
+ANNEAL_FLAG=${3:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # ---------- caches / env ----------
@@ -30,7 +31,6 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-# Default virtual environment directory
 VENV_DIR="$PWD/fastenv310_3_new"
 
 # Check if a custom venv name is passed as a parameter
@@ -152,7 +152,7 @@ exec "$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
-  --k_percent 20 \
+  --k_percent "$K_PERCENT" \
   --datasets "gsm8k" \
   --dataset_config "main" \
   --prompt_col "question" \
@@ -165,4 +165,5 @@ exec "$PY" ekd_distill.py \
   --max_seq_len 384 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
-  --output_dir "$OUTPUT_DIR"
+  --output_dir "$OUTPUT_DIR" \
+  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)

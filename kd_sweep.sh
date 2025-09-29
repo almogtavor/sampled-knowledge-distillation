@@ -5,6 +5,8 @@ usage() {
   echo "Usage:"
   echo "  bash kd_sweep.sh compare_k"
   echo "  bash kd_sweep.sh compare_methods <k_percent>"
+  echo "  bash kd_sweep.sh anneal_compare_methods <k_percent>"
+  echo "  bash kd_sweep.sh anneal_method <method> <k_percent>"
 }
 
 [[ $# -lt 1 ]] && usage && exit 1
@@ -27,6 +29,19 @@ elif [[ "$MODE" == "compare_methods" ]]; then
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
     sbatch train.slurm "$METHOD" "$K_FIXED"
   done
+
+elif [[ "$MODE" == "anneal_compare_methods" ]]; then
+  # Run all methods with temperature annealing enabled
+  for METHOD in vanilla top-k-tok random pos-rs-kd; do
+    sbatch train.slurm "$METHOD" "$K_FIXED" anneal
+  done
+
+elif [[ "$MODE" == "anneal_method" ]]; then
+  # Run a specific method with annealing at fixed k
+  [[ $# -lt 3 ]] && usage && exit 1
+  METHOD="$2"
+  K_ARG="$3"
+  sbatch train.slurm "$METHOD" "$K_ARG" anneal
 
 else
   usage; exit 1

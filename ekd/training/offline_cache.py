@@ -190,7 +190,7 @@ def build_offline_cache_if_needed(self):
     )
     self.cache.set_signature(sig)
 
-    # Use configured temperature for offline entropy approximation (distinct from runtime KD temperature)
+    # Use configured temperature for offline entropy approximation/proposals (distinct from runtime KD temperature)
     T = float(getattr(self.config, "entropy_approx_temperature", getattr(self.config, "cache_temperature", 1.0)))
     k_approx = int(getattr(self.config, "entropy_approx_m", 12))
     S_vocab = int(getattr(self.config, "rs_vocab_samples", 12))
@@ -215,9 +215,11 @@ def build_offline_cache_if_needed(self):
             V_last = V
             t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
             valid_next = attn_mask[:, 1:].bool()  # [B, L-1]
-            # exact log-probs at T=1 for cache
-            t_logp_full = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
-            p_full = t_logp_full.exp()  # [B, L-1, V]
+            # For cache we persist t_logp_sel strictly at T=1
+            t_logp_full_T1 = torch.log_softmax(t_pred / 1.0, dim=-1)  # [B, L-1, V]
+            # For RS-KD proposal q we allow temperature T (entropy_approx_temperature)
+            t_logp_full_T = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+            p_full_T = t_logp_full_T.exp()  # [B, L-1, V]
 
             # per example
             for i in range(B):
@@ -227,8 +229,8 @@ def build_offline_cache_if_needed(self):
 
                 valid_i = valid_next[i]  # [L-1]
                 pred_i = t_pred[i]  # [L-1, V]
-                logp_i = t_logp_full[i]  # [L-1, V]
-                p_i = p_full[i]  # [L-1, V]
+                logp_i_T1 = t_logp_full_T1[i]  # [L-1, V]
+                p_i_T = p_full_T[i]  # [L-1, V]
 
                 # truncated entropy per pos
                 H_hat_list = []
@@ -249,7 +251,7 @@ def build_offline_cache_if_needed(self):
                     H_hat_list.append(H_hat)
 
                     # RS-KD over vocabulary: proposal q ∝ p^beta, sample S without replacement
-                    p_pos = p_i[pos]  # [V]
+                    p_pos = p_i_T[pos]  # [V]
                     if beta != 1.0:
                         q_un = p_pos.clamp_min(1e-12).pow(beta)
                     else:
@@ -259,7 +261,7 @@ def build_offline_cache_if_needed(self):
                     S = min(S_vocab, V)
                     # multinomial w/o replacement via Gumbel-top-k trick fallback when needed
                     idx = torch.multinomial(q, num_samples=S, replacement=False)  # [S]
-                    t_logp_sel = logp_i[pos, idx]  # [S]
+                    t_logp_sel = logp_i_T1[pos, idx]  # [S] (persist at T=1)
                     q_sel = q[idx]  # [S]
 
                     rs_idx_list.append(idx.cpu())
