@@ -144,6 +144,7 @@ except Exception as e:
 PY
 
 # ---------- launch ----------
+EPOCHS="${EKD_EPOCHS:-3}"   # default 3, override via env
 # Convert hyphens to underscores for directory names
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
 OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
@@ -157,7 +158,7 @@ exec "$PY" ekd_distill.py \
   --dataset_config "main" \
   --prompt_col "question" \
   --answer_col "answer" \
-  --epochs 3 \
+  --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
   --checkpoint_steps 250 \

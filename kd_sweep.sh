@@ -15,12 +15,26 @@ MODE="$1"
 K_FIXED="${2:-20}"
 
 if [[ "$MODE" == "compare_k" ]]; then
+  METHOD="${2:-top-k-tok}"
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)
   for K in 0 1 2 5 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
       sbatch train.slurm vanilla "$K"
     else
-      sbatch train.slurm top-k-tok "$K"
+      sbatch train.slurm "$METHOD" "$K"
+    fi
+  done
+
+elif [[ "$MODE" == "coarse_k" ]]; then
+  # --- New mode: quick 1-epoch pass over a default K list
+  METHOD="${2:-top-k-tok}"
+  K_LIST=(0 1 2 5 10 12 15 20 25 30 40 50 75 100)
+  # Submit with EKD_EPOCHS=1 to override train.slurm default
+  for K in "${K_LIST[@]}"; do
+    if [[ "$K" -eq 100 ]]; then
+      sbatch --export=ALL,EKD_EPOCHS=1 train.slurm vanilla "$K"
+    else
+      sbatch --export=ALL,EKD_EPOCHS=1 train.slurm "$METHOD" "$K"
     fi
   done
 
