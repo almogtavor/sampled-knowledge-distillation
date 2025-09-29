@@ -16,7 +16,7 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
-EPOCHS="${4:-${EKD_EPOCHS:-3}}"   # default 3, override via env
+EPOCHS="${4:-${EPOCHS:-3}}"   # default 3, override via env
 ANNEAL_FLAG=${5:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)

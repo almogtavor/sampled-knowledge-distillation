@@ -44,6 +44,7 @@ elif [[ "$MODE" == "coarse_k" ]]; then
     fi
   done
 
+
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
