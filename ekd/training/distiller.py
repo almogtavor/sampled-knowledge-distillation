@@ -430,12 +430,18 @@ class Distiller:
                 if valid_i.sum() == 0:
                     continue
 
-                # Gather RS-KD lists from cache or online fallback using teacher logp
+                # Gather RS-KD samples from packed cache or build online using teacher
                 if cached_items is not None:
                     rs = cached_items[i]["rs"]
-                    idx_list = rs["idx"]
-                    tlogp_list = rs["t_logp"]
-                    q_list = rs["q"]
+                    pos_offsets = torch.as_tensor(rs["pos_offsets"])  # [L]
+                    idx_flat = torch.as_tensor(rs["idx_flat"])        # [sum S_i]
+                    tlogp_flat = torch.as_tensor(rs["t_logp_flat"])    # [sum S_i]
+                    q_flat = torch.as_tensor(rs["q_flat"])            # [sum S_i]
+
+                    def get_pos_slice(p: int):
+                        s = int(pos_offsets[p].item())
+                        e = int(pos_offsets[p + 1].item())
+                        return idx_flat[s:e], tlogp_flat[s:e], q_flat[s:e]
                 else:
                     # Need teacher logprobs for online proposal
                     assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
@@ -462,15 +468,19 @@ class Distiller:
                         tlogp_list.append(t_full_i_T1[pos, idx].cpu())
                         q_list.append(q[idx].cpu())
 
+                    def get_pos_slice(p: int):
+                        return idx_list[p], tlogp_list[p], q_list[p]
+
                 # For each position, compute KL estimate using only sampled tokens
                 for pos, is_valid in enumerate(valid_i.tolist()):
                     if not is_valid:
                         continue
-                    idx = idx_list[pos].to(self.student_device)
+                    idx_cpu, tlogp_cpu, q_cpu = get_pos_slice(pos)
+                    idx = torch.as_tensor(idx_cpu).to(self.student_device, dtype=torch.long)
                     if idx.numel() == 0:
                         continue
-                    t_logp_sel = tlogp_list[pos].to(self.student_device)
-                    q_sel = q_list[pos].to(self.student_device)
+                    t_logp_sel = torch.as_tensor(tlogp_cpu).to(self.student_device)
+                    q_sel = torch.as_tensor(q_cpu).to(self.student_device)
                     s_logp_sel = s_log_probs[i, pos, idx]
                     kd_terms.append(kl_from_vocab_samples(
                         t_logp_sel, s_logp_sel, q_sel, self_norm=True, T_kd=T

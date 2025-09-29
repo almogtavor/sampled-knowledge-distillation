@@ -67,7 +67,7 @@ export WANDB_RESUME=${WANDB_RESUME:-allow}
 export KD_SWEEP_NAME="${KD_SWEEP_NAME:-$(date +%Y%m%d_%H%M)-$DISTILL_TYPE}"
 export WANDB_GROUP="${WANDB_GROUP:-${KD_SWEEP_NAME:-manual}-$(echo "$DISTILL_TYPE" | tr '-' '_')-k${K_PERCENT}}"
 export WANDB_NOTES="slurm_id=$SLURM_JOB_ID; k=$K_PERCENT; eval=${EVAL_SUITE:-none}; anneal=${ANNEAL_FLAG:-none}"
-export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID}_$K_PERCENT_${DISTILL_TYPE}}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID}_${K_PERCENT}_${DISTILL_TYPE}}"
 
 echo "=== Weights & Biases ==="
 echo "W&B PROJECT        = $WANDB_PROJECT"
