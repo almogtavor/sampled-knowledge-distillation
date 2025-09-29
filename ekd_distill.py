@@ -170,8 +170,8 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Optionally quantize student for memory (not typical during training)")
     parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
-    parser.add_argument("--rs_kd_proposal_temp", type=int, default=1, help="for pos-rs-kd only")
-    parser.add_argument("--kd_temperature", type=int, default=1, help="for pos-rs-kd only")
+    parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
+    parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
     # RS-KD (position-sampling) hyperparams
     parser.add_argument("--rs_alpha", type=float, default=1.0,
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")

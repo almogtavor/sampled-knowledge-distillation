@@ -20,6 +20,7 @@ def kl_from_vocab_samples(
     s_logp_sel: torch.Tensor, # [S] student log-probs at same tokens
     q_sel: torch.Tensor,  # [S] proposal probabilities used to draw the samples
     self_norm: bool = True,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
     """
     Estimate KL(P||S) = sum_j p_j (log p_j - log s_j)
@@ -31,12 +32,18 @@ def kl_from_vocab_samples(
     Inputs are 1D tensors for a single position. Returns a scalar tensor.
     """
     with torch.no_grad():
-        p_sel = (t_logp_sel).exp()  # [S]
+        # Convert teacher log-probs at T=1 to probabilities at the configured T via p_T ∝ p_1^{1/T}
+        # Using self-normalized importance weights removes the unknown global normalization constant.
+        if temperature == 1.0:
+            p_sel = t_logp_sel.exp()  # [S]
+        else:
+            p_sel = (t_logp_sel / temperature).exp()
         w = p_sel / q_sel.clamp_min(1e-12)  # [S]
         if self_norm:
             w = w / w.sum().clamp_min(1e-12)
-    # (log p - log s)
-    diff = (t_logp_sel - s_logp_sel)  # [S]
+    # (log p_T - log s_T) with teacher log-probs adjusted to T up to a constant shift
+    t_logp_T_sel = t_logp_sel if temperature == 1.0 else (t_logp_sel / temperature)
+    diff = (t_logp_T_sel - s_logp_sel)  # [S]
     if self_norm:
         return (w * diff).sum()
     else:
@@ -363,7 +370,8 @@ class Distiller:
         input_ids_s = input_ids.to(self.student_device)
         attn_mask_s = attn_mask.to(self.student_device)
 
-        T = 2.0  # distillation temperature
+        # Unified KD temperature (applies to both teacher and student log-softmax)
+        T = float(getattr(self.config, "kd_temperature", 1.0))
         T2 = T * T
 
         # --- student forward (always) ---
@@ -433,6 +441,7 @@ class Distiller:
                     # Need teacher logprobs for online proposal
                     assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
                     with torch.no_grad():
+                        # Use teacher log-probs at the same temperature T used by the student
                         t_full_i = t_log_probs[i]
                         p_i = t_full_i.exp()
                     beta = float(getattr(self.config, "rs_vocab_beta", 1.0))
@@ -463,7 +472,7 @@ class Distiller:
                     t_logp_sel = tlogp_list[pos].to(self.student_device)
                     q_sel = q_list[pos].to(self.student_device)
                     s_logp_sel = s_log_probs[i, pos, idx]
-                    kd_terms.append(kl_from_vocab_samples(t_logp_sel, s_logp_sel, q_sel, self_norm=True))
+                    kd_terms.append(kl_from_vocab_samples(t_logp_sel, s_logp_sel, q_sel, self_norm=True, temperature=T))
 
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
         
