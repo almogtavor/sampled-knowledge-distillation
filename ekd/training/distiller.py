@@ -512,11 +512,36 @@ class Distiller:
 
         return total, kd_loss.item(), ce_loss.item()
 
-
+    def compute_cache_signature(self) -> Dict[str, Any]:
+        """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
+        return {
+            "teacher_name": getattr(getattr(self.teacher, "config", None), "_name_or_path", "unknown"),
+            "tokenizer_name": getattr(self.tok, "name_or_path", "unknown"),
+            "max_seq_len": int(self.config.max_seq_len),
+            "entropy_approx_m": int(getattr(self.config, "entropy_approx_m", 12)),
+            "rs_vocab_samples": int(getattr(self.config, "rs_vocab_samples", 12)),
+            "rs_vocab_beta": float(getattr(self.config, "rs_vocab_beta", 1.0)),
+            "entropy_approx_temperature": float(
+                getattr(self.config, "entropy_approx_temperature", getattr(self.config, "cache_temperature", 1.0))
+            ),
+            "dataset_len": int(len(self.dataloader.dataset)) if hasattr(self.dataloader, "dataset") else -1,
+        }
+        
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
-        # make the offline pass once, if requested
-        build_offline_cache_if_needed(self)
+        # make the offline pass once, if requested (no hidden side effects)
+        if self.cache is None:
+            self.cache = init_offline_cache_for_trainer(getattr(self.config, "offline_cache_dir", None), 
+                                                        self.compute_cache_signature())
+        self.cache = build_offline_cache_if_needed(
+            cache=self.cache,
+            teacher=self.teacher,
+            tok=self.tok,
+            dataloader=self.dataloader,
+            config=self.config,
+            teacher_device=self.teacher_device,
+            sanitize_logits_fn=self._sanitize_logits,
+        )
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)

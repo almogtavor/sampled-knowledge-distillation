@@ -16,7 +16,7 @@ K_FIXED="${2:-20}"
 
 if [[ "$MODE" == "compare_k" ]]; then
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)
-  for K in 1 2 5 10 12 15 20 25 30 40 50 75 100; do
+  for K in 0 1 2 5 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
       sbatch train.slurm vanilla "$K"
     else
