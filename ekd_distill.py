@@ -1,4 +1,6 @@
 import argparse
+import random
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 import os
@@ -230,6 +232,12 @@ def parse_args_to_config() -> TrainingConfig:
                         help="How many vocab tokens to sample per position for RS-KD.")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
+    # Reproducibility
+    default_seed = int(os.environ.get("SEED", "1337"))
+    default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
+    parser.add_argument("--seed", type=int, default=default_seed, help="Random seed for reproducibility")
+    parser.add_argument("--deterministic", action="store_true", default=default_det,
+                        help="Enable deterministic algorithms (may slow down, sets cudnn.deterministic and use_deterministic_algorithms)")
     args = parser.parse_args()
     
     # Convert argparse Namespace to TrainingConfig
@@ -239,6 +247,18 @@ def parse_args_to_config() -> TrainingConfig:
 def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
+
+    # global seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+
+    # Optional deterministic mode
+    if getattr(config, "deterministic", False):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
 
     # Prefer node-local tmp to avoid NFS .nfs tombstones on cleanup
     # If SLURM provides a local scratch (e.g., /dev/shm), use it; fall back to repo tmp
@@ -259,8 +279,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # Clear any cached memory
         
-    # Speed optimizations (safe)
-    torch.backends.cudnn.benchmark = True
+    # Speed optimizations (safe) or deterministic fallback
+    if getattr(config, "deterministic", False):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
@@ -351,6 +375,14 @@ def main():
         dataset = examples
 
     collate = DistillCollator(tok, config.max_seq_len)
+    # Seeded DataLoader generator for reproducible shuffling
+    gen = torch.Generator()
+    gen.manual_seed(config.seed)
+    def _seed_worker(worker_id: int):
+        base = int(config.seed)
+        np.random.seed(base + worker_id)
+        random.seed(base + worker_id)
+
     dl = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -358,7 +390,9 @@ def main():
         collate_fn=collate,
         num_workers=min(8, os.cpu_count() or 1),
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
+        generator=gen,
+        worker_init_fn=_seed_worker,
     )
 
     # Initialize logging with experiment name

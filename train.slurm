@@ -15,7 +15,8 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
-ANNEAL_FLAG=${3:-""}
+EVAL_SUITE=${3:-}
+ANNEAL_FLAG=${4:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 
 # ---------- caches / env ----------
@@ -167,4 +168,6 @@ exec "$PY" ekd_distill.py \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \
+  --seed "${SEED:-1337}" \
+  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
   $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)
