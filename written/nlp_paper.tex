@@ -125,7 +125,7 @@ achieved by merging all tail mass into a single bin (coarse-graining; see \citep
 \end{align*}
 (uniform tail), and the midpoint
 \begin{align*}
-	\widehat{H}_{\text{mid}} & =\tfrac12\!\left(H_{\text{lb}}+H_{\text{ub}}\right)                                   \\ 
+	\widehat{H}_{\text{mid}} & =\tfrac12\!\left(H_{\text{lb}}+H_{\text{ub}}\right)                                   \\
 	                         & = -\sum_{j\le m}p^{\min}_{(j)}\log p^{\min}_{(j)} \;-\; \tau_{\max}\log\tau_{\max} \; \\
 	                         & \quad +\; \tfrac12\,\tau_{\max}\log(V-m).
 \end{align*}
@@ -139,16 +139,16 @@ Midpoint gives the best top-$k$ position overlap with exact entropy at substanti
 	\centering
 	\small
 	\setlength{\tabcolsep}{6pt}
-	\begin{tabular}{lcccccc}
+	\begin{tabular}{rcccccc}
 		\toprule
-		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                         \\
+		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                                     \\
 		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
-		    & Mid                                        & IS                                           & CV-IS  & Mid & IS              & CV-IS           \\
+		    & Mid                                         & IS                                        & CV-IS          & Mid            & IS             & CV-IS          \\
 		\midrule
-		8   & 0.947                                          & 0.868                                       & 0.867 & 0.966   & 0.981          & 0.981          \\
-		12  & \textbf{0.965}                                 & 0.918                                       & 0.918 & 0.972   & 0.991          & 0.991          \\
-		15  & 0.971                                          & 0.942                                       & 0.944 & 0.975   & 0.993          & 0.993          \\
-		20  & 0.976                                          & \textbf{0.956}                                       & \textbf{0.957} & \textbf{0.977}   & \textbf{0.995} & \textbf{0.995} \\
+		8   & 0.947                                       & 0.868                                     & 0.867          & 0.966          & 0.981          & 0.981          \\
+		12  & \textbf{0.965}                              & 0.918                                     & 0.918          & 0.972          & 0.991          & 0.991          \\
+		15  & 0.971                                       & 0.942                                     & 0.944          & 0.975          & 0.993          & 0.993          \\
+		20  & 0.976                                       & \textbf{0.956}                            & \textbf{0.957} & \textbf{0.977} & \textbf{0.995} & \textbf{0.995} \\
 		\bottomrule
 	\end{tabular}
 	\caption{GSM8K ablation ($k\%{=}20$ for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
@@ -246,7 +246,7 @@ A tiny probability floor prevents numerical blow-ups in $1/q$.
 \subsection{KD for LLMs} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
 
 \subsection{Sparse logit KD and calibration}
-Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students. 
+Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students.
 Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
 While exploring orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
 Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
@@ -273,31 +273,31 @@ Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top
 \label{app:tail-IS}
 Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)=p_v/P_T$ the tail-normalized sampling distribution. The exact tail \emph{contribution to entropy} is
 \[
-H_T \;=\; -\sum_{v\in T} p_v \log p_v \;=\; -P_T\,\underset{v\sim q}{\mathbb{E}}\,[\log p_v].
+	H_T \;=\; -\sum_{v\in T} p_v \log p_v \;=\; -P_T\,\underset{v\sim q}{\mathbb{E}}\,[\log p_v].
 \]
 \textbf{Top-$m$ + naive IS.} With $s$ samples $v_i\!\sim q$,
 \[
-\widehat{H}_T^{\text{IS}}
-= -P_T \cdot \frac{1}{s}\sum_{i=1}^s \log p_{v_i}.
+	\widehat{H}_T^{\text{IS}}
+	= -P_T \cdot \frac{1}{s}\sum_{i=1}^s \log p_{v_i}.
 \]
 \textbf{Top-$m$ + control-variated IS (uniform baseline).}
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \[
-\sum_{v\in T} p_v \log p_v
-= -P_T\log\!\frac{P_T}{V-m}
-\;+\; P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
+	\sum_{v\in T} p_v \log p_v
+	= -P_T\log\!\frac{P_T}{V-m}
+	\;+\; P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \]
 Thus, the entropy tail is
 \[
-H_T^{\text{CV-IS}}
-= \underbrace{-P_T\log\!\frac{P_T}{V-m}}_{\text{baseline}}
-\;-\; P_T \cdot \underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right],
+	H_T^{\text{CV-IS}}
+	= \underbrace{-P_T\log\!\frac{P_T}{V-m}}_{\text{baseline}}
+	\;-\; P_T \cdot \underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right],
 \]
 with unbiased estimator (using $s$ samples):
 \begin{align*}
-\widehat{H}_T^{\text{CV-IS}}
-&= -P_T\log\!\frac{P_T}{V-m} \\
-&\quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
+	\widehat{H}_T^{\text{CV-IS}}
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
+	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
 
