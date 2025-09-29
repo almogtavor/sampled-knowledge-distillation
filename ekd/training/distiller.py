@@ -68,6 +68,7 @@ class Distiller:
         self.opt = AdamW(self.student.parameters(), lr=config.lr)
         self.teacher_device = teacher_device
         self.student_device = student_device
+        self._printed_cache_info = False
         
         # Logging setup
         self.logger = logger
@@ -386,17 +387,16 @@ class Distiller:
                 need_teacher_full = False
 
         # Inform per-batch whether we hit the logits cache or run the teacher online
-        if not need_teacher_full:
-            if cached_items is not None:
-                print("[logits-cache] Using cached teacher logits/statistics for this batch (no online teacher forward).")
+        if not self._printed_cache_info:
+            if not need_teacher_full and cached_items is not None:
+                print("[logits-cache] Using cached teacher logits/statistics (no online teacher forward).")
+            elif not need_teacher_full:
+                print("[logits-cache] Cache considered but empty for this batch; skipping teacher forward due to mode.")
+            elif getattr(self.config, "offline_cache", False):
+                print("[logits-cache] Cache miss or not applicable - running online teacher forward.")
             else:
-                # Shouldn't happen, but keep a message for safety
-                print("[logits-cache] Cache considered but no items retrieved; skipping online teacher forward due to mode.")
-        else:
-            if getattr(self.config, "offline_cache", False):
-                print("[logits-cache] Cache miss or not applicable for this batch – running online teacher forward.")
-            else:
-                print("[logits-cache] Disabled – running online teacher forward.")
+                print("[logits-cache] Disabled - running online teacher forward.")
+            self._printed_cache_info = True
 
         if need_teacher_full:
             input_ids_t = input_ids.to(self.teacher_device)

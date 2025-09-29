@@ -17,6 +17,26 @@ DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
 echo "Running training with distillation type: $DISTILL_TYPE"
+START_TIME=$(date +%s)
+echo "Job started at $(date -u)"
+
+# Convert hyphens to underscores for directory names
+DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
+
+# Default virtual environment directory
+VENV_DIR="$PWD/fastenv310_3_new"
+
+echo "=== Job Parameters ==="
+echo "SLURM_JOB_ID      = ${SLURM_JOB_ID:-N/A}"
+echo "DISTILL_TYPE      = $DISTILL_TYPE"
+echo "K_PERCENT         = $K_PERCENT"
+echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
+echo "VENV_DIR          = $VENV_DIR"
+echo "OUTPUT_DIR        = $OUTPUT_DIR"
+echo "User              = $USER"
+echo "GPUs requested    = $SLURM_GPUS"
+echo "======================"
 
 # ---------- caches / env ----------
 mkdir -p logs
@@ -30,9 +50,6 @@ export TRANSFORMERS_VERBOSITY=info
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-
-# Default virtual environment directory
-VENV_DIR="$PWD/fastenv310_3_new"
 
 # Check if a custom venv name is passed as a parameter
 for arg in "$@"; do
@@ -145,9 +162,6 @@ except Exception as e:
 PY
 
 # ---------- launch ----------
-# Convert hyphens to underscores for directory names
-DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
 unset PYTHONPATH PYTHONHOME
 "$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
@@ -167,6 +181,13 @@ unset PYTHONPATH PYTHONHOME
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR"
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+echo "Job started at ${START_TIME}"
+echo "Job finished at $(date -u)"
+echo "Total elapsed time: ${ELAPSED} seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
