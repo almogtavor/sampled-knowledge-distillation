@@ -546,6 +546,7 @@ class Distiller:
         
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
+        overall_train_start = time.time()
         # make the offline pass once, if requested (no hidden side effects)
         if getattr(self.config, "offline_cache", False):
             if self.cache is None:
@@ -658,3 +659,6 @@ class Distiller:
         if self.config.checkpoint_steps > 0:
             print("Training completed. Performing final cleanup of old checkpoints...")
             self._cleanup_old_checkpoints()
+
+        overall_train_elapsed = time.time() - overall_train_start
+        print(f"[distill] Total training duration: {overall_train_elapsed:.2f}s for {epochs} epoch(s)")

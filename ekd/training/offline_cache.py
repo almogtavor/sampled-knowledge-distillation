@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import time
 from pathlib import Path
 from typing import Dict, Any
 
@@ -387,6 +388,7 @@ def _build_cache_pass(
     kd_temperature (tau), U_max, and N_samples configured via build_offline_cache_if_needed.
     """
     teacher.eval()
+    build_start_time = time.time()
     maybe_cache = 0
     V_last = None
     with torch.no_grad():
@@ -476,7 +478,8 @@ def _build_cache_pass(
                 maybe_cache += 1
                 # periodic progress print every 100 items
                 if maybe_cache % 100 == 0:
-                    print(f"[logits-cache] Progress: cached {maybe_cache} new items so far...")
+                    elapsed = time.time() - build_start_time
+                    print(f"[logits-cache] Progress: cached {maybe_cache} new items so far... elapsed={elapsed:.2f}s")
     return maybe_cache, V_last
 
 
@@ -526,14 +529,21 @@ def _recompute_and_persist_stats(
             stats["approx_entropy_logits_saved"] += int(seq_valid * topk_m)
 
         rs = d.get("rs", {}) or {}
-        # Packed representation 
-        idx_flat = rs["idx_flat"]
-        q_flat = rs["q_flat"]
-        s_total = int(len(idx_flat))
-        probs_total = int(len(q_flat))
-        stats["rs_kd_ids_saved"] += s_total
-        stats["rs_kd_probs_saved"] += probs_total
-        stats["ce_logits_needed"] += s_total
+        # Support packed fixed-U representation as well as legacy CSR if present
+        if "packed" in rs:
+            U = int(rs.get("U", 0))
+            s_total = int(seq_valid * U)
+            stats["rs_kd_ids_saved"] += s_total
+            stats["rs_kd_probs_saved"] += s_total
+            stats["ce_logits_needed"] += s_total
+        else:
+            idx_flat = rs.get("idx_flat", [])
+            q_flat = rs.get("q_flat", [])
+            s_total = int(len(idx_flat))
+            probs_total = int(len(q_flat))
+            stats["rs_kd_ids_saved"] += s_total
+            stats["rs_kd_probs_saved"] += probs_total
+            stats["ce_logits_needed"] += s_total
 
     # Compute cache on-disk size: prefer shard sizes when present
     shards = cache.manifest.get("shards")
@@ -611,6 +621,7 @@ def build_offline_cache_if_needed(
     S_vocab = 0
     beta = 1.0
 
+    build_wall_start = time.time()
     maybe_cache, V_last = _build_cache_pass(
         cache=cache,
         teacher=teacher,
@@ -629,9 +640,11 @@ def build_offline_cache_if_needed(
     stats, total_items = _recompute_and_persist_stats(
         cache=cache, tok=tok, k_approx=k_approx, V_last=V_last
     )
+    build_wall_elapsed = time.time() - build_wall_start
 
     saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))
     print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")
+    print(f"[logits-cache] Cache build duration: {build_wall_elapsed:.2f}s")
     print(
         "[logits-cache] Stats: "
         f"approx_entropy_logits_saved={stats['approx_entropy_logits_saved']}, "
