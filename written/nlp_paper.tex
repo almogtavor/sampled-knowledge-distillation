@@ -62,10 +62,10 @@
 %         Author 3 \\ Address line \\ ... \\ Address line}
 
 \author{
-  Neil Cnaan\textsuperscript{*} \qquad Itay Ebenspanger\textsuperscript{*} \qquad Almog Tavor\textsuperscript{*} \\
+  Almog Tavor\textsuperscript{*} \qquad Itay Ebenspanger\textsuperscript{*} \qquad Neil Cnaan\textsuperscript{*} \\
   Balvatnik School of Computer Science and AI \\
   Tel Aviv University \\
-  \texttt{\{email1, email2, email3\}@mail.tau.ac.il} \\
+  \texttt{\{almogt, ebenspanger, neilcnaan\}@mail.tau.ac.il} \\
 }
 
 \begin{document}
@@ -278,7 +278,7 @@ Footnotes are inserted with the \verb|\footnote| command.\footnote{This is a foo
 See Table~\ref{tab:accents} for an example of a table and its caption.
 \textbf{Do not override the default caption sizes.}
 
-\subsection{Appendices}
+
 
 \appendix
 \section{Alternative tail estimators (unbiased IS and control variates)}
@@ -312,56 +312,5 @@ with unbiased estimator (using $s$ samples):
 &\quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
-
-\section{Bib\TeX{} Files}
-\label{sec:bibtex}
-
-Unicode cannot be used in Bib\TeX{} entries, and some ways of typing special characters can disrupt Bib\TeX's alphabetization. The recommended way of typing special characters is shown in Table~\ref{tab:accents}.
-
-Please ensure that Bib\TeX{} records contain DOIs or URLs when possible, and for all the ACL materials that you reference.
-Use the \verb|doi| field for DOIs and the \verb|url| field for URLs.
-If a Bib\TeX{} entry has a URL or DOI field, the paper title in the references section will appear as a hyperlink to the paper, using the hyperref \LaTeX{} package.
-
-\section*{Limitations}
-ACL 2023 requires all submissions to have a section titled ``Limitations'', for discussing the limitations of the paper as a complement to the discussion of strengths in the main text. This section should occur after the conclusion, but before the references. It will not count towards the page limit.
-The discussion of limitations is mandatory. Papers without a limitation section will be desk-rejected without review.
-
-While we are open to different types of limitations, just mentioning that a set of results have been shown for English only probably does not reflect what we expect.
-Mentioning that the method works mostly for languages with limited morphology, like English, is a much better alternative.
-In addition, limitations such as low scalability to long text, the requirement of large GPU resources, or other things that inspire crucial further investigation are welcome.
-
-\section*{Ethics Statement}
-Scientific work published at ACL 2023 must comply with the ACL Ethics Policy.\footnote{\url{https://www.aclweb.org/portal/content/acl-code-ethics}} We encourage all authors to include an explicit ethics statement on the broader impact of the work, or other ethical considerations after the conclusion but before the references. The ethics statement will not count toward the page limit (8 pages for long, 4 pages for short papers).
-
-\section*{Acknowledgements}
-This document has been adapted by Jordan Boyd-Graber, Naoaki Okazaki, Anna Rogers from the style files used for earlier ACL, EMNLP and NAACL proceedings, including those for
-EACL 2023 by Isabelle Augenstein and Andreas Vlachos,
-EMNLP 2022 by Yue Zhang, Ryan Cotterell and Lea Frermann,
-ACL 2020 by Steven Bethard, Ryan Cotterell and Rui Yan,
-ACL 2019 by Douwe Kiela and Ivan Vuli\'{c},
-NAACL 2019 by Stephanie Lukin and Alla Roskovskaya,
-ACL 2018 by Shay Cohen, Kevin Gimpel, and Wei Lu,
-NAACL 2018 by Margaret Mitchell and Stephanie Lukin,
-Bib\TeX{} suggestions for (NA)ACL 2017/2018 from Jason Eisner,
-ACL 2017 by Dan Gildea and Min-Yen Kan, NAACL 2017 by Margaret Mitchell,
-ACL 2012 by Maggie Li and Michael White,
-ACL 2010 by Jing-Shin Chang and Philipp Koehn,
-ACL 2008 by Johanna D. Moore, Simone Teufel, James Allan, and Sadaoki Furui,
-ACL 2005 by Hwee Tou Ng and Kemal Oflazer,
-ACL 2002 by Eugene Charniak and Dekang Lin,
-and earlier ACL and EACL formats written by several people, including
-John Chen, Henry S. Thompson and Donald Walker.
-Additional elements were taken from the formatting instructions of the \emph{International Joint Conference on Artificial Intelligence} and the \emph{Conference on Computer Vision and Pattern Recognition}.
-
-% Entries for the entire Anthology, followed by custom entries
-\bibliography{anthology,custom}
-\bibliographystyle{acl_natbib}
-
-\appendix
-
-\section{Example Appendix}
-\label{sec:appendix}
-
-This is a section in the appendix.
 
 \end{document}
