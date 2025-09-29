@@ -229,7 +229,7 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--entropy_approx_m", type=int, default=12,
                         help="Top-k for truncated-entropy approximation, m=12 by default.")
     parser.add_argument("--rs_vocab_samples", type=int, default=12,
-                        help="How many vocab tokens to sample per position for RS-KD.")
+                        help="How many vocab tokens to sample per position for RS-KD. 36 bytes per position")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
     # Reproducibility

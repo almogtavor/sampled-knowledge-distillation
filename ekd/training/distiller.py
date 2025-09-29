@@ -430,18 +430,19 @@ class Distiller:
                 if valid_i.sum() == 0:
                     continue
 
-                # Gather RS-KD samples from packed cache or build online using teacher
+                # Gather RS-KD samples from new packed cache format or build online when cache missing
                 if cached_items is not None:
                     rs = cached_items[i]["rs"]
-                    pos_offsets = torch.as_tensor(rs["pos_offsets"])  # [L]
-                    idx_flat = torch.as_tensor(rs["idx_flat"])        # [sum S_i]
-                    tlogp_flat = torch.as_tensor(rs["t_logp_flat"])    # [sum S_i]
-                    q_flat = torch.as_tensor(rs["q_flat"])            # [sum S_i]
+                    U = int(rs["U"])  # entries per position
+                    sentinel = int(rs["sentinel_id"])  # Vocab size sentinel id
+                    packed = torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8)  # [(L-1)*U*3]
 
                     def get_pos_slice(p: int):
-                        s = int(pos_offsets[p].item())
-                        e = int(pos_offsets[p + 1].item())
-                        return idx_flat[s:e], tlogp_flat[s:e], q_flat[s:e]
+                        # decode per-position block to (ids, probs)
+                        from .offline_cache import decode_ids_probs_from_block
+                        block = packed[p * U * 3:(p + 1) * U * 3]
+                        ids, probs = decode_ids_probs_from_block(block, U, sentinel)
+                        return ids, probs
                 else:
                     # Need teacher logprobs for online proposal
                     assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
@@ -475,16 +476,25 @@ class Distiller:
                 for pos, is_valid in enumerate(valid_i.tolist()):
                     if not is_valid:
                         continue
-                    idx_cpu, tlogp_cpu, q_cpu = get_pos_slice(pos)
-                    idx = torch.as_tensor(idx_cpu).to(self.student_device, dtype=torch.long)
-                    if idx.numel() == 0:
-                        continue
-                    t_logp_sel = torch.as_tensor(tlogp_cpu).to(self.student_device)
-                    q_sel = torch.as_tensor(q_cpu).to(self.student_device)
-                    s_logp_sel = s_log_probs[i, pos, idx]
-                    kd_terms.append(kl_from_vocab_samples(
-                        t_logp_sel, s_logp_sel, q_sel, self_norm=True, T_kd=T
-                    ))
+                    if cached_items is not None:
+                        ids, probs = get_pos_slice(pos)
+                        if ids.numel() == 0:
+                            continue
+                        # Forward KL approx at KD temperature T using teacher empirical probs
+                        loss_pos = -(probs * s_log_probs[i, pos].index_select(0, ids)).sum()
+                        kd_terms.append(loss_pos)
+                    else:
+                        # Online fallback retained for now (rare path). Build samples as before.
+                        idx_cpu, tlogp_cpu, q_cpu = get_pos_slice(pos)
+                        idx = torch.as_tensor(idx_cpu).to(self.student_device, dtype=torch.long)
+                        if idx.numel() == 0:
+                            continue
+                        t_logp_sel = torch.as_tensor(tlogp_cpu).to(self.student_device)
+                        q_sel = torch.as_tensor(q_cpu).to(self.student_device)
+                        s_logp_sel = s_log_probs[i, pos, idx]
+                        kd_terms.append(kl_from_vocab_samples(
+                            t_logp_sel, s_logp_sel, q_sel, self_norm=True, T_kd=T
+                        ))
 
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
         
@@ -493,19 +503,16 @@ class Distiller:
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
-            logits = s_pred  # [B, L-1, V]
-            targets = input_ids_s[:, 1:] # [B, L-1]
+            targets = input_ids_s[:, 1:]  # [B, L-1]
             targets = targets.masked_fill(~valid_next, -100)
 
-            V = logits.size(-1)
-            flat_logits = logits.reshape(-1, V)
+            # Reuse the existing student log-probs (no extra softmax)
+            V = s_log_probs.size(-1)
+            flat_log_probs = s_log_probs.reshape(-1, V)
             flat_targets = targets.reshape(-1)
-            keep = flat_targets.ne(-100)
 
-            if keep.any():
-                ce_loss = F.cross_entropy(flat_logits[keep], flat_targets[keep], reduction="mean")
-            else:
-                ce_loss = flat_logits.sum() * 0.0
+            # Use NLL with ignore_index for masked positions
+            ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
             total = (1.0 - self.config.alpha_ce) * kd_loss + self.config.alpha_ce * ce_loss
         else:
             ce_loss = torch.tensor(0.0, device=self.student_device)

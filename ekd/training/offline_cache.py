@@ -7,6 +7,104 @@ from typing import Dict, Any
 import torch
 from .entropy_utils import truncated_entropy_topk_tail_midpoint
 
+# ---- Gumbel-based RS-KD packing (fixed-U entries per position) ----
+ID_BITS = 17
+PROB_BITS = 7
+PROB_QMAX = (1 << PROB_BITS) - 1  # 127
+S_SAMPLES_DEFAULT = 50  # draws per position
+
+
+def gumbel_like(x: torch.Tensor) -> torch.Tensor:
+    u = torch.rand_like(x)
+    return -torch.log(-torch.log(u.clamp_min(1e-12)))
+
+
+def sample_with_replacement_from_logits(logits: torch.Tensor, N: int, tau: float) -> torch.Tensor:
+    """Sample N i.i.d. draws per row from softmax(logits/tau) via Gumbel-Max without normalizing.
+
+    logits: [P, V]  -> returns indices Tensor [P, N]
+    """
+    z = logits / float(tau)
+    P, _ = z.shape
+    out = torch.empty(P, N, device=z.device, dtype=torch.long)
+    for n in range(N):
+        g = gumbel_like(z)
+        out[:, n] = (z + g).argmax(dim=-1)
+    return out
+
+
+def topU_unique_counts_per_row(samples: torch.Tensor, U: int):
+    """For each row in `samples` [P,N], compute unique ids and counts, keep top-U by count."""
+    P, _ = samples.shape
+    ids_list, cnts_list = [], []
+    for r in range(P):
+        ids_r, cnts_r = samples[r].unique(return_counts=True)
+        if ids_r.numel() > U:
+            top = torch.topk(cnts_r, k=U, largest=True, sorted=False).indices
+            ids_r, cnts_r = ids_r[top], cnts_r[top]
+        ids_list.append(ids_r)
+        cnts_list.append(cnts_r)
+    return ids_list, cnts_list
+
+
+def counts_to_q7(cnts: torch.Tensor, N: int) -> torch.Tensor:
+    if cnts.numel() == 0:
+        return torch.empty(0, dtype=torch.uint8)
+    x = cnts.float() / float(N)
+    q = torch.round(x * PROB_QMAX).to(torch.int32)
+    diff = int(PROB_QMAX - q.sum().item())
+    if diff != 0:
+        residual = (x * PROB_QMAX - q.float()).abs()
+        order = torch.argsort(residual, descending=True)
+        k = min(len(order), abs(diff))
+        sign = 1 if diff > 0 else -1
+        q[order[:k]] = (q[order[:k]] + sign).clamp(0, PROB_QMAX)
+    return q.to(torch.uint8)
+
+
+def pack_id_q7(ids17: torch.Tensor, q7: torch.Tensor) -> torch.Tensor:
+    x = (ids17.to(torch.int64) & ((1 << ID_BITS) - 1)) | (q7.to(torch.int64) << ID_BITS)
+    x = x & ((1 << 24) - 1)
+    b0 = (x & 0xFF).to(torch.uint8)
+    b1 = ((x >> 8) & 0xFF).to(torch.uint8)
+    b2 = ((x >> 16) & 0xFF).to(torch.uint8)
+    return torch.stack([b0, b1, b2], dim=-1).reshape(-1).contiguous()
+
+
+def unpack_id_q7(packed_flat: torch.Tensor):
+    b = packed_flat.view(-1, 3).to(torch.int64)
+    x = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+    ids17 = x & ((1 << ID_BITS) - 1)
+    q7 = (x >> ID_BITS) & ((1 << PROB_BITS) - 1)
+    return ids17.to(torch.int32), q7.to(torch.uint8)
+
+
+def build_fixedU_packed_rows(ids_list, cnts_list, U: int, N: int, V: int) -> torch.Tensor:
+    P = len(ids_list)
+    out = torch.empty(P * U * 3, dtype=torch.uint8)
+    for r in range(P):
+        ids_r, cnts_r = ids_list[r], cnts_list[r]
+        q7 = counts_to_q7(cnts_r, N)
+        e = ids_r.numel()
+        if e < U:
+            pad = U - e
+            ids_r = torch.cat([ids_r, torch.full((pad,), V, dtype=torch.int32, device=ids_r.device)])
+            q7 = torch.cat([q7, torch.zeros(pad, dtype=torch.uint8, device=q7.device)])
+        packed = pack_id_q7(ids_r[:U].to(torch.int32), q7[:U])
+        out[r * U * 3:(r + 1) * U * 3] = packed.cpu()
+    return out
+
+
+def decode_ids_probs_from_block(block: torch.Tensor, U: int, sentinel_id: int):
+    ids, q7 = unpack_id_q7(block)
+    keep = (ids != sentinel_id) & (q7 > 0)
+    ids = ids[keep].long()
+    probs = (q7[keep].float() / PROB_QMAX).clamp_min(0.0)
+    s = probs.sum()
+    if s > 0:
+        probs = probs / s
+    return ids, probs
+
 
 class TeacherOfflineCache:
     """
@@ -279,12 +377,15 @@ def _build_cache_pass(
     dataloader,
     teacher_device,
     sanitize_logits_fn,
-    T: float,
     k_approx: int,
     S_vocab: int,
     beta: float,
 ):
-    """Internal: run a single offline teacher pass to populate cache. Returns (maybe_cache, V_last)."""
+    """Internal: run a single offline teacher pass to populate cache. Returns (maybe_cache, V_last).
+
+    Note: T/beta/S_vocab are not needed for RS sampling that uses Gumbel with
+    kd_temperature (tau), U_max, and N_samples configured via build_offline_cache_if_needed.
+    """
     teacher.eval()
     maybe_cache = 0
     V_last = None
@@ -304,11 +405,6 @@ def _build_cache_pass(
             V_last = V
             t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
             valid_next = attn_mask[:, 1:].bool()  # [B, L-1]
-            # For cache we persist t_logp_sel strictly at T=1
-            t_logp_full_T1 = torch.log_softmax(t_pred / 1.0, dim=-1)  # [B, L-1, V]
-            # For RS-KD proposal q we allow temperature T (entropy_approx_temperature)
-            t_logp_full_T = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
-            p_full_T = t_logp_full_T.exp()  # [B, L-1, V]
 
             # per example
             for i in range(B):
@@ -318,51 +414,47 @@ def _build_cache_pass(
 
                 valid_i = valid_next[i]  # [L-1]
                 pred_i = t_pred[i]  # [L-1, V]
-                logp_i_T1 = t_logp_full_T1[i]  # [L-1, V]
-                p_i_T = p_full_T[i]  # [L-1, V]
 
                 # truncated entropy per pos
                 H_hat_list = []
-                # collect on device, transfer once per sequence
-                rs_idx_seq, rs_logp_seq, rs_q_seq = [], [], []
+                # Gumbel RS-KD collection per valid position
+                pos_logits = []
+                pos_to_row = []
 
                 for pos, is_valid in enumerate(valid_i.tolist()):
                     if not is_valid:
                         H_hat_list.append(torch.tensor(0.0, device=pred_i.device))
-                        rs_idx_seq.append(torch.empty(0, dtype=torch.long, device=pred_i.device))
-                        rs_logp_seq.append(torch.empty(0, device=pred_i.device))
-                        rs_q_seq.append(torch.empty(0, device=pred_i.device))
                         continue
 
+                    # Calculate a truncated approximation of the entropy (H_hat) for current position's prediction logits (pred_i[pos])
                     # H_hat (Top-k + tail)
                     H_hat = truncated_entropy_topk_tail_midpoint(
                         pred_i[pos], k=k_approx
                     )  # scalar tensor
                     H_hat_list.append(H_hat)
 
-                    # RS-KD over vocabulary: proposal q ∝ p^beta, sample S without replacement
-                    p_pos = p_i_T[pos]  # [V]
-                    if beta != 1.0:
-                        q_un = p_pos.clamp_min(1e-12).pow(beta)
-                    else:
-                        q_un = p_pos.clamp_min(1e-12)
-                    q = q_un / q_un.sum()
+                    pos_logits.append(pred_i[pos])
+                    pos_to_row.append(pos)
 
-                    S = min(S_vocab, V)
-                    # multinomial w/o replacement via Gumbel-top-k trick fallback when needed
-                    idx = torch.multinomial(q, num_samples=S, replacement=False)  # [S]
-                    t_logp_sel = logp_i_T1[pos, idx]  # [S] (persist at T=1)
-                    q_sel = q[idx]  # [S]
+                # Build fixed-U packed rows with Gumbel sampling
+                sig = cache.manifest.get('signature', {})
+                tau_target = float(sig.get('kd_temperature', 1.0))
+                U_max = int(sig.get('rs_vocab_samples', 12))  # number of unique tokens to store per position for the subsequent sampling
+                N_samples = int(sig.get('rs_samples', S_SAMPLES_DEFAULT))
 
-                    rs_idx_seq.append(idx)
-                    rs_logp_seq.append(t_logp_sel)
-                    rs_q_seq.append(q_sel)
+                if len(pos_logits) > 0:
+                    rows_logits = torch.stack(pos_logits, dim=0)  # [P,V]
+                    samples = sample_with_replacement_from_logits(rows_logits, N=N_samples, tau=tau_target)  # [P,N]
+                    ids_list, cnts_list = topU_unique_counts_per_row(samples, U=U_max)
+                    packed_rows = build_fixedU_packed_rows(ids_list, cnts_list, U=U_max, N=N_samples, V=V)  # [P*U*3]
+                else:
+                    packed_rows = torch.empty(0, dtype=torch.uint8)
+                    pos_to_row = []
 
-                # Move once to CPU and cast to compact dtypes, then pack into CSR-style arrays
-                rs_idx_list = [t.cpu().to(torch.int32) for t in rs_idx_seq]
-                rs_logp_list = [t.cpu().to(torch.float16) for t in rs_logp_seq]
-                rs_q_list = [t.cpu().to(torch.float16) for t in rs_q_seq]
-                pos_offsets, idx_flat, lp_flat, q_flat = pack_ragged(rs_idx_list, rs_logp_list, rs_q_list)
+                rs_packed = torch.full((valid_i.numel() * U_max * 3,), 0, dtype=torch.uint8)
+                for ridx, pos in enumerate(pos_to_row):
+                    start = ridx * U_max * 3
+                    rs_packed[pos * U_max * 3:(pos + 1) * U_max * 3] = packed_rows[start:start + U_max * 3]
 
                 item = {
                     "key": key,
@@ -372,11 +464,12 @@ def _build_cache_pass(
                         [h if h.numel() else torch.tensor(0.0, device=pred_i.device) for h in H_hat_list]
                     ).to(torch.float16).cpu(),  # [L-1]
                     "rs": {
-                        "S": S_vocab,
-                        "pos_offsets": pos_offsets,
-                        "idx_flat": idx_flat,
-                        "t_logp_flat": lp_flat,
-                        "q_flat": q_flat,
+                        "U": int(U_max),
+                        "N": int(N_samples),
+                        "id_bits": int(ID_BITS),
+                        "prob_bits": int(PROB_BITS),
+                        "sentinel_id": int(V),
+                        "packed": rs_packed,
                     },
                 }
                 cache.write_item(key, item)
@@ -493,11 +586,12 @@ def build_offline_cache_if_needed(
         "tokenizer_name": getattr(tok, "name_or_path", "unknown"),
         "max_seq_len": int(getattr(config, "max_seq_len", 0)),
         "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
+        # RS packing/signature knobs
+        "kd_temperature": float(getattr(config, "kd_temperature", getattr(config, "kd_temperature", 1.0))),
         "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
-        "rs_vocab_beta": float(getattr(config, "rs_vocab_beta", 1.0)),
-        "entropy_approx_temperature": float(
-            getattr(config, "entropy_approx_temperature", getattr(config, "cache_temperature", 1.0))
-        ),
+        "rs_samples": int(getattr(config, "rs_samples", S_SAMPLES_DEFAULT)),
+        "id_bits": int(ID_BITS),
+        "prob_bits": int(PROB_BITS),
         "dataset_len": int(len(dataloader.dataset)) if hasattr(dataloader, "dataset") else -1,
     }
 
@@ -512,11 +606,10 @@ def build_offline_cache_if_needed(
     )
     cache.set_signature(sig)
 
-    # Use configured temperature for offline entropy approximation/proposals (distinct from runtime KD temperature)
-    T = float(getattr(config, "entropy_approx_temperature", getattr(config, "cache_temperature", 1.0)))
+    # S_vocab, beta are no-ops for Gumbel RS-KD
     k_approx = int(getattr(config, "entropy_approx_m", 12))
-    S_vocab = int(getattr(config, "rs_vocab_samples", 12))
-    beta = float(getattr(config, "rs_vocab_beta", 1.0))  # q ∝ p^beta
+    S_vocab = 0
+    beta = 1.0
 
     maybe_cache, V_last = _build_cache_pass(
         cache=cache,
@@ -524,7 +617,6 @@ def build_offline_cache_if_needed(
         dataloader=dataloader,
         teacher_device=teacher_device,
         sanitize_logits_fn=sanitize_logits_fn,
-        T=T,
         k_approx=k_approx,
         S_vocab=S_vocab,
         beta=beta,
