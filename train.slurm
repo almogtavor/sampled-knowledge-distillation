@@ -17,8 +17,9 @@ DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
 echo "Running training with distillation type: $DISTILL_TYPE"
-START_TIME=$(date +%s)
-echo "Job started at $(date -u)"
+START_TIME=$(date -u)
+START_TIME_EPOCH=$(date +%s)
+echo "Job started at $START_TIME"
 
 # Convert hyphens to underscores for directory names
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
@@ -182,12 +183,13 @@ unset PYTHONPATH PYTHONHOME
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR"
 
-END_TIME=$(date +%s)
-ELAPSED=$((END_TIME - START_TIME))
+END_TIME=$(date -u)
+END_TIME_EPOCH=$(date +%s)
+ELAPSED=$((END_TIME_EPOCH - START_TIME_EPOCH))
 
-echo "Job started at ${START_TIME}"
-echo "Job finished at $(date -u)"
-echo "Total elapsed time: ${ELAPSED} seconds"
+echo "Job started at $START_TIME"
+echo "Job finished at $END_TIME"
+echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
