@@ -16,20 +16,26 @@ S_SAMPLES_DEFAULT = 50  # draws per position
 
 
 def gumbel_like(x: torch.Tensor) -> torch.Tensor:
+    # Kept for reference; not used by the optimized sampler below
     u = torch.rand_like(x)
     return -torch.log(-torch.log(u.clamp_min(1e-12)))
 
 
-def sample_with_replacement_from_logits(logits: torch.Tensor, N: int, tau: float) -> torch.Tensor:
+def sample_with_replacement_from_logits(logits: torch.Tensor, N: int, tau: float, g_buf: torch.Tensor | None = None) -> torch.Tensor:
     """Sample N i.i.d. draws per row from softmax(logits/tau) via Gumbel-Max without normalizing.
+
+    Uses an in-place exponential buffer to generate Gumbel noise: if E~Exp(1), then -log(E) ~ Gumbel(0,1).
 
     logits: [P, V]  -> returns indices Tensor [P, N]
     """
     z = logits / float(tau)
     P, _ = z.shape
     out = torch.empty(P, N, device=z.device, dtype=torch.long)
+    if g_buf is None or g_buf.shape != z.shape or g_buf.device != z.device:
+        g_buf = torch.empty_like(z)
     for n in range(N):
-        g = gumbel_like(z)
+        g_buf.exponential_()      # E ~ Exp(1)
+        g = g_buf.log_().neg_()   # -log(E) ~ Gumbel(0,1)
         out[:, n] = (z + g).argmax(dim=-1)
     return out
 
@@ -414,47 +420,37 @@ def _build_cache_pass(
                 if cache.has(key):
                     continue
 
-                valid_i = valid_next[i]  # [L-1]
-                pred_i = t_pred[i]  # [L-1, V]
+                valid_i = valid_next[i]  # [L-1] (bool on CPU)
+                pred_i = t_pred[i]       # [L-1, V] (on teacher_device)
 
-                # truncated entropy per pos
-                H_hat_list = []
-                # Gumbel RS-KD collection per valid position
-                pos_logits = []
-                pos_to_row = []
+                # Build index of valid positions (CPU long)
+                pos_idx = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)
 
-                for pos, is_valid in enumerate(valid_i.tolist()):
-                    if not is_valid:
-                        H_hat_list.append(torch.tensor(0.0, device=pred_i.device))
-                        continue
-
-                    # Calculate a truncated approximation of the entropy (H_hat) for current position's prediction logits (pred_i[pos])
-                    # H_hat (Top-k + tail)
-                    H_hat = truncated_entropy_topk_tail_midpoint(
-                        pred_i[pos], k=k_approx
-                    )  # scalar tensor
-                    H_hat_list.append(H_hat)
-
-                    pos_logits.append(pred_i[pos])
-                    pos_to_row.append(pos)
-
-                # Build fixed-U packed rows with Gumbel sampling
+                # Preallocate H_hat with zeros and fill only at valid positions (loop kept scalar-only)
+                H_hat_arr = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
+                for pos_t in pos_idx:
+                    pos = int(pos_t.item())
+                    H_hat = truncated_entropy_topk_tail_midpoint(pred_i[pos], k=k_approx)
+                    H_hat_arr[pos] = H_hat
+                # Build fixed-U packed rows with Gumbel sampling (batched over valid rows)
                 sig = cache.manifest.get('signature', {})
                 tau_target = float(sig.get('kd_temperature', 1.0))
                 U_max = int(sig.get('rs_vocab_samples', 12))  # number of unique tokens to store per position for the subsequent sampling
                 N_samples = int(sig.get('rs_samples', S_SAMPLES_DEFAULT))
 
-                if len(pos_logits) > 0:
-                    rows_logits = torch.stack(pos_logits, dim=0)  # [P,V]
-                    samples = sample_with_replacement_from_logits(rows_logits, N=N_samples, tau=tau_target)  # [P,N]
+                if pos_idx.numel() > 0:
+                    # rows_logits: [P, V] gathered in one shot
+                    rows_logits = pred_i.index_select(0, pos_idx.to(pred_i.device))
+                    samples = sample_with_replacement_from_logits(rows_logits, N=N_samples, tau=tau_target)
                     ids_list, cnts_list = topU_unique_counts_per_row(samples, U=U_max)
                     packed_rows = build_fixedU_packed_rows(ids_list, cnts_list, U=U_max, N=N_samples, V=V)  # [P*U*3]
                 else:
                     packed_rows = torch.empty(0, dtype=torch.uint8)
-                    pos_to_row = []
 
                 rs_packed = torch.full((valid_i.numel() * U_max * 3,), 0, dtype=torch.uint8)
-                for ridx, pos in enumerate(pos_to_row):
+                # Scatter packed rows back to absolute positions; small loop over valid positions only
+                for ridx, pos_t in enumerate(pos_idx):
+                    pos = int(pos_t.item())
                     start = ridx * U_max * 3
                     rs_packed[pos * U_max * 3:(pos + 1) * U_max * 3] = packed_rows[start:start + U_max * 3]
 
@@ -462,9 +458,7 @@ def _build_cache_pass(
                     "key": key,
                     "valid_mask": valid_i.cpu(),
                     "topk_m": k_approx,
-                    "H_hat": torch.stack(
-                        [h if h.numel() else torch.tensor(0.0, device=pred_i.device) for h in H_hat_list]
-                    ).to(torch.float16).cpu(),  # [L-1]
+                    "H_hat": H_hat_arr.to(torch.float16).cpu(),  # [L-1]
                     "rs": {
                         "U": int(U_max),
                         "N": int(N_samples),
@@ -506,55 +500,44 @@ def _recompute_and_persist_stats(
         "baseline_full_logits_bytes": 0,
     }
     total_valid_positions = 0
-    for key in idx_map.keys():
-        try:
-            d = cache.read_item(key)
-        except Exception:
-            continue
-
-        vm = d.get("valid_mask", None)
-        if vm is None:
-            continue
-        try:
-            seq_valid = int(vm.sum().item())
-        except Exception:
-            # fallback for non-tensor masks
-            seq_valid = int(sum(bool(x) for x in vm))
-        total_valid_positions += seq_valid
-
-        topk_m = int(d.get("topk_m", k_approx))
-        if V_base:
-            stats["approx_entropy_logits_saved"] += int(seq_valid * min(topk_m, V_base))
-        else:
-            stats["approx_entropy_logits_saved"] += int(seq_valid * topk_m)
-
-        rs = d.get("rs", {}) or {}
-        # Support packed fixed-U representation as well as legacy CSR if present
-        if "packed" in rs:
-            U = int(rs.get("U", 0))
-            s_total = int(seq_valid * U)
-            stats["rs_kd_ids_saved"] += s_total
-            stats["rs_kd_probs_saved"] += s_total
-            stats["ce_logits_needed"] += s_total
-        else:
-            idx_flat = rs.get("idx_flat", [])
-            q_flat = rs.get("q_flat", [])
-            s_total = int(len(idx_flat))
-            probs_total = int(len(q_flat))
-            stats["rs_kd_ids_saved"] += s_total
-            stats["rs_kd_probs_saved"] += probs_total
-            stats["ce_logits_needed"] += s_total
-
-    # Compute cache on-disk size: prefer shard sizes when present
     shards = cache.manifest.get("shards")
     if isinstance(shards, list) and shards:
+        # Efficient path: load each shard once and iterate in-memory
+        for sh in shards:
+            try:
+                items = torch.load(cache.cache_dir / sh.get("path", ""), map_location="cpu")
+            except Exception:
+                items = []
+            for d in items:
+                vm = d.get("valid_mask")
+                if vm is None:
+                    continue
+                seq_valid = int(torch.as_tensor(vm).sum().item())
+                total_valid_positions += seq_valid
+
+                topk_m = int(d.get("topk_m", k_approx))
+                if V_base:
+                    stats["approx_entropy_logits_saved"] += int(seq_valid * min(topk_m, V_base))
+                else:
+                    stats["approx_entropy_logits_saved"] += int(seq_valid * topk_m)
+
+                rs = d.get("rs", {}) or {}
+                if "packed" in rs:
+                    U = int(rs.get("U", 0))
+                    s_total = int(seq_valid * U)
+                    stats["rs_kd_ids_saved"] += s_total
+                    stats["rs_kd_probs_saved"] += s_total
+                    stats["ce_logits_needed"] += s_total
+
+        # Compute cache on-disk size from shard files directly
         for sh in shards:
             try:
                 stats["cache_bytes"] += int(os.path.getsize(cache.cache_dir / sh["path"]))
             except Exception:
                 pass
     else:
-        # No shards means empty cache; keep bytes at 0
+        # No shards present: assume empty or non-sharded cache and skip stats to avoid heavy I/O.
+        # Stats remain zeros; cache_bytes also remains 0 in this branch.
         pass
 
     if V_base:
@@ -637,9 +620,22 @@ def build_offline_cache_if_needed(
     if callable(finalize):
         cache.finalize()
     # Recompute and persist cache-wide stats by scanning manifest items
-    stats, total_items = _recompute_and_persist_stats(
-        cache=cache, tok=tok, k_approx=k_approx, V_last=V_last
-    )
+    try:
+        stats, total_items = _recompute_and_persist_stats(
+            cache=cache, tok=tok, k_approx=k_approx, V_last=V_last
+        )
+    except Exception as e:
+        # Don't fail the run if stats collection hits a schema mismatch
+        stats = {
+            "approx_entropy_logits_saved": 0,
+            "rs_kd_ids_saved": 0,
+            "rs_kd_probs_saved": 0,
+            "ce_logits_needed": 0,
+            "cache_bytes": 0,
+            "baseline_full_logits_bytes": 0,
+        }
+        total_items = len(cache.manifest.get("items", {}))
+        print(f"[logits-cache][warn] Stats recompute failed: {e}. Continuing without stats.")
     build_wall_elapsed = time.time() - build_wall_start
 
     saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))

@@ -554,6 +554,7 @@ class Distiller:
                     getattr(self.config, "offline_cache_dir", None),
                     self.compute_cache_signature()
                 )
+                
             self.cache = build_offline_cache_if_needed(
                 cache=self.cache,
                 teacher=self.teacher, tok=self.tok, dataloader=self.dataloader,
