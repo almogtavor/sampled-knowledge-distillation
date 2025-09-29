@@ -232,7 +232,7 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
             pass
     print(f"Exporting model from base '{base_model_dir}' with state_dict '{ckpt_path.name}' -> '{export_dir}'")
     tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=False, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(base_model_dir, dtype=torch.float16, device_map=None, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(base_model_dir, from_pretrained=torch.float16, device_map=None, trust_remote_code=True)
     chk = torch.load(ckpt_path, map_location="cpu")
     state = chk.get("model_state_dict")
     if state is None:

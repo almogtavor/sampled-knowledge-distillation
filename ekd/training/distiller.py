@@ -86,7 +86,7 @@ class Distiller:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # offline teacher logits cache: centralized initialization
-        self.cache = init_offline_cache_for_trainer(self)
+        self.cache = None
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
@@ -530,18 +530,18 @@ class Distiller:
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
         # make the offline pass once, if requested (no hidden side effects)
-        if self.cache is None:
-            self.cache = init_offline_cache_for_trainer(getattr(self.config, "offline_cache_dir", None), 
-                                                        self.compute_cache_signature())
-        self.cache = build_offline_cache_if_needed(
-            cache=self.cache,
-            teacher=self.teacher,
-            tok=self.tok,
-            dataloader=self.dataloader,
-            config=self.config,
-            teacher_device=self.teacher_device,
-            sanitize_logits_fn=self._sanitize_logits,
-        )
+        if getattr(self.config, "offline_cache", False):
+            if self.cache is None:
+                self.cache = init_offline_cache_for_trainer(
+                    getattr(self.config, "offline_cache_dir", None),
+                    self.compute_cache_signature()
+                )
+            self.cache = build_offline_cache_if_needed(
+                cache=self.cache,
+                teacher=self.teacher, tok=self.tok, dataloader=self.dataloader,
+                config=self.config, teacher_device=self.teacher_device,
+                sanitize_logits_fn=self._sanitize_logits,
+            )
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)
@@ -578,6 +578,9 @@ class Distiller:
                     # Update KD temperature per schedule if enabled
                     if bool(getattr(self.config, "anneal_kd_temperature", False)):
                         self.config.kd_temperature = kd_T_at(self.global_step)
+                        # Log the current KD temperature to visualize the annealing schedule
+                        if self.logger:
+                            self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 

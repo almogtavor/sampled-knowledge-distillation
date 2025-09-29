@@ -35,12 +35,12 @@ elif [[ "$MODE" == "coarse_k" ]]; then
   # --- New mode: quick 1-epoch pass over a default K list
   METHOD="${2:-top-k-tok}"
   K_LIST=(0 1 2 5 10 12 15 20 25 30 40 50 75 100)
-  # Submit with EKD_EPOCHS=1 to override train.slurm default
+  # Submit with EPOCHS=1 to override train.slurm default
   for K in "${K_LIST[@]}"; do
     if [[ "$K" -eq 100 ]]; then
-      sbatch --export=ALL,EKD_EPOCHS=1 train.slurm vanilla "$K"
+      sbatch --export=ALL,EPOCHS=1 train.slurm vanilla "$K"
     else
-      sbatch --export=ALL,EKD_EPOCHS=1 train.slurm "$METHOD" "$K"
+      sbatch --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K"
     fi
   done
 
