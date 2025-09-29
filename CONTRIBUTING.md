@@ -45,9 +45,9 @@ watch -n 5 'rsync -avz ./ YOUR_USER@c-001.cs.tau.ac.il:/home/joberant/NLP_2425b/
 
 ## 🏃 Training Commands
 
-### Submit EKD training:
+### Submit Top K tokens training:
 ```bash
-sbatch train.slurm ekd
+sbatch train.slurm top-k-tok
 ```
 
 ### Submit Vanilla training:

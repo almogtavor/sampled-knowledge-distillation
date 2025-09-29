@@ -16,7 +16,7 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
-EPOCHS="${4:-3}"   # default 3, override via env
+EPOCHS="${4:-${EPOCHS:-3}}"   # default 3, override via env
 ANNEAL_FLAG=${5:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)
@@ -53,6 +53,29 @@ export TRANSFORMERS_VERBOSITY=info
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
+# ---------- Weights & Biases ----------
+export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
+export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
+export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_DISABLED=${WANDB_DISABLED:-false}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
+# Group/name/id make the UI nice for shell-based sweeps
+export KD_SWEEP_NAME="${KD_SWEEP_NAME:-$(date +%Y%m%d_%H%M)-$DISTILL_TYPE}"
+export WANDB_GROUP="${WANDB_GROUP:-${KD_SWEEP_NAME:-manual}-$(echo "$DISTILL_TYPE" | tr '-' '_')-k${K_PERCENT}}"
+export WANDB_NOTES="slurm_id=$SLURM_JOB_ID; k=$K_PERCENT; eval=${EVAL_SUITE:-none}; anneal=${ANNEAL_FLAG:-none}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID}_${K_PERCENT}_${DISTILL_TYPE}}"
+
+echo "=== Weights & Biases ==="
+echo "W&B PROJECT        = $WANDB_PROJECT"
+echo "W&B ENTITY         = ${WANDB_ENTITY:-<user>}"
+echo "W&B GROUP          = $WANDB_GROUP"
+echo "W&B RUN_ID         = $WANDB_RUN_ID"
+echo "W&B MODE/DISABLED  = $WANDB_MODE / $WANDB_DISABLED"
+echo "======================"
 
 VENV_DIR="$PWD/fastenv310_3_new"
 
