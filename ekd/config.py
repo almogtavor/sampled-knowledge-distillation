@@ -18,15 +18,17 @@ class TrainingConfig(BaseModel):
     rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
     rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
     rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
-    rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
-    kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
-    
+    kd_temperature: float = Field(default=1.0, description="Unified KD temperature used for teacher/student log-softmax and loss scaling")
+    entropy_approx_temperature: float = Field(default=1.0, description="Temperature used during offline pass for entropy approximation (and RS-KD proposal if applicable)")
+    # KD temperature annealing (optional)
+    anneal_kd_temperature: bool = Field(default=False, description="Enable annealing schedule for kd_temperature during training")
+    kd_temperature_start: float = Field(default=2.0, description="Starting KD temperature when annealing")
+    kd_temperature_end: float = Field(default=1.0, description="Final KD temperature when annealing")
+    kd_hold_frac: float = Field(default=0.6, description="Fraction of total updates to hold at start temperature before linear decay")
     # RS-KD parameters (for distill_type="pos-rs-kd")
     rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
     rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
     rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
-    rs_kd_proposal_temp: int = Field(default=1, description="for pos-rs-kd only")
-    kd_temperature: int = Field(default=1, description="for pos-rs-kd only")
     
     # Bucket mode parameters (for distill_type="bucket")
     bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")
@@ -51,6 +53,14 @@ class TrainingConfig(BaseModel):
     wandb_project: str = "selective-entropy-knowledge-distillation"
     wandb_entity: str = "selective-entropy-knowledge-distillation"
     wandb_enabled: bool = True
+    
+    # Offline cache (teacher precomputation for entropy approx + RS-KD over vocab)
+    offline_cache: bool = True
+    offline_cache_dir: Optional[str] = None  # if None, defaults to f"{output_dir}/teacher_offline_cache"
+    # Params used by the offline cache builder
+    entropy_approx_m: int = Field(default=20, description="Top-m used in truncated entropy approximation")
+    rs_vocab_samples: int = Field(default=64, description="Number of vocab samples per position for RS-KD")
+    rs_vocab_beta: float = Field(default=1.0, description="Proposal exponent for RS-KD over vocab: q ∝ p^beta")
     
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")

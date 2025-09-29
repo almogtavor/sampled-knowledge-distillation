@@ -56,7 +56,7 @@ def load_model(
         model_name,
         device_map=device_map_arg,
         max_memory=max_memory_arg,
-        dtype=torch_dtype,                 # <- use 'dtype' (HF deprecation)
+        dtype=torch_dtype,
         quantization_config=quantization_config,
         low_cpu_mem_usage=False,  # Disable to avoid hanging issues
         trust_remote_code=True,  # For some models like Qwen

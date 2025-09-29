@@ -15,7 +15,31 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
+EVAL_SUITE=${3:-}
+EPOCHS="${4:-3}"   # default 3, override via env
+ANNEAL_FLAG=${5:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
+START_TIME=$(date -u)
+START_TIME_EPOCH=$(date +%s)
+echo "Job started at $START_TIME"
+
+# Convert hyphens to underscores for directory names
+DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
+
+# Default virtual environment directory
+VENV_DIR="$PWD/fastenv310_3_new"
+
+echo "=== Job Parameters ==="
+echo "SLURM_JOB_ID      = ${SLURM_JOB_ID:-N/A}"
+echo "DISTILL_TYPE      = $DISTILL_TYPE"
+echo "K_PERCENT         = $K_PERCENT"
+echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
+echo "VENV_DIR          = $VENV_DIR"
+echo "OUTPUT_DIR        = $OUTPUT_DIR"
+echo "User              = $USER"
+echo "GPUs requested    = $SLURM_GPUS"
+echo "======================"
 
 # ---------- caches / env ----------
 mkdir -p logs
@@ -30,7 +54,6 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-# Default virtual environment directory
 VENV_DIR="$PWD/fastenv310_3_new"
 
 # Check if a custom venv name is passed as a parameter
@@ -144,20 +167,17 @@ except Exception as e:
 PY
 
 # ---------- launch ----------
-# Convert hyphens to underscores for directory names
-DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
 unset PYTHONPATH PYTHONHOME
-exec "$PY" ekd_distill.py \
+"$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
-  --k_percent 20 \
+  --k_percent "$K_PERCENT" \
   --datasets "gsm8k" \
   --dataset_config "main" \
   --prompt_col "question" \
   --answer_col "answer" \
-  --epochs 3 \
+  --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
   --checkpoint_steps 250 \
@@ -165,4 +185,23 @@ exec "$PY" ekd_distill.py \
   --max_seq_len 384 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
-  --output_dir "$OUTPUT_DIR"
+  --output_dir "$OUTPUT_DIR" \
+  --seed "${SEED:-1337}" \
+  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
+  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)
+
+END_TIME=$(date -u)
+END_TIME_EPOCH=$(date +%s)
+ELAPSED=$((END_TIME_EPOCH - START_TIME_EPOCH))
+
+echo "Job started at $START_TIME"
+echo "Job finished at $END_TIME"
+echo "Total elapsed time: $ELAPSED seconds"
+
+if [[ -n "$EVAL_SUITE" ]]; then
+  echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE"
+  echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
+else
+  echo "No eval suite provided → skipping eval submission."
+fi
