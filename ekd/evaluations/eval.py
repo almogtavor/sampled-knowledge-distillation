@@ -367,7 +367,7 @@ def run_lmeval_suite(
     results_dir: Path,
     gpu_ids: List[int],
     suite: str,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], Dict[str, str]]:
     """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
@@ -442,6 +442,7 @@ def run_lmeval_suite(
         return cmd
 
     # Parallel across physical GPUs (mask each process to one GPU)
+    task_status: Dict[str, str] = {}
     good_any = False
     i = 0
     while i < len(tasks_with_limits):
@@ -470,13 +471,16 @@ def run_lmeval_suite(
             timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
                 print(f"[{timestamp}] ✅ Task {task} completed successfully")
+                task_status[task] = "ok"
                 good_any = True
             elif rc == 124:
                 print(f"[{timestamp}] ⏰ Task {task} timed out after {to} seconds")
+                task_status[task] = "timeout"
             else:
                 print(f"[{timestamp}] ❌ Task {task} failed with code {rc}")
+                task_status[task] = f"failed:{rc}"
         i += len(gpu_ids)
-    return out_dir if good_any else None
+    return out_dir if good_any else None, task_status
 
 # ---------- Lighteval (summarization) ----------
 def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
@@ -861,7 +865,7 @@ def main():
         print(f"\n=== Running benchmarks for {tag} (suite={args.suite}) ===")
 
         # LM-Eval (parallel across GPUs according to the chosen suite)
-        lmeval_root = run_lmeval_suite(
+        lmeval_root, task_status = run_lmeval_suite(
             model_dir=model_dir,
             tag=tag,
             results_dir=results_dir,
@@ -907,9 +911,9 @@ def main():
 
         # --- Save results to JSON for this model ---
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
-        payload = {"tag": tag, "suite": args.suite, "results": merged}
-        save_json(payload, out_file)
+        json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
+        payload = {"tag": tag, "suite": args.suite, "results": merged, "task_status": task_status}
+        save_json(payload, json_result_file)
 
         # Log results to W&B and TensorBoard
         try:
