@@ -170,8 +170,17 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Optionally quantize student for memory (not typical during training)")
     parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
-    parser.add_argument("--rs_kd_proposal_temp", type=int, default=1, help="for pos-rs-kd only")
-    parser.add_argument("--kd_temperature", type=int, default=1, help="for pos-rs-kd only")
+    parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
+    parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
+    # KD temperature annealing controls
+    parser.add_argument("--anneal_kd_temperature", action="store_true", default=False,
+                        help="Enable annealing of kd_temperature during training")
+    parser.add_argument("--kd_temperature_start", type=float, default=2.0,
+                        help="Starting KD temperature when annealing is enabled")
+    parser.add_argument("--kd_temperature_end", type=float, default=1.0,
+                        help="Final KD temperature when annealing is enabled")
+    parser.add_argument("--kd_hold_frac", type=float, default=0.6,
+                        help="Fraction of total updates to hold at start temperature before linear decay")
     # RS-KD (position-sampling) hyperparams
     parser.add_argument("--rs_alpha", type=float, default=1.0,
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
@@ -215,9 +224,9 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Disable offline caching mode (use online teacher forward pass).")
     parser.add_argument("--offline_cache_dir", type=str, default=None,
                         help="Where to store/read the offline teacher cache (defaults under output_dir).")
-    parser.add_argument("--entropy_approx_m", type=int, default=20,
-                        help="Top-k for truncated-entropy approximation (Sec. 3.6), m=20 by default.")
-    parser.add_argument("--rs_vocab_samples", type=int, default=64,
+    parser.add_argument("--entropy_approx_m", type=int, default=12,
+                        help="Top-k for truncated-entropy approximation, m=12 by default.")
+    parser.add_argument("--rs_vocab_samples", type=int, default=12,
                         help="How many vocab tokens to sample per position for RS-KD.")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")

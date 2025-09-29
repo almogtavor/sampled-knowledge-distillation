@@ -234,3 +234,4 @@ kd_pos_rs_kd_run_out_models/
 tb/
 evalplus_results/
 .tensorboard-info/
+logits_caches/

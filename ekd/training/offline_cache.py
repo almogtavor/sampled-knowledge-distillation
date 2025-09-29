@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 import torch
-from .entropy_utils import truncated_entropy_topk_tail
+from .entropy_utils import truncated_entropy_topk_tail_midpoint
 
 
 class TeacherOfflineCache:
@@ -68,9 +68,14 @@ class TeacherOfflineCache:
     def write_item(self, key: str, item: Dict[str, Any]):
         idx = len(self.manifest["items"])
         fname = f"item_{idx:06d}.pt"
-        torch.save(item, self.cache_dir / fname)
+        out_path = self.cache_dir / fname
+        torch.save(item, out_path)
         self.manifest["items"][key] = fname
         self.save_manifest()
+        try:
+            return os.path.getsize(out_path)
+        except Exception:
+            return 0
 
     def read_item(self, key: str) -> Dict[str, Any]:
         return torch.load(self.path_for(key), map_location="cpu")
@@ -87,9 +92,12 @@ def compute_cache_signature(trainer) -> Dict[str, Any]:
         "teacher_name": getattr(getattr(trainer.teacher, "config", None), "_name_or_path", "unknown"),
         "tokenizer_name": getattr(trainer.tok, "name_or_path", "unknown"),
         "max_seq_len": int(trainer.config.max_seq_len),
-        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 20)),
-        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 64)),
+        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 12)),
+        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 12)),
         "rs_vocab_beta": float(getattr(trainer.config, "rs_vocab_beta", 1.0)),
+        "entropy_approx_temperature": float(
+            getattr(trainer.config, "entropy_approx_temperature", getattr(trainer.config, "cache_temperature", 1.0))
+        ),
         "dataset_len": int(len(trainer.dataloader.dataset)) if hasattr(trainer.dataloader, "dataset") else -1,
     }
 
@@ -173,22 +181,24 @@ def build_offline_cache_if_needed(self):
 
     if self.cache.signature_matches(sig):
         print(
-            f"[logits-cache] Cache found with matching signature – using existing cache at {self.cache.cache_dir}."
+            f"[logits-cache] Cache found with matching signature - using existing cache at {self.cache.cache_dir}."
         )
         return
 
     print(
-        f"[logits-cache] No cache found or signature changed – building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
+        f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
     )
     self.cache.set_signature(sig)
 
-    T = 1.0  # use T=1 for the cached statistics
-    k_approx = int(getattr(self.config, "entropy_approx_m", 20))
-    S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
+    # Use configured temperature for offline entropy approximation/proposals (distinct from runtime KD temperature)
+    T = float(getattr(self.config, "entropy_approx_temperature", getattr(self.config, "cache_temperature", 1.0)))
+    k_approx = int(getattr(self.config, "entropy_approx_m", 12))
+    S_vocab = int(getattr(self.config, "rs_vocab_samples", 12))
     beta = float(getattr(self.config, "rs_vocab_beta", 1.0))  # q ∝ p^beta
 
     self.teacher.eval()
     maybe_cache = 0
+    V_last = None
     with torch.no_grad():
         for batch in self.dataloader:
             input_ids = batch["input_ids"]  # [B, L]
@@ -202,11 +212,14 @@ def build_offline_cache_if_needed(self):
             t_logits = self._sanitize_logits(out.logits, "teacher")  # [B,L,V]
 
             B, L, V = t_logits.shape
+            V_last = V
             t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
             valid_next = attn_mask[:, 1:].bool()  # [B, L-1]
-            # exact log-probs at T=1 for cache
-            t_logp_full = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
-            p_full = t_logp_full.exp()  # [B, L-1, V]
+            # For cache we persist t_logp_sel strictly at T=1
+            t_logp_full_T1 = torch.log_softmax(t_pred / 1.0, dim=-1)  # [B, L-1, V]
+            # For RS-KD proposal q we allow temperature T (entropy_approx_temperature)
+            t_logp_full_T = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+            p_full_T = t_logp_full_T.exp()  # [B, L-1, V]
 
             # per example
             for i in range(B):
@@ -216,8 +229,8 @@ def build_offline_cache_if_needed(self):
 
                 valid_i = valid_next[i]  # [L-1]
                 pred_i = t_pred[i]  # [L-1, V]
-                logp_i = t_logp_full[i]  # [L-1, V]
-                p_i = p_full[i]  # [L-1, V]
+                logp_i_T1 = t_logp_full_T1[i]  # [L-1, V]
+                p_i_T = p_full_T[i]  # [L-1, V]
 
                 # truncated entropy per pos
                 H_hat_list = []
@@ -232,13 +245,13 @@ def build_offline_cache_if_needed(self):
                         continue
 
                     # H_hat (Top-k + tail)
-                    H_hat = truncated_entropy_topk_tail(
+                    H_hat = truncated_entropy_topk_tail_midpoint(
                         pred_i[pos], k=k_approx
                     )  # scalar tensor
                     H_hat_list.append(H_hat)
 
                     # RS-KD over vocabulary: proposal q ∝ p^beta, sample S without replacement
-                    p_pos = p_i[pos]  # [V]
+                    p_pos = p_i_T[pos]  # [V]
                     if beta != 1.0:
                         q_un = p_pos.clamp_min(1e-12).pow(beta)
                     else:
@@ -248,7 +261,7 @@ def build_offline_cache_if_needed(self):
                     S = min(S_vocab, V)
                     # multinomial w/o replacement via Gumbel-top-k trick fallback when needed
                     idx = torch.multinomial(q, num_samples=S, replacement=False)  # [S]
-                    t_logp_sel = logp_i[pos, idx]  # [S]
+                    t_logp_sel = logp_i_T1[pos, idx]  # [S] (persist at T=1)
                     q_sel = q[idx]  # [S]
 
                     rs_idx_list.append(idx.cpu())
@@ -274,5 +287,91 @@ def build_offline_cache_if_needed(self):
                 # periodic progress print every 100 items
                 if maybe_cache % 100 == 0:
                     print(f"[logits-cache] Progress: cached {maybe_cache} new items so far...")
-    total_items = len(self.cache.manifest.get("items", {}))
+    # Recompute and persist cache-wide stats by scanning manifest items
+    idx_map = self.cache.manifest.get("items", {})
+    total_items = len(idx_map)
+    # Determine vocabulary size for baseline calculations
+    V_base = getattr(getattr(self, "tok", None), "vocab_size", None)
+    if V_base is None:
+        V_base = V_last if V_last is not None else 0
+
+    stats = {
+        "approx_entropy_logits_saved": 0,
+        "rs_kd_ids_saved": 0,
+        "rs_kd_probs_saved": 0,
+        "ce_logits_needed": 0,
+        "cache_bytes": 0,
+        "baseline_full_logits_bytes": 0,
+    }
+    total_valid_positions = 0
+    for rel in idx_map.values():
+        fpath = self.cache.cache_dir / rel
+        try:
+            d = torch.load(fpath, map_location="cpu")
+        except Exception:
+            continue
+
+        vm = d.get("valid_mask", None)
+        if vm is None:
+            continue
+        try:
+            seq_valid = int(vm.sum().item())
+        except Exception:
+            # fallback for non-tensor masks
+            seq_valid = int(sum(bool(x) for x in vm))
+        total_valid_positions += seq_valid
+
+        topk_m = int(d.get("topk_m", k_approx))
+        if V_base:
+            stats["approx_entropy_logits_saved"] += int(seq_valid * min(topk_m, V_base))
+        else:
+            stats["approx_entropy_logits_saved"] += int(seq_valid * topk_m)
+
+        rs = d.get("rs", {}) or {}
+        idx_list = rs.get("idx", []) or []
+        q_list = rs.get("q", []) or []
+
+        s_total = 0
+        for t in idx_list:
+            try:
+                s_total += int(len(t))
+            except Exception:
+                pass
+        stats["rs_kd_ids_saved"] += s_total
+
+        probs_total = 0
+        for t in q_list:
+            try:
+                probs_total += int(len(t))
+            except Exception:
+                pass
+        if probs_total == 0 and s_total:
+            probs_total = s_total
+        stats["rs_kd_probs_saved"] += probs_total
+        stats["ce_logits_needed"] += s_total
+
+        try:
+            stats["cache_bytes"] += int(os.path.getsize(fpath))
+        except Exception:
+            pass
+
+    if V_base:
+        stats["baseline_full_logits_bytes"] = int(total_valid_positions * V_base * 4)
+
+    # Persist stats in manifest
+    self.cache.manifest.setdefault("stats", {})
+    self.cache.manifest["stats"] = stats
+    self.cache.save_manifest()
+
+    saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))
     print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")
+    print(
+        "[logits-cache] Stats: "
+        f"approx_entropy_logits_saved={stats['approx_entropy_logits_saved']}, "
+        f"rs_ids={stats['rs_kd_ids_saved']}, "
+        f"rs_probs={stats['rs_kd_probs_saved']}, "
+        f"ce_logits_needed={stats['ce_logits_needed']}, "
+        f"bytes: cache={stats['cache_bytes']:,}, "
+        f"baseline_full={stats.get('baseline_full_logits_bytes', 0):,}, "
+        f"saved={saved_bytes:,}"
+    )

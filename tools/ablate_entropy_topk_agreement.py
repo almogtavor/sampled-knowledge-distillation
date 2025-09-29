@@ -34,7 +34,14 @@ if _repo_root not in sys.path:
 
 try:
     from ekd.data.dataset import DistillCollator
-    from ekd.training.entropy_utils import truncated_entropy_topk_tail, token_entropy
+    from ekd.training.entropy_utils import (
+        token_entropy,
+        truncated_entropy_topk_tail,
+        truncated_entropy_topk_tail_midpoint,
+        truncated_entropy_topk_tail_uniform,
+        entropy_topm_plus_tail_is,
+        entropy_topm_plus_cv_is,
+    )
 except ModuleNotFoundError as e:
     raise SystemExit(
         "Failed to import 'ekd'. Run from the repo root, or install the package (pip install -e .).\n"
@@ -122,7 +129,28 @@ def main():
     log.info("Model loaded and moved to device")
 
     import math
-    tot, agree_sum = 0, 0
+    
+    # Define entropy variants to test
+    entropy_variants = {
+        "topk_tail_lower": lambda x, m: truncated_entropy_topk_tail(x, k=m),
+        "topk_tail_midpoint": lambda x, m: truncated_entropy_topk_tail_midpoint(x, k=m),
+        "topk_tail_uniform": lambda x, m: truncated_entropy_topk_tail_uniform(x, k=m),
+        "topm_plus_tail_is": lambda x, m: entropy_topm_plus_tail_is(x, m=m, s=5),
+        "topm_plus_cv_is": lambda x, m: entropy_topm_plus_cv_is(x, m=m, s=5),
+    }
+    
+    # Results storage: variant_name -> list of overlap ratios
+    results = {name: [] for name in entropy_variants.keys()}
+    correlations = {name: [] for name in entropy_variants.keys()}
+    
+    # Track detailed statistics
+    total_sequences = 0
+    total_tokens = 0
+    total_valid_tokens = 0
+    sequence_lengths = []
+    valid_token_ratios = []
+    
+    tot = 0
     last_log = time.time()
     with torch.no_grad():
         for bi, batch in enumerate(dl):
@@ -133,48 +161,131 @@ def main():
             valid = mask[:, 1:].bool()
 
             B, Lm1, _ = pred.shape
+            
+            # Compute exact entropy once
             ent_exact = []
-            ent_trunc = []
             for i in range(B):
-                ent_exact.append(token_entropy(pred[i]).cpu())                     # [L-1]
-                ent_trunc.append(truncated_entropy_topk_tail(pred[i], k=args.m).cpu())
-            ent_exact = torch.stack(ent_exact)   # [B, L-1]
-            ent_trunc = torch.stack(ent_trunc)   # [B, L-1]
+                pred32 = pred[i].float()
+                ent_exact.append(token_entropy(pred32).cpu())
+            ent_exact = torch.stack(ent_exact)  # [B, L-1]
+            
+            # Test each variant
+            for variant_name, variant_fn in entropy_variants.items():
+                ent_variant = []
+                for i in range(B):
+                    pred32 = pred[i].float()
+                    ent_variant.append(variant_fn(pred32, args.m).cpu())
+                ent_variant = torch.stack(ent_variant)  # [B, L-1]
+                
+                # Compute overlap and correlation for this batch
+                for i in range(B):
+                    v = valid[i].cpu()
+                    n_valid = int(v.sum())
+                    seq_len = len(v)
+                    
+                    # Track detailed statistics (only once per sequence, not per variant)
+                    if variant_name == list(entropy_variants.keys())[0]:  # First variant only
+                        total_sequences += 1
+                        total_tokens += seq_len
+                        total_valid_tokens += n_valid
+                        sequence_lengths.append(seq_len)
+                        valid_token_ratios.append(n_valid / seq_len if seq_len > 0 else 0.0)
+                    
+                    if n_valid < 3: 
+                        continue
+                    k = max(1, math.ceil(n_valid * args.k_percent / 100.0))
+                    idx = torch.nonzero(v, as_tuple=False).squeeze(-1)
 
-            for i in range(B):
-                v = valid[i].cpu()
-                n_valid = int(v.sum())
-                if n_valid < 3: 
-                    continue
-                k = max(1, math.ceil(n_valid * args.k_percent / 100.0))
-                idx = torch.nonzero(v, as_tuple=False).squeeze(-1)
+                    e1 = ent_exact[i, idx]
+                    e2 = ent_variant[i, idx]
 
-                e1 = ent_exact[i, idx]
-                e2 = ent_trunc[i, idx]
-
-                top1 = idx[torch.topk(e1, k=k, largest=True, sorted=False).indices]
-                top2 = idx[torch.topk(e2, k=k, largest=True, sorted=False).indices]
-
-                set1 = set(top1.tolist())
-                set2 = set(top2.tolist())
-                inter = len(set1 & set2)
-                agree_sum += inter / float(k)
-                tot += 1
+                    # Top-k overlap
+                    top1 = idx[torch.topk(e1, k=k, largest=True, sorted=False).indices]
+                    top2 = idx[torch.topk(e2, k=k, largest=True, sorted=False).indices]
+                    set1 = set(top1.tolist())
+                    set2 = set(top2.tolist())
+                    inter = len(set1 & set2)
+                    overlap_ratio = inter / float(k)
+                    results[variant_name].append(overlap_ratio)
+                    
+                    # Correlation
+                    if len(e1) > 1 and len(e2) > 1:
+                        corr = torch.corrcoef(torch.stack([e1.flatten(), e2.flatten()]))[0,1].item()
+                        if not math.isnan(corr):
+                            correlations[variant_name].append(corr)
+                    
+            tot += B
 
             # Periodic progress logging
             now = time.time()
-            if now - last_log > 2.0:
+            if now - last_log > 3.0:
                 last_log = now
-                avg = (agree_sum / tot) if tot else 0.0
-                log.info(f"Progress: batch {bi+1}/{len(dl)} | partial avg overlap={avg:.4f} over {tot} sequences")
+                # Show progress for first variant
+                first_variant = list(entropy_variants.keys())[0]
+                n_samples = len(results[first_variant])
+                if n_samples > 0:
+                    avg = sum(results[first_variant]) / n_samples
+                    log.info(f"Progress: batch {bi+1}/{len(dl)} | {total_sequences} sequences, {total_valid_tokens}/{total_tokens} valid tokens | sample avg overlap={avg:.4f}")
 
-    if tot == 0:
+    if total_sequences == 0:
         log.warning("No valid sequences.")
-    else:
-        avg = agree_sum / tot
-        dt = time.time() - t0
-        log.info(f"Done in {dt:.1f}s")
-        print(f"Average top-k overlap ratio (exact vs truncated, m={args.m}): {avg:.4f} over {tot} sequences.")
+        return
+    
+    dt = time.time() - t0
+    log.info(f"Done in {dt:.1f}s")
+    
+    # Compute detailed statistics
+    avg_seq_len = sum(sequence_lengths) / len(sequence_lengths) if sequence_lengths else 0
+    avg_valid_ratio = sum(valid_token_ratios) / len(valid_token_ratios) if valid_token_ratios else 0
+    
+    # Print results table
+    print("\n" + "="*90)
+    print("ENTROPY APPROXIMATION COMPARISON RESULTS")
+    print("="*90)
+    print(f"Dataset: {args.dataset} | Model: {args.model}")
+    print(f"Parameters: m={args.m}, k_percent={args.k_percent}%, batch_size={args.batch_size}")
+    print(f"Total sequences: {total_sequences} | Total tokens: {total_tokens:,} | Valid tokens: {total_valid_tokens:,} ({total_valid_tokens/total_tokens*100:.1f}%)")
+    print(f"Avg sequence length: {avg_seq_len:.1f} tokens | Avg valid ratio: {avg_valid_ratio:.1f}%")
+    print()
+    
+    # Table header
+    print(f"{'Variant':<25} {'N_Samples':<10} {'Avg_Overlap':<12} {'Std_Overlap':<12} {'Avg_Corr':<10} {'Std_Corr':<10}")
+    print("-" * 90)
+    
+    # Table rows
+    for variant_name in entropy_variants.keys():
+        overlaps = results[variant_name]
+        corrs = correlations[variant_name]
+        
+        if len(overlaps) > 0:
+            avg_overlap = sum(overlaps) / len(overlaps)
+            if len(overlaps) > 1:
+                var_overlap = sum((x - avg_overlap)**2 for x in overlaps) / (len(overlaps) - 1)
+                std_overlap = math.sqrt(var_overlap)
+            else:
+                std_overlap = 0.0
+        else:
+            avg_overlap = std_overlap = 0.0
+            
+        if len(corrs) > 0:
+            avg_corr = sum(corrs) / len(corrs)
+            if len(corrs) > 1:
+                var_corr = sum((x - avg_corr)**2 for x in corrs) / (len(corrs) - 1)
+                std_corr = math.sqrt(var_corr)
+            else:
+                std_corr = 0.0
+        else:
+            avg_corr = std_corr = 0.0
+            
+        print(f"{variant_name:<25} {len(overlaps):<10} {avg_overlap:<12.4f} {std_overlap:<12.4f} {avg_corr:<10.4f} {std_corr:<10.4f}")
+    
+    print("="*90)
+    print("Legend:")
+    print("  Avg_Overlap: Average ratio of top-k positions that match between exact and approximate entropy")
+    print("  Avg_Corr:    Average Pearson correlation between exact and approximate entropy values")
+    print("  Higher values indicate better approximation quality")
+    print("  Valid tokens: Tokens that are not padding and contribute to next-token prediction")
+    print()
 
     # Cleanup temp export if used
     if export_tmp is not None:
