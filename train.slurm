@@ -16,7 +16,8 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
-ANNEAL_FLAG=${3:-""}
+EPOCHS="${4:-3}"   # default 3, override via env
+ANNEAL_FLAG=${5:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)
 START_TIME_EPOCH=$(date +%s)
@@ -176,7 +177,7 @@ unset PYTHONPATH PYTHONHOME
   --dataset_config "main" \
   --prompt_col "question" \
   --answer_col "answer" \
-  --epochs 3 \
+  --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
   --checkpoint_steps 250 \
@@ -185,6 +186,8 @@ unset PYTHONPATH PYTHONHOME
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \
+  --seed "${SEED:-1337}" \
+  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
   $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)
 
 END_TIME=$(date -u)

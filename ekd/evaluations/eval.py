@@ -414,8 +414,8 @@ def run_lmeval_suite(
         _available = set()
 
     # Include local task YAMLs if present
-    # Seed for downstream tools; default to env or EKD_EVAL_SEED set by main
-    seed = int(os.environ.get("EKD_EVAL_SEED", "42"))
+    # Seed for downstream tools; default to env or EVAL_SEED set by main
+    seed = int(os.environ.get("EVAL_SEED", "42"))
     # Check if lm-eval CLI supports --seed (older versions may not)
     _help_code, _help_out = run(["lm-eval", "--help"])
     _lm_eval_supports_seed = _help_code == 0 and ("--seed" in _help_out or "--fewshot-seed" in _help_out)
@@ -462,7 +462,7 @@ def run_lmeval_suite(
             # Propagate seed-related env for deterministic child runs
             env.setdefault("PYTHONHASHSEED", str(seed))
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-            env.setdefault("EKD_EVAL_SEED", str(seed))
+            env.setdefault("EVAL_SEED", str(seed))
             cmd = _task_cmd(task, limit, "cuda:0")
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)

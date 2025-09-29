@@ -86,22 +86,6 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def compute_cache_signature(trainer) -> Dict[str, Any]:
-    """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
-    return {
-        "teacher_name": getattr(getattr(trainer.teacher, "config", None), "_name_or_path", "unknown"),
-        "tokenizer_name": getattr(trainer.tok, "name_or_path", "unknown"),
-        "max_seq_len": int(trainer.config.max_seq_len),
-        "entropy_approx_m": int(getattr(trainer.config, "entropy_approx_m", 12)),
-        "rs_vocab_samples": int(getattr(trainer.config, "rs_vocab_samples", 12)),
-        "rs_vocab_beta": float(getattr(trainer.config, "rs_vocab_beta", 1.0)),
-        "entropy_approx_temperature": float(
-            getattr(trainer.config, "entropy_approx_temperature", getattr(trainer.config, "cache_temperature", 1.0))
-        ),
-        "dataset_len": int(len(trainer.dataloader.dataset)) if hasattr(trainer.dataloader, "dataset") else -1,
-    }
-
-
 def _cache_base_dir() -> Path:
     # Single canonical location: <repo_root>/logits_caches
     base = _repo_root() / "logits_caches"
@@ -140,12 +124,9 @@ def init_offline_cache_for_trainer(trainer: Any) -> TeacherOfflineCache:
     Also maintain an index.json mapping hash -> signature for clarity.
     Returns a TeacherOfflineCache instance.
     """
-    # If user overrode the dir in config, honor it
-    cfg_dir = getattr(trainer.config, "offline_cache_dir", None)
     if cfg_dir:
         cache_dir = Path(cfg_dir)
     else:
-        sig = compute_cache_signature(trainer)
         h = _signature_hash(sig)
         idx = _load_index()
         if h not in idx:
@@ -164,52 +145,32 @@ def init_offline_cache_for_trainer(trainer: Any) -> TeacherOfflineCache:
     return cache
 
 
-def build_offline_cache_if_needed(self):
-    """
-    One pass over the dataset with the TEACHER to compute:
-      - truncated entropy H_hat with m=k_approx (Sec. 3.6 in EHM paper)
-      - RS-KD proposal over vocabulary per position + sampled tokens
-
-    Skips entirely if manifest signature matches.
-    """
-    # Initialize cache if not already set
-    if not getattr(self, "cache", None):
-        self.cache = init_offline_cache_for_trainer(self)
-
-    # build signature (changes -> rebuild)
-    sig = compute_cache_signature(self)
-
-    if self.cache.signature_matches(sig):
-        print(
-            f"[logits-cache] Cache found with matching signature - using existing cache at {self.cache.cache_dir}."
-        )
-        return
-
-    print(
-        f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {self.cache.cache_dir}..."
-    )
-    self.cache.set_signature(sig)
-
-    # Use configured temperature for offline entropy approximation/proposals (distinct from runtime KD temperature)
-    T = float(getattr(self.config, "entropy_approx_temperature", getattr(self.config, "cache_temperature", 1.0)))
-    k_approx = int(getattr(self.config, "entropy_approx_m", 12))
-    S_vocab = int(getattr(self.config, "rs_vocab_samples", 12))
-    beta = float(getattr(self.config, "rs_vocab_beta", 1.0))  # q ∝ p^beta
-
-    self.teacher.eval()
+def _build_cache_pass(
+    cache: TeacherOfflineCache,
+    teacher,
+    dataloader,
+    teacher_device,
+    sanitize_logits_fn,
+    T: float,
+    k_approx: int,
+    S_vocab: int,
+    beta: float,
+):
+    """Internal: run a single offline teacher pass to populate cache. Returns (maybe_cache, V_last)."""
+    teacher.eval()
     maybe_cache = 0
     V_last = None
     with torch.no_grad():
-        for batch in self.dataloader:
+        for batch in dataloader:
             input_ids = batch["input_ids"]  # [B, L]
             attn_mask = batch["attention_mask"]  # [B, L]
-            input_ids_t = input_ids.to(self.teacher_device)
-            attn_t = attn_mask.to(self.teacher_device)
+            input_ids_t = input_ids.to(teacher_device)
+            attn_t = attn_mask.to(teacher_device)
 
-            out = self.teacher(
+            out = teacher(
                 input_ids_t, attention_mask=attn_t, output_hidden_states=False
             )
-            t_logits = self._sanitize_logits(out.logits, "teacher")  # [B,L,V]
+            t_logits = sanitize_logits_fn(out.logits, "teacher")  # [B,L,V]
 
             B, L, V = t_logits.shape
             V_last = V
@@ -224,7 +185,7 @@ def build_offline_cache_if_needed(self):
             # per example
             for i in range(B):
                 key = TeacherOfflineCache.key_from_ids(input_ids[i])
-                if self.cache.has(key):
+                if cache.has(key):
                     continue
 
                 valid_i = valid_next[i]  # [L-1]
@@ -282,16 +243,25 @@ def build_offline_cache_if_needed(self):
                         "q": rs_q_list,
                     },
                 }
-                self.cache.write_item(key, item)
+                cache.write_item(key, item)
                 maybe_cache += 1
                 # periodic progress print every 100 items
                 if maybe_cache % 100 == 0:
                     print(f"[logits-cache] Progress: cached {maybe_cache} new items so far...")
-    # Recompute and persist cache-wide stats by scanning manifest items
-    idx_map = self.cache.manifest.get("items", {})
+    return maybe_cache, V_last
+
+
+def _recompute_and_persist_stats(
+    cache: TeacherOfflineCache,
+    tok,
+    k_approx: int,
+    V_last: int | None,
+):
+    """Internal: recompute manifest stats and persist them. Returns (stats, total_items)."""
+    idx_map = cache.manifest.get("items", {})
     total_items = len(idx_map)
     # Determine vocabulary size for baseline calculations
-    V_base = getattr(getattr(self, "tok", None), "vocab_size", None)
+    V_base = getattr(tok, "vocab_size", None)
     if V_base is None:
         V_base = V_last if V_last is not None else 0
 
@@ -305,7 +275,7 @@ def build_offline_cache_if_needed(self):
     }
     total_valid_positions = 0
     for rel in idx_map.values():
-        fpath = self.cache.cache_dir / rel
+        fpath = cache.cache_dir / rel
         try:
             d = torch.load(fpath, map_location="cpu")
         except Exception:
@@ -359,9 +329,81 @@ def build_offline_cache_if_needed(self):
         stats["baseline_full_logits_bytes"] = int(total_valid_positions * V_base * 4)
 
     # Persist stats in manifest
-    self.cache.manifest.setdefault("stats", {})
-    self.cache.manifest["stats"] = stats
-    self.cache.save_manifest()
+    cache.manifest.setdefault("stats", {})
+    cache.manifest["stats"] = stats
+    cache.save_manifest()
+
+    return stats, total_items
+
+
+def build_offline_cache_if_needed(
+    cache: TeacherOfflineCache,
+    teacher,
+    tok,
+    dataloader,
+    config,
+    teacher_device,
+    sanitize_logits_fn,
+) -> TeacherOfflineCache:
+    """
+    One pass over the dataset with the TEACHER to compute:
+      - truncated entropy H_hat with m=k_approx (Sec. 3.6 in EHM paper)
+      - RS-KD proposal over vocabulary per position + sampled tokens
+
+    Skips entirely if manifest signature matches.
+    """
+    # Expect a pre-initialized cache from caller to avoid hidden side-effects
+    if cache is None:
+        raise ValueError("cache must be provided (initialize it once via init_offline_cache_for_trainer)")
+
+    # build signature (changes -> rebuild)
+    # Build signature from provided components
+    sig = {
+        "teacher_name": getattr(getattr(getattr(teacher, "config", None), "_name_or_path", None),
+                                 "__str__", lambda: getattr(getattr(teacher, "config", None), "_name_or_path", "unknown"))(),
+        "tokenizer_name": getattr(tok, "name_or_path", "unknown"),
+        "max_seq_len": int(getattr(config, "max_seq_len", 0)),
+        "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
+        "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
+        "rs_vocab_beta": float(getattr(config, "rs_vocab_beta", 1.0)),
+        "entropy_approx_temperature": float(
+            getattr(config, "entropy_approx_temperature", getattr(config, "cache_temperature", 1.0))
+        ),
+        "dataset_len": int(len(dataloader.dataset)) if hasattr(dataloader, "dataset") else -1,
+    }
+
+    if cache.signature_matches(sig):
+        print(
+            f"[logits-cache] Cache found with matching signature - using existing cache at {cache.cache_dir}."
+        )
+        return cache
+
+    print(
+        f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {cache.cache_dir}..."
+    )
+    cache.set_signature(sig)
+
+    # Use configured temperature for offline entropy approximation/proposals (distinct from runtime KD temperature)
+    T = float(getattr(config, "entropy_approx_temperature", getattr(config, "cache_temperature", 1.0)))
+    k_approx = int(getattr(config, "entropy_approx_m", 12))
+    S_vocab = int(getattr(config, "rs_vocab_samples", 12))
+    beta = float(getattr(config, "rs_vocab_beta", 1.0))  # q ∝ p^beta
+
+    maybe_cache, V_last = _build_cache_pass(
+        cache=cache,
+        teacher=teacher,
+        dataloader=dataloader,
+        teacher_device=teacher_device,
+        sanitize_logits_fn=sanitize_logits_fn,
+        T=T,
+        k_approx=k_approx,
+        S_vocab=S_vocab,
+        beta=beta,
+    )
+    # Recompute and persist cache-wide stats by scanning manifest items
+    stats, total_items = _recompute_and_persist_stats(
+        cache=cache, tok=tok, k_approx=k_approx, V_last=V_last
+    )
 
     saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))
     print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")
@@ -375,3 +417,4 @@ def build_offline_cache_if_needed(self):
         f"baseline_full={stats.get('baseline_full_logits_bytes', 0):,}, "
         f"saved={saved_bytes:,}"
     )
+    return cache
