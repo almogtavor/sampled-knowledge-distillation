@@ -389,48 +389,166 @@ class Distiller:
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
-            # This excludes both the lowest 70% and highest 20% entropy tokens
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
-            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
             score_ctx = None
+            kl_pos = None
             if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
                 score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
             kd_terms = []
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
-                mask = valid_next[i]
-                if mask.sum().item() < 3:  # Need at least 3 tokens for bucket selection
+                valid_next_i = valid_next[i]
+                if valid_next_i.sum() < 3:  # Need at least 3 tokens for bucket selection
                     continue
 
-                valid_idx = torch.where(mask)[0]
                 if score_enabled:
-                    combined = self._build_score_vector(score_ctx, i, mask)
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
                     if combined is None:
                         continue
-                    score_valid = combined[mask].float()
-                    if score_valid.numel() == 0:
-                        continue
-                    # Calculate both thresholds
-                    lower_thr = torch.quantile(score_valid, self.config.bucket_lower_percent / 100.0)
-                    upper_thr = torch.quantile(score_valid, self.config.bucket_upper_percent / 100.0)
-                    bucket_mask = (score_valid >= lower_thr) & (score_valid <= upper_thr)
+                    vec = combined[valid_next_i].float()
                 else:
-                    ent_valid = ent_raw[i][mask].float()
-                    lower_thr = torch.quantile(ent_valid, self.config.bucket_lower_percent / 100.0)
-                    upper_thr = torch.quantile(ent_valid, self.config.bucket_upper_percent / 100.0)
-                    bucket_mask = (ent_valid >= lower_thr) & (ent_valid <= upper_thr)
+                    vec = ent_raw[i][valid_next_i].float()
 
-                if bucket_mask.any():
-                    selected_topk_idx = valid_idx[bucket_mask]
-                    # Compute KL *only* for the selected tokens
-                    kd_terms.append(kl_pos[i, selected_topk_idx].mean())
+                lower_thr = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
+                upper_thr = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
 
-            # skip the batch if nothing selected
-            kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+                keep = torch.zeros_like(valid_next_i)
+                keep_idx = torch.where(valid_next_i)[0]
+                sel_mask = (vec >= lower_thr) & (vec <= upper_thr)
+                if sel_mask.any():
+                    keep[keep_idx[sel_mask]] = True
+                    kd_terms.append(
+                        self._kl_loss(
+                            t_log_probs[i][keep].to(self.student_device),
+                            s_log_probs[i][keep]
+                        ).mean()
+                    )
 
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:  # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+        elif self.config.distill_type == "random":
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            kl_pos = None
+            if score_enabled:
+                ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1] for context only
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
+            kd_terms = []
+            Bsz = t_log_probs.size(0)
+            for i in range(Bsz):
+                valid_next_i = valid_next[i]
+                valid_count = int(valid_next_i.sum().item())
+                if valid_count < 2:
+                    continue
+                k_count = max(1, int(valid_count * self.config.k_percent / 100.0))
+                valid_indices = torch.where(valid_next_i)[0]
+                if len(valid_indices) < k_count:
+                    continue
+
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    if combined is None:
+                        continue
+                    score_valid = combined[valid_next_i].float()
+                    # turn scores into sampling probs
+                    s = score_valid - score_valid.min()
+                    s = torch.clamp(s, min=1e-8)
+                    probs = s / s.sum()
+                    rel = torch.multinomial(probs, num_samples=k_count, replacement=False)
+                    selected_indices = valid_indices[rel]
+                else:
+                    perm = torch.randperm(len(valid_indices), device=self.student_device)
+                    selected_indices = valid_indices[perm[:k_count]]
+
+                keep = torch.zeros_like(valid_next_i)
+                keep[selected_indices] = True
+                if keep.any():
+                    kd_terms.append(
+                        self._kl_loss(
+                            t_log_probs[i][keep].to(self.student_device),
+                            s_log_probs[i][keep]
+                        ).mean()
+                    )
+
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:  # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+        elif self.config.distill_type == "pos-rs-kd":
+            # RS-KD over POSITIONS: sample K% positions by distribution q(i)
+            # Default q(i) ∝ H_i^alpha; with scores enabled, q(i) ∝ score_i^alpha
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            kl_pos = None
+            if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
+            kd_terms = []
+            Bsz = t_pred.size(0)
+            alpha = float(getattr(self.config, "rs_alpha", 1.0))
+            q_floor = float(getattr(self.config, "rs_floor", 1e-6))
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+
+            for i in range(Bsz):
+                valid_next_i = valid_next[i]  # [L-1] bool of valid positions
+                valid_count = int(valid_next_i.sum().item())
+                if valid_count < 3:
+                    continue
+
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    if combined is None:
+                        continue
+                    base = combined[valid_next_i].float()
+                else:
+                    base = ent_raw[i][valid_next_i].float()
+
+                base = torch.clamp(base - base.min(), min=1e-8)  # strictly positive
+                if alpha == 0.0:
+                    q_un = torch.ones_like(base)
+                else:
+                    q_un = base.pow(alpha)
+
+                q_un_sum = q_un.sum()
+                if q_un_sum <= 0:
+                    q = torch.full_like(q_un, 1.0 / q_un.numel())
+                else:
+                    q = q_un / q_un_sum
+                    q = torch.clamp(q, min=q_floor)
+                    q = q / q.sum()
+
+                k_count = max(1, int(valid_count * pct))
+                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
+
+                valid_idx = torch.where(valid_next_i)[0]
+                selected_abs = valid_idx[sel_rel]  # [k]
+
+                idx_t = selected_abs.to(t_log_probs.device)
+                kl_sel = self._kl_loss(
+                    t_log_probs[i, idx_t, :].to(self.student_device),
+                    s_log_probs[i, selected_abs, :]
+                )  # [k]
+
+                q_sel = q[sel_rel]  # [k]
+                w = 1.0 / torch.clamp(q_sel, min=q_floor)
+                w = w / w.sum()
+                kd_terms.append((kl_sel * w).sum())
+
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:  # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         elif self.config.distill_type == "linucb":
             if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
@@ -458,96 +576,6 @@ class Distiller:
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
             if metrics:
                 extra = metrics
-
-        elif self.config.distill_type == "random":
-            kd_terms = []
-            Bsz = t_log_probs.size(0)
-            for i in range(Bsz):
-                valid_next_i = valid_next[i]
-                valid_count = valid_next_i.sum().item()
-                if valid_count < 2:
-                    continue
-                k_count = max(1, int(valid_count * self.config.k_percent / 100.0))
-                valid_indices = torch.where(valid_next_i)[0]
-                if len(valid_indices) >= k_count:
-                    perm = torch.randperm(len(valid_indices), device=self.student_device)
-                    selected_indices = valid_indices[perm[:k_count]]
-                    keep = torch.zeros_like(valid_next_i)
-                    keep[selected_indices] = True
-                    if keep.any():
-                        # Compute KL *only* for the selected tokens
-                        kd_terms.append(
-                            self._kl_loss(
-                                t_log_probs[i][keep].to(self.student_device),
-                                s_log_probs[i][keep]
-                            ).mean()
-                        )
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
-
-        elif self.config.distill_type == "pos-rs-kd":
-            # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
-            # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
-            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
-            kd_terms = []
-            Bsz = t_pred.size(0)
-            alpha = float(getattr(self.config, "rs_alpha", 1.0))
-            q_floor = float(getattr(self.config, "rs_floor", 1e-6))
-            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-
-            for i in range(Bsz):
-                valid_next_i = valid_next[i]  # [L-1] bool of valid positions
-                valid_count = int(valid_next_i.sum().item())
-                if valid_count < 3:
-                    continue
-                # Entropy over valid positions
-                ent_valid = ent[i][valid_next_i].float() # [n_valid]
-                ent_valid = torch.clamp(ent_valid, min=1e-8) # Make strictly positive for exponentiation
-                # q_un ∝ H^alpha (Unnormalized proposal distribution). Higher H -> higher sampling prob
-                if alpha == 0.0:
-                    q_un = torch.ones_like(ent_valid) # uniform if alpha=0
-                else:
-                    q_un = ent_valid.pow(alpha)
-
-                q_un_sum = q_un.sum()
-                if q_un_sum <= 0:
-                    # fallback to uniform if degenerate
-                    q = torch.full_like(q_un, 1.0 / q_un.numel())
-                else:
-                    q = q_un / q_un_sum  # normalize
-                    # floor to avoid zero probs
-                    q = torch.clamp(q, min=q_floor)
-                    q = q / q.sum()  # renormalize
-
-                k_count = max(1, int(valid_count * pct))
-                # Sample indices within the "valid positions" subspace
-                # torch.multinomial expects probs sum to 1
-                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
-
-                # Map relative -> absolute indices
-                valid_idx = torch.where(valid_next_i)[0]  # absolute positions
-                selected_topk_idx = valid_idx[sel_rel]  # [k]
-                # KL on selected positions (like top-k branch)
-                idx_t = selected_topk_idx.to(t_log_probs.device)
-                kl_sel = self._kl_loss(
-                    t_log_probs[i, idx_t, :].to(self.student_device),
-                    s_log_probs[i, selected_topk_idx, :]
-                )  # [k]
-
-                # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.
-                q_sel = q[sel_rel]  # [k]
-                w = 1.0 / torch.clamp(q_sel, min=q_floor)
-                w = w / w.sum()
-                kd_terms.append((kl_sel * w).sum())
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
-
-        else:
-            raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
 
         return kd_loss, extra
 
