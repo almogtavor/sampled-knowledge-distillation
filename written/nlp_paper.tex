@@ -97,68 +97,10 @@ Empirically, we compare against (a) full Random-Sampling KD at every token, (b) 
 
 \subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
-\section{Entropy Approximation}
-\label{sec:entropy}
-We estimate token uncertainty via a Top-$k$-plus-tail construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
-$
-	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}
-$
-denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
-\begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,          \\
-	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
-\end{align*}
-i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
-\[
-	p^{\min}_{(j)}=\exp(u_{(j)}-Z_{\text{ub}}).
-\]
-The remaining probability mass outside the top-$m$ is then bounded by
-\begin{align*}
-	\tau_{\max}=1-\sum_{j\le m}p^{\min}_{(j)},
-\end{align*}
-A valid lower bound on entropy $H(p)=-\sum_i p_i\log p_i$ is
-\[
-	H_{\text{lb}}=-\sum_{j\le m} p^{\min}_{(j)}\log p^{\min}_{(j)}\;-\;\tau_{\max}\log\tau_{\max},
-\]
-achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep{kaltchenko2025entropyheatmap}, Sec.~3.6, for a self-contained proof and LLM application). A corresponding upper estimate is
-\begin{align*}
-	H_{\text{ub}}=H_{\text{lb}}+\tau_{\max}\log(V-m),
-\end{align*}
-(uniform tail), and the midpoint
-\begin{align*}
-	\widehat{H}_{\text{mid}} & =\tfrac12\!\left(H_{\text{lb}}+H_{\text{ub}}\right)                                   \\
-	                         & = -\sum_{j\le m}p^{\min}_{(j)}\log p^{\min}_{(j)} \;-\; \tau_{\max}\log\tau_{\max} \; \\
-	                         & \quad +\; \tfrac12\,\tau_{\max}\log(V-m).
-\end{align*}
 
-\paragraph{Choice of estimator and $m$.}
-We found that for positions ranking, using $\widehat{H}_{\text{mid}}$ with $m{=}12$ serves as the best accuracy--efficiency trade-off (Table~\ref{tab:entropy-ablation}). On \texttt{GSM8K} (7{,}473 sequences; 613K tokens; 438K valid), we ablated $m\in\{8,12,15,20\}$ and compared midpoint to lower bound, upper bound, unbiased importance sampling \emph{(IS)} and control-variated importance sampling \emph{(CV-IS)} tail estimators (both use random sampling from the tail; Appendix~\ref{app:tail-IS}).
-Midpoint gives the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant to the task of position selection. This reduces compute from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with $V{=}30$K and $m{=}12$, we touch $\sim\!12$ terms (plus one tail) instead of 30K, i.e., $\sim\!2{,}500\times$ fewer.
+\section{Methodology}
 
-\vspace{-0.5em}
-\begin{table}[h]
-	\centering
-	\small
-	\setlength{\tabcolsep}{6pt}
-	\begin{tabular}{rcccccc}
-		\toprule
-		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                                     \\
-		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
-		    & Mid                                         & IS                                        & CV-IS          & Mid            & IS             & CV-IS          \\
-		\midrule
-		8   & 0.947                                       & 0.868                                     & 0.867          & 0.966          & 0.981          & 0.981          \\
-		12  & \textbf{0.965}                              & 0.918                                     & 0.918          & 0.972          & 0.991          & 0.991          \\
-		15  & 0.971                                       & 0.942                                     & 0.944          & 0.975          & 0.993          & 0.993          \\
-		20  & 0.976                                       & \textbf{0.956}                            & \textbf{0.957} & \textbf{0.977} & \textbf{0.995} & \textbf{0.995} \\
-		\bottomrule
-	\end{tabular}
-	\caption{GSM8K ablation ($k\%{=}20$ for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
-	\label{tab:entropy-ablation}
-\end{table}
-\vspace{-0.75em}
-
-
-\section{Position-Selective Distillation (RS-KD over Positions)}
+\subsection{Position-Selective Distillation (RS-KD over Positions)}
 \label{sec:posrs}
 
 The KD objective for an autoregressive step is a mean over positions:
@@ -241,6 +183,66 @@ $\alpha{=}1$,
 $\alpha_{\text{ce}}\!\in\![0.05,0.2]$.
 A tiny probability floor prevents numerical blow-ups in $1/q$.
 
+\section{Entropy Approximation}
+\label{sec:entropy}
+We estimate token uncertainty via a Top-$k$-plus-tail construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
+$
+	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}
+$
+denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
+\begin{align*}
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,          \\
+	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
+\end{align*}
+i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
+\[
+	p^{\min}_{(j)}=\exp(u_{(j)}-Z_{\text{ub}}).
+\]
+The remaining probability mass outside the top-$m$ is then bounded by
+\begin{align*}
+	\tau_{\max}=1-\sum_{j\le m}p^{\min}_{(j)},
+\end{align*}
+A valid lower bound on entropy $H(p)=-\sum_i p_i\log p_i$ is
+\[
+	H_{\text{lb}}=-\sum_{j\le m} p^{\min}_{(j)}\log p^{\min}_{(j)}\;-\;\tau_{\max}\log\tau_{\max},
+\]
+achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep{kaltchenko2025entropyheatmap}, Sec.~3.6, for a self-contained proof and LLM application). A corresponding upper estimate is
+\begin{align*}
+	H_{\text{ub}}=H_{\text{lb}}+\tau_{\max}\log(V-m),
+\end{align*}
+(uniform tail), and the midpoint
+\begin{align*}
+	\widehat{H}_{\text{mid}} & =\tfrac12\!\left(H_{\text{lb}}+H_{\text{ub}}\right)                                   \\
+	                         & = -\sum_{j\le m}p^{\min}_{(j)}\log p^{\min}_{(j)} \;-\; \tau_{\max}\log\tau_{\max} \; \\
+	                         & \quad +\; \tfrac12\,\tau_{\max}\log(V-m).
+\end{align*}
+
+\paragraph{Choice of estimator and $m$.}
+We found that for positions ranking, using $\widehat{H}_{\text{mid}}$ with $m{=}12$ serves as the best accuracy--efficiency trade-off (Table~\ref{tab:entropy-ablation}). On \texttt{GSM8K} (7{,}473 sequences; 613K tokens; 438K valid), we ablated $m\in\{8,12,15,20\}$ and compared midpoint to lower bound, upper bound, unbiased importance sampling \emph{(IS)} and control-variated importance sampling \emph{(CV-IS)} tail estimators (both use random sampling from the tail; Appendix~\ref{app:tail-IS}).
+Midpoint gives the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant to the task of position selection. This reduces compute from $\mathcal{O}(V)$ to $\mathcal{O}(m)$: with $V{=}30$K and $m{=}12$, we touch $\sim\!12$ terms (plus one tail) instead of 30K, i.e., $\sim\!2{,}500\times$ fewer.
+
+\vspace{-0.5em}
+\begin{table}[h]
+	\centering
+	\small
+	\setlength{\tabcolsep}{6pt}
+	\begin{tabular}{rcccccc}
+		\toprule
+		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                                     \\
+		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+		    & Mid                                         & IS                                        & CV-IS          & Mid            & IS             & CV-IS          \\
+		\midrule
+		8   & 0.947                                       & 0.868                                     & 0.867          & 0.966          & 0.981          & 0.981          \\
+		12  & \textbf{0.965}                              & 0.918                                     & 0.918          & 0.972          & 0.991          & 0.991          \\
+		15  & 0.971                                       & 0.942                                     & 0.944          & 0.975          & 0.993          & 0.993          \\
+		20  & 0.976                                       & \textbf{0.956}                            & \textbf{0.957} & \textbf{0.977} & \textbf{0.995} & \textbf{0.995} \\
+		\bottomrule
+	\end{tabular}
+	\caption{GSM8K ablation ($k\%{=}20$ for position selection; Qwen3-0.6B; $s{=}5$ samples for IS/CV-IS). Midpoint attains near-peak overlap already at $m{=}12$; IS/CV-IS maximize correlation at larger $m$. (IS: importance sampling; CV-IS: control-variated IS.)}
+	\label{tab:entropy-ablation}
+\end{table}
+\vspace{-0.75em}
+
 \subsection{Storage accounting}
 Our cache packs each stored vocab sample into exactly 3 bytes: a 17-bit token id and a 7-bit probability (q7), written as a single 24-bit word. In addition, we store a per-position entropy approximation $\hat H$ in uint8 (1 byte). With $U{=}12$ stored samples per valid position, the average cost is
 \[
@@ -255,11 +257,13 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 
 If the selection strategy is fixed and deterministic (e.g., always distill on the top-25\% highest-entropy positions chosen offline), we can achieve substantial additional storage and compute savings by omitting $\hat H$ entirely and only retain RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
-	\text{B/token} \;&=\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3 \\
-	\;&=\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
+	\text{B/token} \; & =\; k \cdot U \cdot 3
+	\;=\; 0.25 \cdot 12 \cdot 3                                                 \\
+	\;                & =\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache, but the one-time offline preselection is straightforward and offers an additional $\sim\!\times4$ reduction when $k{=}25\%$.
+Table~\ref{tab:storage} summarizes the storage requirements across different methods.
+
 
 \begin{table}[h]
 	\centering
@@ -353,8 +357,8 @@ Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	&= -P_T\log\!\frac{P_T}{V-m} \\
-	&+ P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
+	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
+	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
 \[
