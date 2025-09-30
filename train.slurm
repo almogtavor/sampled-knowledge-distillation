@@ -19,7 +19,7 @@ DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
 KD_SWEEP_TAG=${4:-}
-EPOCHS="${5:-${EPOCHS:-3}}"   # default 3, override via env
+EPOCHS="${5:-${EPOCHS:-1}}"   # default 1, override via env
 ANNEAL_FLAG=${6:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)
@@ -39,6 +39,7 @@ echo "SLURM_JOB_ID      = ${SLURM_JOB_ID:-N/A}"
 echo "DISTILL_TYPE      = $DISTILL_TYPE"
 echo "K_PERCENT         = $K_PERCENT"
 echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
+echo "KD_SWEEP_TAG      = $KD_SWEEP_TAG"
 echo "VENV_DIR          = $VENV_DIR"
 echo "OUTPUT_DIR        = $OUTPUT_DIR"
 echo "User              = $USER"
@@ -241,7 +242,7 @@ echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
-  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} --gpus=3 evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."
