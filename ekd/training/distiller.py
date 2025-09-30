@@ -146,9 +146,23 @@ class Distiller:
         if self.cache is not None:
             items = self._lookup_cache_batch(input_ids)
             if items is not None:
-                # Stack cached per-example arrays
-                H = [torch.as_tensor(it["H_hat"]) for it in items]  # each [L-1]
-                return torch.stack(H, dim=0).to(self.student_device)  # [B, L-1]
+                H_list = []
+                for it in items:
+                    if "H_hat_u8" in it:
+                        # Dequantize from uint8 using cap ln(V)
+                        H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
+                        V = int(it.get("rs", {}).get("sentinel_id", 0))
+                        H_cap = math.log(max(2, V)) if V > 0 else 1.0
+                        H_f = (H_u8.float() / 255.0) * H_cap
+                        H_list.append(H_f)
+                    elif "H_hat" in it:
+                        H_list.append(torch.as_tensor(it["H_hat"]).float())
+                    else:
+                        # Missing Ĥ in cache: fall back to exact
+                        H_list = None
+                        break
+                if H_list is not None:
+                    return torch.stack(H_list, dim=0).to(self.student_device)
 
         # need exact from t_pred
         assert t_pred is not None, "Exact entropy requested but teacher logits are unavailable."

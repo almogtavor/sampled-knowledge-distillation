@@ -66,6 +66,8 @@ class TrainingConfig(BaseModel):
     entropy_approx_m: int = Field(default=20, description="Top-m used in truncated entropy approximation")
     rs_vocab_samples: int = Field(default=64, description="Number of vocab samples per position for RS-KD")
     rs_vocab_beta: float = Field(default=1.0, description="Proposal exponent for RS-KD over vocab: q ∝ p^beta")
+    # Entropy cache policy (always stored): True => uint8, False => fp16
+    H_hat_u8: bool = Field(default=True, description="Store Ĥ as uint8 (True) or fp16 (False)")
     
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")
