@@ -212,7 +212,8 @@ unset PYTHONPATH PYTHONHOME
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
-  --datasets "gsm8k" \
+  --datasets "fineweb" \
+  --fineweb_tokens "${FINEWEB_TOKENS:-50000000}" \
   --dataset_config "main" \
   --prompt_col "question" \
   --answer_col "answer" \
