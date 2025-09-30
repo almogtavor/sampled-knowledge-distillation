@@ -428,6 +428,7 @@ class Distiller:
 
             targets = input_ids[:, 1:].to(self.student_device)
             targets = targets.masked_fill(~valid_next, 0)
+            # Teacher/student CE and KL are the contextual features consumed by the bandit.
             teacher_ce = (-t_log_probs_T1.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
             student_ce = (-s_log_probs_T1.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
 
@@ -767,6 +768,7 @@ class Distiller:
             )
 
         if self.bandit_manager is not None:
+            # Guard against stale pending batches when resuming training or restarting loops.
             self.bandit_manager.reset()
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
@@ -812,6 +814,7 @@ class Distiller:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
                     reward_metrics = None
                     if self.bandit_manager is not None:
+                        # Consume queued actions collected during forward passes and update the bandit.
                         reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
                     if reward_metrics:
                         last_reward_metrics = reward_metrics
@@ -828,6 +831,7 @@ class Distiller:
                 running["kl"] += kl_val
                 running["ce"] += ce_val
                 if bandit_metrics:
+                    # These metrics describe the current batch's bandit decisions (e.g., token counts).
                     for key, value in bandit_metrics.items():
                         bandit_running[key] = bandit_running.get(key, 0.0) + value
                     bandit_steps += 1

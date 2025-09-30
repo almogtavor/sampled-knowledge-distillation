@@ -11,6 +11,7 @@ from .linucb import LinUCBBandit
 
 @dataclass
 class BanditTokenRecord:
+    """Snapshot of a single token decision made by the bandit."""
     example_idx: int
     position: int
     context: torch.Tensor
@@ -19,6 +20,7 @@ class BanditTokenRecord:
 
 @dataclass
 class BanditPendingBatch:
+    """Bundle of tokens tied to a batch so we can recompute rewards later."""
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     tokens: List[BanditTokenRecord]
@@ -42,7 +44,8 @@ class LinUCBBanditController:
         self.teacher_device = torch.device(teacher_device)
         self._sanitize_logits = sanitize_logits_fn
 
-        feature_dim = 6  # [entropy, teacher CE, student CE, KL, POS code, norm position]
+        # Feature vector: [entropy, teacher CE, student CE, KL, token POS class, normalized position]
+        feature_dim = 6
         self.bandit = LinUCBBandit(
             feature_dim=feature_dim,
             alpha=self.config.bandit_alpha,
@@ -57,6 +60,7 @@ class LinUCBBanditController:
     # Selection helpers
     # ------------------------------------------------------------------
     def _token_pos_code(self, token_id: int) -> float:
+        """Map a token ID to a coarse part-of-speech style bucket [0, 1]."""
         cached = self._pos_cache.get(int(token_id))
         if cached is not None:
             return cached
@@ -88,6 +92,7 @@ class LinUCBBanditController:
         input_ids: torch.Tensor,
         valid_next: torch.Tensor,
     ) -> List[Optional[Dict[str, torch.Tensor]]]:
+        """Assemble per-token contexts and bookkeeping needed by the bandit."""
         features: List[Optional[Dict[str, torch.Tensor]]] = []
         seq_len = valid_next.size(1)
 
@@ -111,6 +116,7 @@ class LinUCBBanditController:
             )
 
             denom = max(1, seq_len - 1)
+            # Explicitly encode relative position to encourage exploration across the sequence.
             pos_norm = valid_idx.float() / denom
 
             contexts = torch.stack(
@@ -125,6 +131,7 @@ class LinUCBBanditController:
                 dim=1,
             )
 
+            # Track entropy top quartile to diagnose whether we revisit high-uncertainty tokens.
             top25_count = max(1, min(valid_idx.numel(), math.ceil(0.25 * valid_idx.numel())))
             top25_rel = torch.topk(ent_vals, k=top25_count, largest=True, sorted=False).indices
             top25_abs = valid_idx[top25_rel]
@@ -150,6 +157,7 @@ class LinUCBBanditController:
         valid_next: torch.Tensor,
         temperature: float,
     ) -> Tuple[List[torch.Tensor], Dict[str, float]]:
+        """Choose token positions for KD and queue up reward computations."""
         feature_data = self._prepare_features(
             ent_raw=ent_raw,
             teacher_ce=teacher_ce,
@@ -188,12 +196,14 @@ class LinUCBBanditController:
             if max_actions is not None:
                 eff_min = min(eff_min, max_actions)
 
+            # Force a minimum number of actions to keep gradients flowing on small batches.
             if mask.sum().item() < eff_min:
                 topk = torch.topk(scores, k=eff_min, largest=True, sorted=False).indices
                 new_mask = torch.zeros_like(mask, dtype=torch.bool)
                 new_mask[topk] = True
                 mask = new_mask
 
+            # If the threshold filtered out everything, backstop with the best-scoring token.
             if mask.sum().item() == 0:
                 top_idx = torch.topk(scores, k=1, largest=True).indices
                 mask = torch.zeros_like(mask, dtype=torch.bool)
@@ -230,6 +240,7 @@ class LinUCBBanditController:
             total_overlap_top25 += intersection / max(1, float(top25_abs.numel()))
 
         if pending_tokens:
+            # Store a CPU copy of the batch so we can run reward rollouts after the optimizer step.
             self._pending.append(
                 BanditPendingBatch(
                     input_ids=input_ids.detach().cpu(),
@@ -258,6 +269,7 @@ class LinUCBBanditController:
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
     def process_rewards(self, student_model, teacher_model) -> Optional[Dict[str, float]]:
+        """Re-evaluate queued tokens and feed rewards back into the bandit."""
         if not self._pending:
             return None
 
@@ -328,5 +340,6 @@ class LinUCBBanditController:
         }
 
     def reset(self) -> None:
+        """Clear cached state so training can restart safely."""
         self._pending.clear()
         self._pos_cache.clear()
