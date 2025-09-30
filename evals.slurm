@@ -126,6 +126,7 @@ fi
 # MODEL_PATH can be either a HF model directory or a .pt checkpoint; eval.py will auto-detect.
 MODEL_PATH=${1:-}
 SUITE=${2:-}
+OUTPUT_DIR=${3:-"evaluation_json_results"}
 
 if [[ -z "$MODEL_PATH" || -z "$SUITE" ]]; then
   echo "Error: missing args. Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light>"
@@ -142,6 +143,7 @@ mkdir -p logs eval_runs
 # ---------- run (fan-out across whatever GPUs were allocated) ----------
 EVAL_ARGS=(
   --work_dir eval_runs
+  --output_dir "$OUTPUT_DIR"
   --gpu_ids "$CUDA_VISIBLE_DEVICES"
   --suite "$SUITE"
   --wandb_project selective-entropy-knowledge-distillation
