@@ -234,7 +234,7 @@ kd_pos_rs_kd_run_out_models/
 tb/
 evalplus_results/
 .tensorboard-info/
+logits_caches/
 
 # LaTeX code snippets
 tex.code-snippets
-logits_caches/
