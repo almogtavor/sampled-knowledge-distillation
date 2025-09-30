@@ -1,17 +1,23 @@
+import glob
+import math
+import os
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
 from torch import device
 from torch.optim import AdamW
-import os
-from pathlib import Path
-import glob
-import math
-from typing import Dict, Any, List, Optional
 
 from ..config import TrainingConfig, TrainingMetrics
-from .offline_cache import TeacherOfflineCache, build_offline_cache_if_needed, init_offline_cache_for_trainer
 from .entropy_utils import token_entropy
+from .linucb_controller import LinUCBBanditController
+from .offline_cache import (
+    TeacherOfflineCache,
+    build_offline_cache_if_needed,
+    init_offline_cache_for_trainer,
+)
 
 
 # importance-sampled KL over vocabulary using cached RS samples
@@ -87,6 +93,17 @@ class Distiller:
 
         # offline teacher logits cache: centralized initialization
         self.cache = None
+
+        # LinUCB contextual bandit setup
+        self.bandit_manager: Optional[LinUCBBanditController] = None
+        if self.config.distill_type == "linucb":
+            self.bandit_manager = LinUCBBanditController(
+                tokenizer=self.tok,
+                config=self.config,
+                student_device=self.student_device,
+                teacher_device=self.teacher_device,
+                sanitize_logits_fn=self._sanitize_logits,
+            )
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
@@ -172,6 +189,102 @@ class Distiller:
             ent_list.append(token_entropy(t_pred[i]).to(self.student_device))  # [L-1]
         return torch.stack(ent_list, dim=0)  # [B, L-1]
 
+    @staticmethod
+    def _normalize_component(values: torch.Tensor, mask: torch.Tensor, mode: str) -> torch.Tensor:
+        """Normalize `values` over the True positions of `mask` according to `mode`.
+
+        Returns a tensor of the same shape as `values` (no masking applied).
+        """
+        if mode == "none":
+            return values
+
+        valid_vals = values[mask]
+        if valid_vals.numel() == 0:
+            return values
+
+        if mode == "z":
+            mean = valid_vals.mean()
+            std = valid_vals.std(unbiased=False)
+            if std < 1e-6:
+                return values - mean
+            return (values - mean) / std
+        elif mode == "minmax":
+            min_val = valid_vals.min()
+            max_val = valid_vals.max()
+            denom = (max_val - min_val).clamp_min(1e-6)
+            return (values - min_val) / denom
+        else:
+            raise ValueError(f"Unknown normalization mode: {mode}")
+
+    def _prepare_score_context(
+        self,
+        ent_raw: torch.Tensor,
+        kl_pos: torch.Tensor,
+        s_log_probs: torch.Tensor,
+        valid_next: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Pre-compute tensors needed for score-based token ranking"""
+        weights = (
+            float(getattr(self.config, "score_entropy_weight", 1.0)),
+            float(getattr(self.config, "score_ce_weight", 1.0)),
+            float(getattr(self.config, "score_kl_weight", 1.0)),
+        )
+        if all(abs(w) < 1e-8 for w in weights):
+            raise ValueError("Score-based selection requires at least one non-zero component weight.")
+
+        norm_mode = getattr(self.config, "score_normalize", "z")
+
+        targets = input_ids[:, 1:].to(self.student_device)
+        targets = targets.masked_fill(~valid_next, 0)
+        target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
+
+        ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
+        kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+
+        return {
+            "weights": weights,
+            "norm_mode": norm_mode,
+            "entropy": ent_for_score,
+            "student_ce": student_ce,
+            "kl": kl_for_score,
+        }
+
+    def _build_score_vector(
+        self,
+        score_ctx: Dict[str, Any],
+        example_idx: int,
+        mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Construct combined score for one example or return None if no components are active."""
+        weights = score_ctx["weights"]
+        norm_mode = score_ctx["norm_mode"]
+
+        combined = torch.zeros_like(score_ctx["entropy"][example_idx])
+        component_used = False
+
+        if abs(weights[0]) > 0:
+            comp = self._normalize_component(score_ctx["entropy"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[0] * comp
+            component_used = True
+
+        if abs(weights[1]) > 0:
+            comp = self._normalize_component(score_ctx["student_ce"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[1] * comp
+            component_used = True
+
+        if abs(weights[2]) > 0:
+            comp = self._normalize_component(score_ctx["kl"][example_idx].clone(), mask, norm_mode)
+            combined = combined + weights[2] * comp
+            component_used = True
+
+        if not component_used:
+            return None
+
+        combined = combined.masked_fill(~mask, float('-inf'))
+        return combined
+
     def load_checkpoint(self, checkpoint_path: str):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.student_device)
@@ -188,181 +301,283 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
-    def _compute_kd_loss(self, t_pred: torch.Tensor, t_log_probs: torch.Tensor, 
-                         s_log_probs: torch.Tensor, valid_next: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute knowledge distillation loss based on the configured distillation type.
-        
+    def _compute_kd_loss(
+        self,
+        t_pred: torch.Tensor,
+        t_log_probs: torch.Tensor,
+        s_pred: torch.Tensor,
+        s_log_probs: torch.Tensor,
+        valid_next: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: float,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+        """Compute knowledge distillation loss for the configured strategy.
+
         Args:
             t_pred: Teacher predictions [B, L-1, V]
-            t_log_probs: Teacher log probabilities [B, L-1, V] 
-            s_log_probs: Student log probabilities [B, L-1, V]
-            valid_next: Valid next token positions [B, L-1]
-            
+            t_log_probs: Teacher log probabilities [B, L-1, V]
+            s_pred: Student logits aligned to next-token positions [B, L-1, V]
+            s_log_probs: Student log probabilities at KD temperature [B, L-1, V]
+            valid_next: Boolean mask of valid next-token positions [B, L-1]
+            input_ids: Input ids [B, L]
+            attention_mask: Attention mask [B, L]
+            temperature: KD temperature used for the current batch
+
         Returns:
-            kd_loss: Computed KD loss tensor
+            Tuple containing the KD loss tensor and optional auxiliary info (for LinUCB).
         """
+        extra: Optional[Dict[str, Any]] = None
+
         if self.config.distill_type == "vanilla":
-            # KL for all positions for vanilla (sum over vocab so it becomes [B, L-1])
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-            
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens by entropy among valid positions only
-            # selection by entropy (T=1 for selection is common) ----
-            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
-            ent = ent.masked_fill(~valid_next, float('-inf')) # ignore invalid
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent = ent_raw.masked_fill(~valid_next, float('-inf'))  # ignore invalid
 
-            pct = max(0.0, min(1.0, self.config.k_percent / 100.0)) # e.g. 0.2
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))  # e.g. 0.2
 
-            # top-k-tok: select positions first, then compute KL only on those
+            # optional score-based selection context
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
+            # select positions first, then compute KL only on those
             kd_terms = []
             batch_size = valid_next.size(0)
             for i in range(batch_size):
-                valid_next_i = valid_next[i]  # [L-1] - valid positions for sequence i
-                n_valid = int(valid_next_i.sum().item())  # Count valid positions
+                mask = valid_next[i]  # [L-1] - valid positions for sequence i
+                n_valid = int(mask.sum().item())
                 if n_valid < 3:
-                    continue # Skip sequences with too few valid tokens
+                    continue
                 k = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                # Find indices of valid positions (all that aren't 0)
-                valid_idx = torch.nonzero(valid_next_i, as_tuple=False).squeeze(-1)      # [n_valid]
-                ent_valid_pos = ent[i][valid_idx] # [n_valid], entropy of valid positions
-                _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
-                # Convert relative indices back to absolute sequence positions
-                selected_topk_idx = valid_idx[selected_topk_pos] # [k]
 
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, mask)
+                    if combined is None:
+                        continue
+                    score_valid = combined[mask]
+                    if score_valid.numel() == 0:
+                        continue
+                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
+                    _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
+                    selected_topk_idx = valid_idx[rel_idx]  # [k]
+                else:
+                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
+                    ent_valid_pos = ent[i][valid_idx] # [n_valid], entropy of valid positions
+                    _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
+                    # Convert relative indices back to absolute sequence positions
+                    selected_topk_idx = valid_idx[selected_topk_pos]  # [k]
                 # Compute KL only on selected positions (sum over vocab, so [k])
                 idx_t = selected_topk_idx.to(t_log_probs.device)
-                kl_sel = self._kl_loss(t_log_probs[i, idx_t, :].to(self.student_device),
-                        s_log_probs[i, selected_topk_idx, :])  # [k]
+                kl_sel = self._kl_loss(
+                    t_log_probs[i, idx_t, :].to(self.student_device),
+                    s_log_probs[i, selected_topk_idx, :]
+                )  # [k]
                 kd_terms.append(kl_sel.mean())
 
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
+            else:
                 kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
-            # This excludes both the lowest 70% and highest 20% entropy tokens
-            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            kl_pos = None
+            if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
             kd_terms = []
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
                 valid_next_i = valid_next[i]
                 if valid_next_i.sum() < 3:  # Need at least 3 tokens for bucket selection
                     continue
-                ent_valid = ent[i][valid_next_i]
 
-                # Calculate both thresholds
-                lower_thr = torch.quantile(ent_valid.float(), self.config.bucket_lower_percent / 100.0)
-                upper_thr = torch.quantile(ent_valid.float(), self.config.bucket_upper_percent / 100.0)
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    if combined is None:
+                        continue
+                    vec = combined[valid_next_i].float()
+                else:
+                    vec = ent_raw[i][valid_next_i].float()
 
-                # Select tokens in the bucket [lower_thr, upper_thr]
+                lower_thr = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
+                upper_thr = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
+
                 keep = torch.zeros_like(valid_next_i)
-                keep[valid_next_i] = (ent_valid >= lower_thr) & (ent_valid <= upper_thr)
-                if keep.any():
-                    # Compute KL *only* for the selected tokens
+                keep_idx = torch.where(valid_next_i)[0]
+                sel_mask = (vec >= lower_thr) & (vec <= upper_thr)
+                if sel_mask.any():
+                    keep[keep_idx[sel_mask]] = True
                     kd_terms.append(
                         self._kl_loss(
                             t_log_probs[i][keep].to(self.student_device),
                             s_log_probs[i][keep]
                         ).mean()
                     )
+
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
+            else:  # skip the batch if nothing selected
                 kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
-
         elif self.config.distill_type == "random":
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            kl_pos = None
+            if score_enabled:
+                ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1] for context only
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
             kd_terms = []
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
                 valid_next_i = valid_next[i]
-                valid_count = valid_next_i.sum().item()
+                valid_count = int(valid_next_i.sum().item())
                 if valid_count < 2:
                     continue
                 k_count = max(1, int(valid_count * self.config.k_percent / 100.0))
                 valid_indices = torch.where(valid_next_i)[0]
-                if len(valid_indices) >= k_count:
+                if len(valid_indices) < k_count:
+                    continue
+
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    if combined is None:
+                        continue
+                    score_valid = combined[valid_next_i].float()
+                    # turn scores into sampling probs
+                    s = score_valid - score_valid.min()
+                    s = torch.clamp(s, min=1e-8)
+                    probs = s / s.sum()
+                    rel = torch.multinomial(probs, num_samples=k_count, replacement=False)
+                    selected_indices = valid_indices[rel]
+                else:
                     perm = torch.randperm(len(valid_indices), device=self.student_device)
                     selected_indices = valid_indices[perm[:k_count]]
-                    keep = torch.zeros_like(valid_next_i)
-                    keep[selected_indices] = True
-                    if keep.any():
-                        # Compute KL *only* for the selected tokens
-                        kd_terms.append(
-                            self._kl_loss(
-                                t_log_probs[i][keep].to(self.student_device),
-                                s_log_probs[i][keep]
-                            ).mean()
-                        )
+
+                keep = torch.zeros_like(valid_next_i)
+                keep[selected_indices] = True
+                if keep.any():
+                    kd_terms.append(
+                        self._kl_loss(
+                            t_log_probs[i][keep].to(self.student_device),
+                            s_log_probs[i][keep]
+                        ).mean()
+                    )
+
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
+            else:  # skip the batch if nothing selected
                 kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
         elif self.config.distill_type == "pos-rs-kd":
-            # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
-            # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
-            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            # RS-KD over POSITIONS: sample K% positions by distribution q(i)
+            # Default q(i) ∝ H_i^alpha; with scores enabled, q(i) ∝ score_i^alpha
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            kl_pos = None
+            if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
             kd_terms = []
             Bsz = t_pred.size(0)
             alpha = float(getattr(self.config, "rs_alpha", 1.0))
             q_floor = float(getattr(self.config, "rs_floor", 1e-6))
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-        
+
             for i in range(Bsz):
                 valid_next_i = valid_next[i]  # [L-1] bool of valid positions
                 valid_count = int(valid_next_i.sum().item())
                 if valid_count < 3:
                     continue
-                # Entropy over valid positions
-                ent_valid = ent[i][valid_next_i].float() # [n_valid]
-                ent_valid = torch.clamp(ent_valid, min=1e-8) # Make strictly positive for exponentiation
-                # q_un ∝ H^alpha (Unnormalized proposal distribution). Higher H -> higher sampling prob
-                if alpha == 0.0:
-                    q_un = torch.ones_like(ent_valid) # uniform if alpha=0
+
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    if combined is None:
+                        continue
+                    base = combined[valid_next_i].float()
                 else:
-                    q_un = ent_valid.pow(alpha)
-        
+                    base = ent_raw[i][valid_next_i].float()
+
+                base = torch.clamp(base - base.min(), min=1e-8)  # strictly positive
+                if alpha == 0.0:
+                    q_un = torch.ones_like(base)
+                else:
+                    q_un = base.pow(alpha)
+
                 q_un_sum = q_un.sum()
                 if q_un_sum <= 0:
-                    # fallback to uniform if degenerate
                     q = torch.full_like(q_un, 1.0 / q_un.numel())
                 else:
-                    q = q_un / q_un_sum  # normalize
-                    # floor to avoid zero probs
+                    q = q_un / q_un_sum
                     q = torch.clamp(q, min=q_floor)
-                    q = q / q.sum()  # renormalize
-        
+                    q = q / q.sum()
+
                 k_count = max(1, int(valid_count * pct))
-                # Sample indices within the "valid positions" subspace
-                # torch.multinomial expects probs sum to 1
                 sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
-        
-                # Map relative -> absolute indices
-                valid_idx = torch.where(valid_next_i)[0]  # absolute positions
+
+                valid_idx = torch.where(valid_next_i)[0]
                 selected_abs = valid_idx[sel_rel]  # [k]
-                # KL on selected positions (like top-k branch)
+
                 idx_t = selected_abs.to(t_log_probs.device)
                 kl_sel = self._kl_loss(
                     t_log_probs[i, idx_t, :].to(self.student_device),
                     s_log_probs[i, selected_abs, :]
                 )  # [k]
-        
-                # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.
+
                 q_sel = q[sel_rel]  # [k]
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                 w = w / w.sum()
                 kd_terms.append((kl_sel * w).sum())
+
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
+            else:  # skip the batch if nothing selected
                 kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
-        else:
-            raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
-            
-        return kd_loss
+        elif self.config.distill_type == "linucb":
+            if self.bandit_manager is None:
+                raise RuntimeError("LinUCB bandit is not initialized.")
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)
+            t_log_probs_T1 = torch.log_softmax(t_pred, dim=-1)
+            s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+
+            targets = input_ids[:, 1:].to(self.student_device)
+            targets = targets.masked_fill(~valid_next, 0)
+            # Teacher/student CE and KL are the contextual features consumed by the bandit.
+            teacher_ce = (-t_log_probs_T1.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+            student_ce = (-s_log_probs_T1.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+
+            kd_terms, metrics = self.bandit_manager.select_tokens(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                ent_raw=ent_raw.detach(),
+                teacher_ce=teacher_ce,
+                student_ce=student_ce,
+                kl_pos=kl_pos.detach(),
+                valid_next=valid_next,
+                temperature=temperature,
+            )
+            kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+            if metrics:
+                extra = metrics
+
+        return kd_loss, extra
 
     @staticmethod
     def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
@@ -400,11 +615,16 @@ class Distiller:
         # Decide whether we need full teacher logits now
         cached_items = None
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
-        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd"}
+        if self.config.distill_type == "linucb":
+            use_vocab_rs_kd = False
+        # Score-based selection needs fresh teacher logits even if the cache could satisfy EKD,
+        # because we require per-position KL and student CE statistics that aren't stored offline.
+        score_requires_teacher = bool(getattr(self.config, "score_token_selection", False)) and self.config.distill_type in {"top-k-tok", "bucket"}
+        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd", "linucb"} or score_requires_teacher
         if use_vocab_rs_kd:
             # try offline cache to avoid teacher forward; fall back to teacher if cache missing
             cached_items = self._lookup_cache_batch(input_ids)
-            if cached_items is not None:
+            if cached_items is not None and not score_requires_teacher:
                 need_teacher_full = False
 
         # Inform per-batch whether we hit the logits cache or run the teacher online
@@ -434,8 +654,20 @@ class Distiller:
         # --- KD loss ---
         # Compute per-position base KD according to mode (positions subset and weights),
         # then replace vocab-sum with RS-KD estimator when enabled.
+        extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
-            kd_loss = self._compute_kd_loss(t_pred, t_log_probs, s_log_probs, valid_next, input_ids)
+            kd_loss, kd_extra = self._compute_kd_loss(
+                t_pred,
+                t_log_probs,
+                s_pred,
+                s_log_probs,
+                valid_next,
+                input_ids,
+                attn_mask,
+                T,
+            )
+            if kd_extra:
+                extra_metrics = kd_extra
         else:
             # Replace vocab-sum with RS-KD estimator. Two paths:
             # 1) cached_items available: decode precomputed per-position samples (keep existing per-position loop)
@@ -542,9 +774,9 @@ class Distiller:
                 f"(total={total.item()}, kd={kd_loss.item()}, ce={ce_loss.item()})")
             # Return a tiny zero-like loss with grad so autograd graph stays valid
             zero = s_pred.sum() * 0.0
-            return zero + zero, 0.0, 0.0
+            return zero + zero, 0.0, 0.0, None
 
-        return total, kd_loss.item(), ce_loss.item()
+        return total, kd_loss.item(), ce_loss.item(), extra_metrics
 
     def compute_cache_signature(self) -> Dict[str, Any]:
         """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
@@ -594,6 +826,10 @@ class Distiller:
                 config=self.config, teacher_device=self.teacher_device,
                 sanitize_logits_fn=self._sanitize_logits,
             )
+
+        if self.bandit_manager is not None:
+            # Guard against stale pending batches when resuming training or restarting loops.
+            self.bandit_manager.reset()
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)
@@ -612,10 +848,13 @@ class Distiller:
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
+            bandit_running: Dict[str, float] = {}
+            bandit_steps = 0
+            last_reward_metrics: Optional[Dict[str, float]] = None
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
             for step, batch in enumerate(self.dataloader):
-                loss, kl_val, ce_val = self._forward_batch(batch)
+                loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
                 
                 # Scale loss by gradient accumulation steps
                 loss = loss / self.config.gradient_accumulation_steps
@@ -633,6 +872,14 @@ class Distiller:
                         # Log the current KD temperature to visualize the annealing schedule
                         if self.logger:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
+                    reward_metrics = None
+                    if self.bandit_manager is not None:
+                        # Consume queued actions collected during forward passes and update the bandit.
+                        reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
+                    if reward_metrics:
+                        last_reward_metrics = reward_metrics
+                        if self.logger:
+                            self.logger.log(reward_metrics, self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 
@@ -643,6 +890,11 @@ class Distiller:
                 running["loss"] += loss.item() * self.config.gradient_accumulation_steps  # Unscale for logging
                 running["kl"] += kl_val
                 running["ce"] += ce_val
+                if bandit_metrics:
+                    # These metrics describe the current batch's bandit decisions (e.g., token counts).
+                    for key, value in bandit_metrics.items():
+                        bandit_running[key] = bandit_running.get(key, 0.0) + value
+                    bandit_steps += 1
                 
                 # Logging every step using TrainingMetrics
                 metrics = TrainingMetrics(
@@ -657,6 +909,8 @@ class Distiller:
                 # Log metrics
                 if self.logger:
                     log_metrics = {**metrics.to_dict(), "train/step": step + 1, "train/global_step": self.global_step}
+                    if bandit_metrics:
+                        log_metrics.update(bandit_metrics)
                     self.logger.log(log_metrics, self.global_step)
                     
                 if (step + 1) % log_every == 0:
@@ -664,13 +918,25 @@ class Distiller:
                     avg_loss = running['loss'] / n
                     avg_kl = running['kl'] / n
                     avg_ce = running['ce'] / n
+                    avg_bandit: Dict[str, float] = {}
+                    if bandit_steps > 0:
+                        avg_bandit = {k: v / bandit_steps for k, v in bandit_running.items()}
                     
                     elapsed = time.time() - step_start 
                     step_start = time.time()
+                    bandit_str = ""
+                    if avg_bandit:
+                        sel = avg_bandit.get("bandit/selected_tokens", 0.0)
+                        overlap = avg_bandit.get("bandit/overlap_selected", 0.0)
+                        bandit_str = f" | bandit_sel={sel:.2f} overlap={overlap:.2f}"
+                    reward_str = ""
+                    if last_reward_metrics:
+                        avg_reward = last_reward_metrics.get("bandit/avg_reward", 0.0)
+                        reward_str = f" | bandit_reward={avg_reward:.4f}"
                     print(
                         f"ep{epoch + 1} step{step + 1} | "
                         f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
-                        f"| global_step={self.global_step} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
+                        f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
                     )
                     
                     # Log averages using new combined logger or legacy loggers
@@ -681,6 +947,10 @@ class Distiller:
                         "train/elapsed_time": elapsed,
                         "train/steps_per_second": log_every / elapsed
                     }
+                    if avg_bandit:
+                        avg_metrics.update(avg_bandit)
+                    if last_reward_metrics:
+                        avg_metrics.update(last_reward_metrics)
                     
                     # Log averages
                     if self.logger:
@@ -688,6 +958,8 @@ class Distiller:
                         self.logger.flush()
                         
                     running = {k: 0.0 for k in running}
+                    bandit_running = {}
+                    bandit_steps = 0
         
         # Final checkpoint and cleanup at the end
         if self.config.checkpoint_steps > 0:

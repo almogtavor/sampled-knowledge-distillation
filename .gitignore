@@ -235,4 +235,6 @@ tb/
 evalplus_results/
 .tensorboard-info/
 logits_caches/
+# LaTeX code snippets
+tex.code-snippets
 results/
