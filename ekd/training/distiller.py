@@ -338,10 +338,10 @@ class Distiller:
             kd_terms = []
             batch_size = valid_next.size(0)
             for i in range(batch_size):
-                mask = valid_next[i]
-                n_valid = int(mask.sum().item())
+                mask = valid_next[i]  # [L-1] - valid positions for sequence i
+                n_valid = int(mask.sum().item())  # Count valid positions
                 if n_valid < 3:
-                    continue
+                    continue # Skip sequences with too few valid tokens
                 k = max(1, min(n_valid, math.ceil(pct * n_valid)))
 
                 if score_enabled:
@@ -355,20 +355,26 @@ class Distiller:
                     _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
                     selected_abs = valid_idx[rel_idx]
                 else:
-                    valid_idx = torch.where(mask)[0]
-                    ent_valid_pos = ent_masked[i][mask]
+                    # Find indices of valid positions (all that aren't 0)
+                    valid_idx = torch.where(mask)[0] # [n_valid]
+                    ent_valid_pos = ent_masked[i][mask] # [n_valid], entropy of valid positions
                     _, rel_idx = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
-                    selected_abs = valid_idx[rel_idx]
+                    # Convert relative indices back to absolute sequence positions
+                    selected_abs = valid_idx[rel_idx] # [k]
 
                 kd_terms.append(kl_pos[i, selected_abs].mean())
 
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
 
         elif self.config.distill_type == "bucket":
+            # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
+            # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
+            # This excludes both the lowest 70% and highest 20% entropy tokens
+            
             if t_pred is None or t_log_probs is None:
                 raise ValueError("bucket distillation requires teacher predictions.")
 
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
@@ -380,7 +386,7 @@ class Distiller:
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
                 mask = valid_next[i]
-                if mask.sum().item() < 3:
+                if mask.sum().item() < 3:  # Need at least 3 tokens for bucket selection
                     continue
 
                 valid_idx = torch.where(mask)[0]
@@ -391,6 +397,7 @@ class Distiller:
                     score_valid = combined[mask].float()
                     if score_valid.numel() == 0:
                         continue
+                    # Calculate both thresholds
                     lower_thr = torch.quantile(score_valid, self.config.bucket_lower_percent / 100.0)
                     upper_thr = torch.quantile(score_valid, self.config.bucket_upper_percent / 100.0)
                     bucket_mask = (score_valid >= lower_thr) & (score_valid <= upper_thr)
@@ -402,8 +409,10 @@ class Distiller:
 
                 if bucket_mask.any():
                     selected_abs = valid_idx[bucket_mask]
+                    # Compute KL *only* for the selected tokens
                     kd_terms.append(kl_pos[i, selected_abs].mean())
 
+            # skip the batch if nothing selected
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
 
         elif self.config.distill_type == "linucb":
@@ -452,6 +461,7 @@ class Distiller:
                     keep = torch.zeros_like(valid_next_i)
                     keep[selected_indices] = True
                     if keep.any():
+                        # Compute KL *only* for the selected tokens
                         kd_terms.append(
                             self._kl_loss(
                                 t_log_probs[i][keep].to(self.student_device),
@@ -460,11 +470,13 @@ class Distiller:
                         )
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else:
-                kd_loss = t_pred.sum() * 0.0
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
 
         elif self.config.distill_type == "pos-rs-kd":
-            ent = self._entropy_for_selection(input_ids, t_pred)
+            # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
+            # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
+            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             kd_terms = []
             Bsz = t_pred.size(0)
             alpha = float(getattr(self.config, "rs_alpha", 1.0))
@@ -472,44 +484,53 @@ class Distiller:
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
 
             for i in range(Bsz):
-                valid_next_i = valid_next[i]
+                valid_next_i = valid_next[i]  # [L-1] bool of valid positions
                 valid_count = int(valid_next_i.sum().item())
                 if valid_count < 3:
                     continue
-                ent_valid = ent[i][valid_next_i].float()
-                ent_valid = torch.clamp(ent_valid, min=1e-8)
+                # Entropy over valid positions
+                ent_valid = ent[i][valid_next_i].float() # [n_valid]
+                ent_valid = torch.clamp(ent_valid, min=1e-8) # Make strictly positive for exponentiation
+                # q_un ∝ H^alpha (Unnormalized proposal distribution). Higher H -> higher sampling prob
                 if alpha == 0.0:
-                    q_un = torch.ones_like(ent_valid)
+                    q_un = torch.ones_like(ent_valid) # uniform if alpha=0
                 else:
                     q_un = ent_valid.pow(alpha)
 
                 q_un_sum = q_un.sum()
                 if q_un_sum <= 0:
+                    # fallback to uniform if degenerate
                     q = torch.full_like(q_un, 1.0 / q_un.numel())
                 else:
-                    q = q_un / q_un_sum
+                    q = q_un / q_un_sum  # normalize
+                    # floor to avoid zero probs
                     q = torch.clamp(q, min=q_floor)
-                    q = q / q.sum()
+                    q = q / q.sum()  # renormalize
 
                 k_count = max(1, int(valid_count * pct))
-                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)
+                # Sample indices within the "valid positions" subspace
+                # torch.multinomial expects probs sum to 1
+                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
 
-                valid_idx = torch.where(valid_next_i)[0]
-                selected_abs = valid_idx[sel_rel]
+                # Map relative -> absolute indices
+                valid_idx = torch.where(valid_next_i)[0]  # absolute positions
+                selected_abs = valid_idx[sel_rel]  # [k]
+                # KL on selected positions (like top-k branch)
                 idx_t = selected_abs.to(t_log_probs.device)
                 kl_sel = self._kl_loss(
                     t_log_probs[i, idx_t, :].to(self.student_device),
                     s_log_probs[i, selected_abs, :]
-                )
+                )  # [k]
 
-                q_sel = q[sel_rel]
+                # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.
+                q_sel = q[sel_rel]  # [k]
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                 w = w / w.sum()
                 kd_terms.append((kl_sel * w).sum())
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else:
-                kd_loss = t_pred.sum() * 0.0
+            else: # skip the batch if nothing selected
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
 
         else:
             raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
@@ -556,8 +577,7 @@ class Distiller:
             use_vocab_rs_kd = False
         # Score-based selection needs fresh teacher logits even if the cache could satisfy EKD,
         # because we require per-position KL and student CE statistics that aren't stored offline.
-        score_requires_teacher = bool(getattr(self.config, "score_token_selection", False)) \
-            and self.config.distill_type in {"top-k-tok", "bucket"}
+        score_requires_teacher = bool(getattr(self.config, "score_token_selection", False)) and self.config.distill_type in {"top-k-tok", "bucket"}
         need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd", "linucb"} or score_requires_teacher
         if use_vocab_rs_kd:
             # try offline cache to avoid teacher forward; fall back to teacher if cache missing
