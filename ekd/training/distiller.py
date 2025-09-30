@@ -333,29 +333,28 @@ class Distiller:
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-
         elif self.config.distill_type == "top-k-tok":
-            if t_pred is None or t_log_probs is None:
-                raise ValueError("top-k-tok distillation requires teacher predictions.")
+            # top-k% tokens by entropy among valid positions only
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent = ent_raw.masked_fill(~valid_next, float('-inf'))  # ignore invalid
 
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)
-            ent_masked = ent_raw.masked_fill(~valid_next, float('-inf'))
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))  # e.g. 0.2
 
-            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
-
+            # optional score-based selection context
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
             score_ctx = None
             if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
                 score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
+            # select positions first, then compute KL only on those
             kd_terms = []
             batch_size = valid_next.size(0)
             for i in range(batch_size):
                 mask = valid_next[i]  # [L-1] - valid positions for sequence i
-                n_valid = int(mask.sum().item())  # Count valid positions
+                n_valid = int(mask.sum().item())
                 if n_valid < 3:
-                    continue # Skip sequences with too few valid tokens
+                    continue
                 k = max(1, min(n_valid, math.ceil(pct * n_valid)))
 
                 if score_enabled:
@@ -365,29 +364,32 @@ class Distiller:
                     score_valid = combined[mask]
                     if score_valid.numel() == 0:
                         continue
-                    valid_idx = torch.where(mask)[0]
+                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
                     _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
-                    selected_abs = valid_idx[rel_idx]
+                    selected_topk_idx = valid_idx[rel_idx]  # [k]
                 else:
-                    # Find indices of valid positions (all that aren't 0)
-                    valid_idx = torch.where(mask)[0] # [n_valid]
-                    ent_valid_pos = ent_masked[i][mask] # [n_valid], entropy of valid positions
-                    _, rel_idx = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
+                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
+                    ent_valid_pos = ent[i][valid_idx] # [n_valid], entropy of valid positions
+                    _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
                     # Convert relative indices back to absolute sequence positions
-                    selected_abs = valid_idx[rel_idx] # [k]
+                    selected_topk_idx = valid_idx[selected_topk_pos]  # [k]
+                # Compute KL only on selected positions (sum over vocab, so [k])
+                idx_t = selected_topk_idx.to(t_log_probs.device)
+                kl_sel = self._kl_loss(
+                    t_log_probs[i, idx_t, :].to(self.student_device),
+                    s_log_probs[i, selected_topk_idx, :]
+                )  # [k]
+                kd_terms.append(kl_sel.mean())
 
-                kd_terms.append(kl_pos[i, selected_abs].mean())
-
-            kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+            if kd_terms:
+                kd_loss = torch.stack(kd_terms).mean()
+            else:
+                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
 
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
             # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
             # This excludes both the lowest 70% and highest 20% entropy tokens
-            
-            if t_pred is None or t_log_probs is None:
-                raise ValueError("bucket distillation requires teacher predictions.")
-
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
@@ -422,9 +424,9 @@ class Distiller:
                     bucket_mask = (ent_valid >= lower_thr) & (ent_valid <= upper_thr)
 
                 if bucket_mask.any():
-                    selected_abs = valid_idx[bucket_mask]
+                    selected_topk_idx = valid_idx[bucket_mask]
                     # Compute KL *only* for the selected tokens
-                    kd_terms.append(kl_pos[i, selected_abs].mean())
+                    kd_terms.append(kl_pos[i, selected_topk_idx].mean())
 
             # skip the batch if nothing selected
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
@@ -432,9 +434,6 @@ class Distiller:
         elif self.config.distill_type == "linucb":
             if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
-            if t_pred is None or t_log_probs is None:
-                raise ValueError("LinUCB distillation requires teacher predictions.")
-
             ent_raw = self._entropy_for_selection(input_ids, t_pred)
             t_log_probs_T1 = torch.log_softmax(t_pred, dim=-1)
             s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
@@ -529,12 +528,12 @@ class Distiller:
 
                 # Map relative -> absolute indices
                 valid_idx = torch.where(valid_next_i)[0]  # absolute positions
-                selected_abs = valid_idx[sel_rel]  # [k]
+                selected_topk_idx = valid_idx[sel_rel]  # [k]
                 # KL on selected positions (like top-k branch)
-                idx_t = selected_abs.to(t_log_probs.device)
+                idx_t = selected_topk_idx.to(t_log_probs.device)
                 kl_sel = self._kl_loss(
                     t_log_probs[i, idx_t, :].to(self.student_device),
-                    s_log_probs[i, selected_abs, :]
+                    s_log_probs[i, selected_topk_idx, :]
                 )  # [k]
 
                 # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.

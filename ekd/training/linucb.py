@@ -23,16 +23,18 @@ class LinUCBBandit:
 
         self.A = torch.eye(self.feature_dim, device=self.device, dtype=torch.float32) * self.lambda_
         self.b = torch.zeros(self.feature_dim, device=self.device, dtype=torch.float32)
-        self._ensure_A_inv()
+        self._factorize()
 
-    def _ensure_A_inv(self) -> None:
-        # Numerical guard before inversion; keeps A positive-definite.
+    def _factorize(self) -> None:
+        # Numerical guard before factorization; keeps A positive-definite.
         jitter = 1e-6 * torch.eye(self.feature_dim, device=self.device, dtype=torch.float32)
-        self._A_inv = torch.linalg.inv(self.A + jitter)
+        self._L = torch.linalg.cholesky(self.A + jitter)
 
     @property
     def theta(self) -> Tensor:
-        return self._A_inv @ self.b
+        # Solve A θ = b via Cholesky (A = L L^T)
+        y = torch.cholesky_solve(self.b.unsqueeze(1), self._L)
+        return y.squeeze(1)
 
     @torch.no_grad()
     def select(
@@ -47,11 +49,12 @@ class LinUCBBandit:
             return torch.zeros(0, dtype=torch.bool), torch.zeros(0, dtype=torch.float32)
 
         ctx = contexts.to(self.device, dtype=torch.float32)
-        self._ensure_A_inv()
+        self._factorize()
         theta = self.theta
         mean = ctx @ theta
-        Ax = ctx @ self._A_inv
-        quad = (Ax * ctx).sum(dim=1).clamp_min(1e-12)
+        # Solve A x = ctx^T for each row (batched)
+        x = torch.cholesky_solve(ctx.t(), self._L)   # [D,N]
+        quad = (ctx * x.t()).sum(dim=1).clamp_min(1e-12)
         conf = self.alpha * torch.sqrt(quad)
         scores = mean + conf
         mask = scores > threshold
@@ -77,4 +80,4 @@ class LinUCBBandit:
         rew = rewards.to(self.device, dtype=torch.float32)
         self.A = self.A + ctx.t() @ ctx
         self.b = self.b + ctx.t() @ rew
-        self._ensure_A_inv()
+        self._factorize()
