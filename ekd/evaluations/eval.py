@@ -232,7 +232,7 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
             pass
     print(f"Exporting model from base '{base_model_dir}' with state_dict '{ckpt_path.name}' -> '{export_dir}'")
     tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=False, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(base_model_dir, dtype=torch.float16, device_map=None, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(base_model_dir, from_pretrained=torch.float16, device_map=None, trust_remote_code=True)
     chk = torch.load(ckpt_path, map_location="cpu")
     state = chk.get("model_state_dict")
     if state is None:
@@ -288,7 +288,10 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 
 # NOTE: Task names follow lm-eval harness conventions. Some tasks may be unavailable
 # in older harness versions; failures are tolerated and reported.
-# LIGHT suite (coffee-break): strict caps via --limit (first-N selection by harness)
+# LIGHT suite (coffee-break): each tuple is (task, sample_count). We attempt to
+# draw a SEEDED RANDOM subset of that many samples per task (when the lm-eval CLI
+# supports random limiting). If the installed lm-eval version lacks such a flag,
+# we fall back to the harness default (typically first-N) and print a warning.
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
     ("gsm8k", 50),
@@ -297,10 +300,11 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     ("arc_challenge", 300),
     ("arc_easy", 300),
-    ("hellaswag", 500),
-    ("piqa", 500),
+    # ("hellaswag", 500),
+    # ("piqa", 500),
     # exact-match
     ("aime25", None),
+    ("ifeval", None)
 ]
 # Optional tiny adds (off by default): BoolQ 200, HumanEval full
 LIGHT_ENABLE_OPTIONALS = os.environ.get("LIGHT_EXTRAS", "0") == "1"
@@ -315,7 +319,6 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("svamp", None),
     ("asdiv", None), # arithmetic subset (ASDiv-A handled inside task)
     ("hendrycks_math", None),  # MATH
-    ("aime24", None),
     ("aime25", None),
     ("olympiadbench", None),
     ("piqa", None),
@@ -342,8 +345,7 @@ TASK_TIMEOUTS = {
     "hellaswag": 1200,
     "svamp": 900,
     "gsm8k": 1200,
-    "aime24": 900,
-    "aime25": 2100,
+    "aime25": 2000,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,
@@ -367,7 +369,7 @@ def run_lmeval_suite(
     results_dir: Path,
     gpu_ids: List[int],
     suite: str,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], Dict[str, str]]:
     """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
@@ -413,6 +415,17 @@ def run_lmeval_suite(
         _available = set()
 
     # Include local task YAMLs if present
+    # Seed for downstream tools; default to env or EVAL_SEED set by main
+    seed = int(os.environ.get("EVAL_SEED", "42"))
+    # Probe lm-eval CLI support for seed and random limiting (version-dependent)
+    _help_code, _help_out = run(["lm-eval", "--help"])
+    _has_seed_flag = _help_code == 0 and ("--seed" in _help_out)
+    _has_fewshot_seed_flag = _help_code == 0 and ("--fewshot-seed" in _help_out)
+    _lm_eval_supports_seed = _has_seed_flag or _has_fewshot_seed_flag
+    # Random limiting flags have changed across versions; detect both variants
+    _has_limit_type = _help_code == 0 and ("--limit-type" in _help_out)
+    _has_limit_mode = _help_code == 0 and ("--limit_mode" in _help_out)
+
     base_args = [
         "lm-eval",
         "--model", "hf",
@@ -420,8 +433,15 @@ def run_lmeval_suite(
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
+    if _has_seed_flag:
+        base_args += ["--seed", str(seed)]
+    elif _has_fewshot_seed_flag:
+        base_args += ["--fewshot-seed", str(seed)]
+
+    _warned_no_random_limit = False
 
     def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
+        nonlocal _warned_no_random_limit
         cmd = base_args + ["--tasks", task, "--device", device]
         # Some generate_until tasks stall when probing batch_size=auto; force bs=1
         GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
@@ -431,9 +451,19 @@ def run_lmeval_suite(
             cmd += ["--batch_size", "auto"]
         if isinstance(limit, (int, float)):
             cmd += ["--limit", str(limit)]
+            # Prefer randomized subset selection when supported by this lm-eval version
+            if _has_limit_type:
+                cmd += ["--limit-type", "random"]
+            elif _has_limit_mode:
+                cmd += ["--limit_mode", "random"]
+            else:
+                if not _warned_no_random_limit:
+                    print("[lm-eval] Warning: CLI lacks a random subset flag; using first-N for --limit.")
+                    _warned_no_random_limit = True
         return cmd
 
     # Parallel across physical GPUs (mask each process to one GPU)
+    task_status: Dict[str, str] = {}
     good_any = False
     i = 0
     while i < len(tasks_with_limits):
@@ -449,6 +479,10 @@ def run_lmeval_suite(
             if env.get("PYTHONPATH"):
                 py_path_parts.append(env["PYTHONPATH"])
             env["PYTHONPATH"] = ":".join(py_path_parts)
+            # Propagate seed-related env for deterministic child runs
+            env.setdefault("PYTHONHASHSEED", str(seed))
+            env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+            env.setdefault("EVAL_SEED", str(seed))
             cmd = _task_cmd(task, limit, "cuda:0")
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
@@ -458,13 +492,16 @@ def run_lmeval_suite(
             timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
                 print(f"[{timestamp}] ✅ Task {task} completed successfully")
+                task_status[task] = "ok"
                 good_any = True
             elif rc == 124:
                 print(f"[{timestamp}] ⏰ Task {task} timed out after {to} seconds")
+                task_status[task] = "timeout"
             else:
                 print(f"[{timestamp}] ❌ Task {task} failed with code {rc}")
+                task_status[task] = f"failed:{rc}"
         i += len(gpu_ids)
-    return out_dir if good_any else None
+    return out_dir if good_any else None, task_status
 
 # ---------- Lighteval (summarization) ----------
 def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
@@ -767,12 +804,18 @@ def print_latex_table(all_models_metrics: Dict[str, Dict[str, Dict[str, float]]]
     print(r"\end{tabular}")
     print(r"\end{table}")
 
+def save_json(obj: dict, path: Path) -> None:
+    """Persist a Python dict to pretty-printed UTF-8 JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+    print(f"[json] Wrote {path}")
+
 # ---------- Main pipeline ----------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model_dir", type=str, required=True, help="HF dir used to initialize the student (architecture + tokenizer).")
-    parser.add_argument("--vanilla_ckpt_dir", type=str, default="kd_vanilla_run_out_model")
-    parser.add_argument("--ekd_ckpt_dir", type=str, default="kd_ekd_run_out_model")
+    # Single input: trained student model path (either HF dir or .pt checkpoint). We'll auto-detect.
+    parser.add_argument("model", type=str, help="Path to trained student model: HF directory (preferred) or a .pt checkpoint.")
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
@@ -787,16 +830,16 @@ def main():
     # Suite selection
     parser.add_argument("--suite", type=str, choices=["light", "heavy"], default="light",
                         help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
-    # Optional: evaluate a single tag+checkpoint instead of both latest
-    parser.add_argument("--tag", type=str, choices=["vanilla", "ekd"], help="Evaluate only this run type (vanilla or ekd).")
-    parser.add_argument("--checkpoint_path", type=str, help="Path to a specific checkpoint .pt to evaluate (used with --tag).")
+    # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
     exports_dir = work_dir / "exports"
     results_dir = work_dir / "results"
+    json_results_dir = Path("evaluation_json_results")
     ensure_dir(exports_dir)
     ensure_dir(results_dir)
+    ensure_dir(json_results_dir)
 
     # Build GPU pool
     if args.gpu_ids:
@@ -807,27 +850,31 @@ def main():
         gpu_pool = gpu_pool[: args.max_parallel]
     print(f"[gpu] Using GPUs: {gpu_pool}" if gpu_pool else "[gpu] No GPUs detected/selected.")
 
-    # Prepare models (export with caching)
+    # Resolve the single model dir to evaluate
+    in_path = Path(args.model)
+    tag = in_path.stem if in_path.is_file() else in_path.name
     model_specs: List[Tuple[str, Path]] = []
-    if args.tag and args.checkpoint_path:
-        tag = args.tag
-        ckpt = Path(args.checkpoint_path)
-        if not ckpt.exists():
-            print(f"Error: checkpoint not found: {ckpt}")
+    if in_path.is_dir():
+        print(f"[models] Using HF model directory: {in_path}")
+        model_specs.append((tag, in_path))
+    elif in_path.is_file() and in_path.suffix == ".pt":
+        # Export HF dir based on base_model_dir recorded in checkpoint
+        try:
+            chk = torch.load(in_path, map_location="cpu")
+        except Exception as e:
+            print(f"Error loading checkpoint {in_path}: {e}")
             sys.exit(2)
-        export_dir = exports_dir / f"{tag}_export_{ckpt.stem}"
-        export_hf_model(args.base_model_dir, ckpt, export_dir)
+        base_model_dir = chk.get("base_model_dir") or chk.get("base_model") or chk.get("student_model")
+        if not base_model_dir:
+            print("Error: checkpoint does not record base_model_dir. Re-train with newer code or evaluate a ready HF model directory.")
+            sys.exit(2)
+        export_dir = exports_dir / f"export_{in_path.stem}"
+        print(f"[export] Exporting HF model from base='{base_model_dir}' and ckpt='{in_path.name}' -> '{export_dir}'")
+        export_hf_model(base_model_dir, in_path, export_dir)
         model_specs.append((tag, export_dir))
     else:
-        for tag, ckdir in [("vanilla", args.vanilla_ckpt_dir), ("ekd", args.ekd_ckpt_dir)]:
-            ckpt_dir = Path(ckdir)
-            ckpt = find_latest_checkpoint(ckpt_dir)
-            if ckpt is None:
-                print(f"Warning: no checkpoints in {ckpt_dir}, skipping {tag}")
-                continue
-            export_dir = exports_dir / f"{tag}_export"
-            export_hf_model(args.base_model_dir, ckpt, export_dir)
-            model_specs.append((tag, export_dir))
+        print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
+        sys.exit(2)
 
     if not model_specs:
         print("No models exported. Exiting.")
@@ -839,7 +886,7 @@ def main():
         print(f"\n=== Running benchmarks for {tag} (suite={args.suite}) ===")
 
         # LM-Eval (parallel across GPUs according to the chosen suite)
-        lmeval_root = run_lmeval_suite(
+        lmeval_root, task_status = run_lmeval_suite(
             model_dir=model_dir,
             tag=tag,
             results_dir=results_dir,
@@ -882,6 +929,12 @@ def main():
             hb_metrics
         ])
         all_models_metrics[tag] = merged
+
+        # --- Save results to JSON for this model ---
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
+        payload = {"tag": tag, "suite": args.suite, "results": merged, "task_status": task_status}
+        save_json(payload, json_result_file)
 
         # Log results to W&B and TensorBoard
         try:

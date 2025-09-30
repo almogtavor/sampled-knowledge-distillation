@@ -1,17 +1,17 @@
 import argparse
+import random
+import numpy as np
 from pathlib import Path
 from datetime import datetime
-import os, shutil
+import os
 from typing import List, Tuple, Optional
 
 import torch
-from transformers.utils import is_torch_cuda_available
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
-from ekd.models.ollama_loader import OllamaModel
 from ekd.training.distiller import Distiller
 from ekd.config import TrainingConfig
 from datasets import load_dataset
@@ -20,13 +20,14 @@ from datasets import load_dataset
 try:
     from ekd.logging.wandb_utils import create_training_combined_logger
 except ImportError:
-    create_training_combined_logger = lambda *args, **kwargs: None
+    def create_training_combined_logger(*args, **kwargs):
+        return None
 
 
 def load_teacher_with_fallback(
     model_name: str,
-    prefer_gpus: List[int],          # GPUs to use for the teacher, in order of preference
-    student_gpu: Optional[int],      # GPU reserved for the student (exclude from teacher)
+    prefer_gpus: List[int],          # Local GPU indices to use for the teacher, in order of preference
+    student_gpu: Optional[int],      # Local GPU index reserved for the student (exclude from teacher)
 ) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
     """
     1) Try single-GPU FP16 on prefer_gpus[0]
@@ -35,9 +36,7 @@ def load_teacher_with_fallback(
     4) If still OOM, try 4-bit on single GPU
     Returns: (teacher_model, tokenizer, teacher_device_for_inputs)
     """
-    # Helper: make a local offload/cache dir (per job if SLURM)
-    job_id = os.environ.get("SLURM_JOB_ID", "nojid")
-    # Use TMPDIR which is already set up in the SLURM script
+    # Helper: make a local offload/cache dir (per job if SLURM), prefer node-local TMPDIR
     tmpdir = os.environ.get("TMPDIR", "/home/joberant/NLP_2425b/almogt/ekd/tmp")
     offload_dir = os.path.join(tmpdir, "hf_offload_teacher")
     os.makedirs(offload_dir, exist_ok=True)
@@ -116,8 +115,51 @@ def load_teacher_with_fallback(
         except Exception as e:
             print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
 
+    # Helper: check if BitsAndBytes + Triton backend are usable in this env
+    def _bnb_triton_available() -> bool:
+        try:
+            # transformers integration class
+            from transformers import BitsAndBytesConfig  # noqa: F401
+        except Exception:
+            return False
+        try:
+            import bitsandbytes as bnb  # noqa: F401
+        except Exception:
+            return False
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            return False
+        # Some bnb builds require triton.ops; probe a representative module
+        try:
+            import importlib
+            importlib.import_module("bitsandbytes.triton.int8_matmul_mixed_dequantize")
+        except Exception:
+            return False
+        return True
+
+    # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
+    try:
+        import importlib
+        _torch_ver = getattr(torch, "__version__", "?")
+        try:
+            _triton = importlib.import_module("triton")
+            _triton_ver = getattr(_triton, "__version__", "installed")
+        except Exception:
+            _triton_ver = "not-installed"
+        try:
+            _bnb = importlib.import_module("bitsandbytes")
+            _bnb_ver = getattr(_bnb, "__version__", "installed")
+        except Exception:
+            _bnb_ver = "not-installed"
+        print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
+    except Exception:
+        pass
+
     # ===== 3) 8-bit quantization on single GPU =====
     try:
+        if not _bnb_triton_available():
+            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
         from transformers import BitsAndBytesConfig
         q8 = BitsAndBytesConfig(load_in_8bit=True)
         one = teacher_gpus[0]
@@ -139,6 +181,8 @@ def load_teacher_with_fallback(
 
     # ===== 4) 4-bit quantization on single GPU (last resort) =====
     try:
+        if not _bnb_triton_available():
+            raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
         from transformers import BitsAndBytesConfig
         q4 = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -164,6 +208,35 @@ def load_teacher_with_fallback(
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
+def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337):
+    """
+    Stream FineWeb-Edu and take ~max_tokens worth of text, reproducibly.
+    Returns a list of {prompt, answer} examples.
+    """
+    print(f"[fineweb] Streaming HuggingFaceFW/fineweb-edu with token budget={max_tokens:,}, seed={seed}")
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+
+    # Shuffle with fixed seed for reproducibility (uses a buffer)
+    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+
+    total_tokens = 0
+    examples = []
+    for ex in ds:
+        txt = ex.get("text", None)
+        if not txt:
+            continue
+        # Tokenize with the same tokenizer used for training
+        ids = tokenizer(txt)["input_ids"]
+        n_tokens = len(ids)
+        if total_tokens + n_tokens > max_tokens:
+            break
+        examples.append({"prompt": txt, "answer": ""})
+        total_tokens += n_tokens
+
+    print(f"[fineweb] Sampled ~{len(examples)} docs, {total_tokens:,} tokens")
+    return examples
+
+
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
     parser = argparse.ArgumentParser(description="Entropy-guided KD for LLMs")
@@ -173,8 +246,17 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Optionally quantize student for memory (not typical during training)")
     parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
-    parser.add_argument("--rs_kd_proposal_temp", type=int, default=1, help="for pos-rs-kd only")
-    parser.add_argument("--kd_temperature", type=int, default=1, help="for pos-rs-kd only")
+    parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
+    parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
+    # KD temperature annealing controls
+    parser.add_argument("--anneal_kd_temperature", action="store_true", default=False,
+                        help="Enable annealing of kd_temperature during training")
+    parser.add_argument("--kd_temperature_start", type=float, default=2.0,
+                        help="Starting KD temperature when annealing is enabled")
+    parser.add_argument("--kd_temperature_end", type=float, default=1.0,
+                        help="Final KD temperature when annealing is enabled")
+    parser.add_argument("--kd_hold_frac", type=float, default=0.6,
+                        help="Fraction of total updates to hold at start temperature before linear decay")
     # RS-KD (position-sampling) hyperparams
     parser.add_argument("--rs_alpha", type=float, default=1.0,
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
@@ -203,6 +285,8 @@ def parse_args_to_config() -> TrainingConfig:
                         help="name of text prompt column for HF datasets")
     parser.add_argument("--answer_col", type=str, default=None,
                         help="name of answer column for HF datasets")
+    parser.add_argument("--fineweb_tokens", type=int, default=50_000_000,
+                        help="Token budget when streaming FineWeb-Edu (used when datasets[0] == 'fineweb')")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
@@ -228,12 +312,18 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Disable offline caching mode (use online teacher forward pass).")
     parser.add_argument("--offline_cache_dir", type=str, default=None,
                         help="Where to store/read the offline teacher cache (defaults under output_dir).")
-    parser.add_argument("--entropy_approx_m", type=int, default=20,
-                        help="Top-k for truncated-entropy approximation (Sec. 3.6), m=20 by default.")
-    parser.add_argument("--rs_vocab_samples", type=int, default=64,
-                        help="How many vocab tokens to sample per position for RS-KD.")
+    parser.add_argument("--entropy_approx_m", type=int, default=12,
+                        help="Top-k for truncated-entropy approximation, m=12 by default.")
+    parser.add_argument("--rs_vocab_samples", type=int, default=12,
+                        help="How many vocab tokens to sample per position for RS-KD. 36 bytes per position")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
+    # Reproducibility
+    default_seed = int(os.environ.get("SEED", "1337"))
+    default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
+    parser.add_argument("--seed", type=int, default=default_seed, help="Random seed for reproducibility")
+    parser.add_argument("--deterministic", action="store_true", default=default_det,
+                        help="Enable deterministic algorithms (may slow down, sets cudnn.deterministic and use_deterministic_algorithms)")
     args = parser.parse_args()
     
     # Convert argparse Namespace to TrainingConfig
@@ -244,12 +334,43 @@ def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
 
+    # global seeding
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+
+    # Optional deterministic mode
+    if getattr(config, "deterministic", False):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+
+    # Prefer node-local tmp to avoid NFS .nfs tombstones on cleanup
+    # If SLURM provides a local scratch (e.g., /dev/shm), use it; fall back to repo tmp
+    node_tmp = os.environ.get("TMPDIR")
+    if not node_tmp:
+        shm_candidate = f"/dev/shm/{os.environ.get('USER', 'user')}.ekd.{os.environ.get('SLURM_JOB_ID', 'local')}"
+        try:
+            os.makedirs(shm_candidate, exist_ok=True)
+            node_tmp = shm_candidate
+        except Exception:
+            node_tmp = f"/home/joberant/NLP_2425b/{os.environ.get('USER', 'user')}/ekd/tmp"
+        os.environ["TMPDIR"] = node_tmp
+    # Point HF caches to tmp (can still hit shared cache via symlink if needed)
+    os.environ.setdefault("HF_HOME", os.path.join(node_tmp, "hf"))
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
     # Set CUDA memory management settings for better memory efficiency
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # Clear any cached memory
         
-    # Speed optimizations (safe)
-    torch.backends.cudnn.benchmark = True
+    # Speed optimizations (safe) or deterministic fallback
+    if getattr(config, "deterministic", False):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
@@ -265,29 +386,39 @@ def main():
         total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
     print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
 
-    # Dynamic GPU allocation based on CUDA_VISIBLE_DEVICES
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    avail = [int(x) for x in visible.split(",")] if visible else list(range(device_count))
-    student_gpu = avail[1] if len(avail) >= 2 else avail[0]
-    student_device = torch.device(f"cuda:{student_gpu}")
-    prefer_for_teacher = [g for g in avail if g != student_gpu]
+    # Dynamic GPU allocation normalized to local indices [0..N-1]
+    # When CUDA_VISIBLE_DEVICES=1,3,4,5, local torch sees devices as [0,1,2,3]
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd:
+        physical = [int(x) for x in cvd.split(",") if x != ""]
+        # local indices are 0..len(physical)-1
+        local_avail = list(range(len(physical)))
+    else:
+        physical = list(range(device_count))
+        local_avail = list(range(device_count))
+
+    # Reserve one local GPU for student (pick 1 if exists else 0)
+    student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
+    student_device = torch.device(f"cuda:{student_local}")
+    # Teacher uses remaining local indices
+    teacher_locals = [g for g in local_avail if g != student_local]
     
-    print(f"CUDA_VISIBLE_DEVICES: {visible}")
-    print(f"Available GPUs: {avail}")
-    print(f"Student GPU: {student_gpu}")
-    print(f"Teacher GPUs: {prefer_for_teacher}")
+    print(f"CUDA_VISIBLE_DEVICES: {cvd}")
+    print(f"Available GPUs (local indices): {local_avail}")
+    print(f"Student GPU (local): {student_local}")
+    print(f"Teacher GPUs (local): {teacher_locals}")
 
     print("Loading teacher with GPU-first fallback...", flush=True)
     teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
         model_name=config.teacher_model,
-        prefer_gpus=prefer_for_teacher,
-        student_gpu=student_gpu,
+        prefer_gpus=teacher_locals,
+        student_gpu=student_local,
     )
 
     print("Loading student on its own GPU...", flush=True)
     student = load_model(  # your existing helper is fine for student
         config.student_model,
-        device_map=student_gpu,     # {'': 1}
+        device_map=student_local,     # {'': 1} but using local index
         quant_bits=config.student_quant_bits,
     )
 
@@ -316,20 +447,34 @@ def main():
         # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
     else:
-        # Load from Hugging Face dataset if user passes HF dataset name
-        print(f"Loading Hugging Face dataset: {config.datasets[0]}")
-        hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
-            else load_dataset(config.datasets[0])["train"]
-        print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-        examples = []
-        for ex in hf_dataset:
-            examples.append({
-                "prompt": ex[config.prompt_col],
-                "answer": ex[config.answer_col],
-            })
-        dataset = examples
+        # Special-case: FineWeb-Edu streaming with token budget
+        if config.datasets[0].lower() == "fineweb":
+            budget = int(getattr(config, "fineweb_tokens", 50_000_000))
+            print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
+            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed)
+        else:
+            # Load from Hugging Face dataset if user passes HF dataset name
+            print(f"Loading Hugging Face dataset: {config.datasets[0]}")
+            hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
+                else load_dataset(config.datasets[0])["train"]
+            print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
+            examples = []
+            for ex in hf_dataset:
+                examples.append({
+                    "prompt": ex[config.prompt_col],
+                    "answer": ex[config.answer_col],
+                })
+            dataset = examples
 
     collate = DistillCollator(tok, config.max_seq_len)
+    # Seeded DataLoader generator for reproducible shuffling
+    gen = torch.Generator()
+    gen.manual_seed(config.seed)
+    def _seed_worker(worker_id: int):
+        base = int(config.seed)
+        np.random.seed(base + worker_id)
+        random.seed(base + worker_id)
+
     dl = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -337,7 +482,9 @@ def main():
         collate_fn=collate,
         num_workers=min(8, os.cpu_count() or 1),
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
+        generator=gen,
+        worker_init_fn=_seed_worker,
     )
 
     # Initialize logging with experiment name

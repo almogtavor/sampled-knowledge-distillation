@@ -22,3 +22,7 @@ manual_tasks:
     process_docs: !function ekd.evaluations.utils.process_docs_aimo
     process_results: !function ekd.evaluations.utils.process_results_numeric_em
     num_fewshot: 0
+
+  - task: ifeval
+    dataset_path: ifeval
+    num_fewshot: 0

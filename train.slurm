@@ -15,7 +15,31 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
+EVAL_SUITE=${3:-}
+EPOCHS="${4:-${EPOCHS:-3}}"   # default 3, override via env
+ANNEAL_FLAG=${5:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
+START_TIME=$(date -u)
+START_TIME_EPOCH=$(date +%s)
+echo "Job started at $START_TIME"
+
+# Convert hyphens to underscores for directory names
+DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
+
+# Default virtual environment directory
+VENV_DIR="$PWD/fastenv310_3_new"
+
+echo "=== Job Parameters ==="
+echo "SLURM_JOB_ID      = ${SLURM_JOB_ID:-N/A}"
+echo "DISTILL_TYPE      = $DISTILL_TYPE"
+echo "K_PERCENT         = $K_PERCENT"
+echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
+echo "VENV_DIR          = $VENV_DIR"
+echo "OUTPUT_DIR        = $OUTPUT_DIR"
+echo "User              = $USER"
+echo "GPUs requested    = $SLURM_GPUS"
+echo "======================"
 
 # ---------- caches / env ----------
 mkdir -p logs
@@ -30,7 +54,29 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
-# Default virtual environment directory
+# ---------- Weights & Biases ----------
+export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
+export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
+export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
+export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_DISABLED=${WANDB_DISABLED:-false}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
+# Group/name/id make the UI nice for shell-based sweeps
+export KD_SWEEP_NAME="${KD_SWEEP_NAME:-$(date +%Y%m%d_%H%M)-$DISTILL_TYPE}"
+export WANDB_GROUP="${WANDB_GROUP:-${KD_SWEEP_NAME:-manual}-$(echo "$DISTILL_TYPE" | tr '-' '_')-k${K_PERCENT}}"
+export WANDB_NOTES="slurm_id=$SLURM_JOB_ID; k=$K_PERCENT; eval=${EVAL_SUITE:-none}; anneal=${ANNEAL_FLAG:-none}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-${SLURM_JOB_ID}_${K_PERCENT}_${DISTILL_TYPE}}"
+
+echo "=== Weights & Biases ==="
+echo "W&B PROJECT        = $WANDB_PROJECT"
+echo "W&B ENTITY         = ${WANDB_ENTITY:-<user>}"
+echo "W&B GROUP          = $WANDB_GROUP"
+echo "W&B RUN_ID         = $WANDB_RUN_ID"
+echo "W&B MODE/DISABLED  = $WANDB_MODE / $WANDB_DISABLED"
+echo "======================"
+
 VENV_DIR="$PWD/fastenv310_3_new"
 
 # Check if a custom venv name is passed as a parameter
@@ -41,8 +87,8 @@ for arg in "$@"; do
   fi
 done
 
-# ---------- pick a python3 available on the node ----------
-PY_SYS="$(command -v python3 || true)"
+# ---------- pick a python3 available on the node (prefer 3.10 for bnb/triton compat) ----------
+PY_SYS="$(command -v python3.10 || command -v python3 || true)"
 if [[ -z "${PY_SYS}" ]]; then
   echo "ERROR: python3 not found on this node."
   exit 1
@@ -105,6 +151,22 @@ if [[ -f requirements.txt ]]; then
   $PY -m pip install --no-cache-dir -r "$TMP_REQ"
 fi
 
+# Ensure triton and bitsandbytes are installed (defensive)
+$PY - <<'PY' >/dev/null 2>&1
+import importlib, sys
+missing = []
+for mod in ("triton", "bitsandbytes"):
+    try:
+        importlib.import_module(mod)
+    except Exception:
+        missing.append(mod)
+sys.exit(0 if not missing else 1)
+PY
+if [[ $? -ne 0 ]]; then
+  echo "Installing triton==2.2.0 and bitsandbytes==0.43.3 (post-reqs)"
+  $PY -m pip install --no-cache-dir triton==2.2.0 bitsandbytes==0.43.3
+fi
+
 # ---------- GPU reorder by free VRAM ----------
 if command -v nvidia-smi >/dev/null 2>&1; then
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -144,20 +206,17 @@ except Exception as e:
 PY
 
 # ---------- launch ----------
-# Convert hyphens to underscores for directory names
-DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
 unset PYTHONPATH PYTHONHOME
-exec "$PY" ekd_distill.py \
+"$PY" ekd_distill.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
-  --k_percent 20 \
+  --k_percent "$K_PERCENT" \
   --datasets "gsm8k" \
   --dataset_config "main" \
   --prompt_col "question" \
   --answer_col "answer" \
-  --epochs 3 \
+  --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
   --checkpoint_steps 250 \
@@ -165,4 +224,23 @@ exec "$PY" ekd_distill.py \
   --max_seq_len 384 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
-  --output_dir "$OUTPUT_DIR"
+  --output_dir "$OUTPUT_DIR" \
+  --seed "${SEED:-1337}" \
+  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
+  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)
+
+END_TIME=$(date -u)
+END_TIME_EPOCH=$(date +%s)
+ELAPSED=$((END_TIME_EPOCH - START_TIME_EPOCH))
+
+echo "Job started at $START_TIME"
+echo "Job finished at $END_TIME"
+echo "Total elapsed time: $ELAPSED seconds"
+
+if [[ -n "$EVAL_SUITE" ]]; then
+  echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE"
+  echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
+else
+  echo "No eval suite provided → skipping eval submission."
+fi

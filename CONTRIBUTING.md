@@ -15,13 +15,20 @@ cd /home/joberant/NLP_2425b/YOUR_USER/ekd/
 ### 3. Create virtual environment:
 ```bash
 python3.10 -m venv --without-pip fastenv310
-curl -sS https://bootstrap.pypa.io/get-pip.py | python
+source ./fastenv310/bin/activate
 ```
 
 ### 4. Install dependencies:
 ```bash
-source ./fastenv310/bin/activate
-python -m pip install --no-cache-dir --prefer-binary --only-binary=:all: --index-url https://download.pytorch.org/whl/cu118 -r requirements.txt
+curl -sS https://bootstrap.pypa.io/get-pip.py | python
+export TMPDIR="$PWD/tmp"; mkdir -p "$TMPDIR"
+export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
+export PIP_CACHE_DIR="$TMPDIR/pip-cache"
+
+pip install --extra-index-url https://download.pytorch.org/whl/cu118 \
+    torch==2.2.2+cu118 torchvision==0.17.2+cu118 torchaudio==2.2.2+cu118
+
+pip install --prefer-binary -r requirements.txt
 ```
 
 ## 📁 Sync Local Changes to Remote
@@ -38,9 +45,9 @@ watch -n 5 'rsync -avz ./ YOUR_USER@c-001.cs.tau.ac.il:/home/joberant/NLP_2425b/
 
 ## 🏃 Training Commands
 
-### Submit EKD training:
+### Submit Top K tokens training:
 ```bash
-sbatch train.slurm ekd
+sbatch train.slurm top-k-tok
 ```
 
 ### Submit Vanilla training:
@@ -122,6 +129,34 @@ tail -f logs/eval.<jobid>.log
 - Final trained model: `kd_ekd_run_out_model/model.safetensors`
 
 ### Evaluation details:
+## 🧪 Model Evaluation
+
+### Submit evaluation job (HF dir or checkpoint)
+
+The evaluator now accepts a single model path:
+- HF model directory (preferred), e.g. `kd_top_k_tok_run_out_models/model_2617`
+- or a `.pt` checkpoint, which will be exported automatically to a temporary HF directory
+
+```bash
+# SLURM (recommended)
+sbatch evals.slurm <MODEL_PATH> <SUITE: light|heavy>
+
+# Direct (if you already have an env active)
+python -m ekd.evaluations.eval <MODEL_PATH> --suite light
+```
+
+**Examples:**
+```bash
+# Evaluate a ready HF model directory (no export)
+sbatch evals.slurm kd_top_k_tok_run_out_models/model_2617 light
+
+# Evaluate a raw checkpoint (auto-export)
+sbatch evals.slurm kd_top_k_tok_run_out_models/checkpoints/checkpoint_epoch2_step5055.pt heavy
+```
+
+No need to specify the original base model; the evaluator reads it from the checkpoint if needed.
+
+### Monitor evaluation
 - **Benchmarks**: LM-Eval, Lighteval, EvalPlus, AlpacaEval
 - **GPU allocation**: Automatic fallback (3→2→1 GPUs as available)
 - **Cache management**: Handled via SLURM environment variables
@@ -130,8 +165,9 @@ tail -f logs/eval.<jobid>.log
 ## � Entropy Ablation (Top‑k overlap)
 
 Use `ablate.slurm` to run the entropy agreement ablation between exact entropy and truncated Top‑k+Tail.
-
+sbatch ablate.slurm --model <HF_MODEL_DIR_OR_ID> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]
 General form (sbatch forwards flags directly to the Python tool):
+    --model kd_top_k_tok_run_out_models/model_2617 
 
 ```bash
 sbatch ablate.slurm --model <MODEL_OR_DIR> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]

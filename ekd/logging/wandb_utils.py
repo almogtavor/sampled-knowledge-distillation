@@ -8,7 +8,7 @@ Weights & Biases and TensorBoard.
 
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from datetime import datetime
 
 # Optional imports
@@ -24,6 +24,10 @@ try:
 except ImportError:
     TENSORBOARD_AVAILABLE = False
 
+    if TYPE_CHECKING:
+        # For type checkers/linting only; avoids runtime import cycles
+        from ekd.config import TrainingConfig
+
 
 class WandBLogger:
     """W&B logging utility for EKD project."""
@@ -31,32 +35,61 @@ class WandBLogger:
     def __init__(
         self,
         project: str = "selective-entropy-knowledge-distillation",
-        entity: str = "selective-entropy-knowledge-distillation",
+        entity: Optional[str] = None,
         name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         tags: Optional[list] = None,
+        group: Optional[str] = None,
+        job_type: Optional[str] = None,
+        notes: Optional[str] = None,
+        resume: str = "allow",
+        run_id: Optional[str] = None,
     ):
-        self.project = project
-        self.entity = entity
+        # Allow environment to override
+        self.project = os.getenv("WANDB_PROJECT", project)
+        self.entity  = os.getenv("WANDB_ENTITY", entity or "") or None
+        self.group   = os.getenv("WANDB_GROUP", group)
+        self.job_type= os.getenv("WANDB_JOB_TYPE", job_type)
+        self.notes   = os.getenv("WANDB_NOTES", notes)
+        resume_env   = os.getenv("WANDB_RESUME", resume)
+        run_id_env   = os.getenv("WANDB_RUN_ID", run_id)
         self.run = None
-        self.enabled = WANDB_AVAILABLE and os.getenv("WANDB_API_KEY") is not None
-        
+
+        def _is_rank0():
+            return os.getenv("RANK") in (None, "0") and os.getenv("LOCAL_RANK") in (None, "0") and os.getenv("SLURM_PROCID") in (None, "0")
+
+        offline = os.getenv("WANDB_MODE", "online") == "offline" or os.getenv("WANDB_DISABLED", "").lower() in ("true", "1")
+        self.enabled = WANDB_AVAILABLE and _is_rank0() and not offline
+
         if self.enabled:
             try:
-                wandb.login(key=os.getenv("WANDB_API_KEY"))
+                # Login if key present; else rely on ~/.netrc
+                if os.getenv("WANDB_API_KEY"):
+                    wandb.login(key=os.getenv("WANDB_API_KEY"))
+                settings = wandb.Settings(start_method=os.getenv("WANDB_START_METHOD", "thread"))
                 self.run = wandb.init(
-                    project=project,
-                    entity=entity,
+                    project=self.project,
+                    entity=self.entity,
                     name=name,
                     config=config or {},
-                    tags=tags or []
+                    tags=tags or [],
+                    group=self.group,
+                    job_type=self.job_type,
+                    notes=self.notes,
+                    resume=resume_env,
+                    id=run_id_env,
+                    settings=settings,
+                    reinit=True,
                 )
                 print(f"W&B logging initialized: {self.run.get_url()}")
             except Exception as e:
                 print(f"Failed to initialize W&B: {e}")
                 self.enabled = False
         else:
-            print("W&B not available (missing wandb package or API key)")
+            if not WANDB_AVAILABLE:
+                print("W&B not available: pip install wandb")
+            else:
+                print("W&B disabled (non-rank0 or WANDB_MODE=offline/WANDB_DISABLED=true)")
 
     def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         """Log metrics to W&B."""
@@ -272,10 +305,15 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
     
     return WandBLogger(
         project=getattr(config, 'wandb_project', 'selective-entropy-knowledge-distillation'),
-        entity=getattr(config, 'wandb_entity', 'selective-entropy-knowledge-distillation'),
+        entity=getattr(config, 'wandb_entity', None),
         name=experiment_name,
         config=wandb_config,
-        tags=tags
+        tags=tags,
+        group=os.getenv("WANDB_GROUP"),
+        job_type="train",
+        notes=os.getenv("WANDB_NOTES"),
+        resume=os.getenv("WANDB_RESUME", "allow"),
+        run_id=os.getenv("WANDB_RUN_ID"),
     )
 
 
