@@ -571,10 +571,26 @@ class Distiller:
                     getattr(self.config, "offline_cache_dir", None),
                     self.compute_cache_signature()
                 )
-                
+            # Build cache with a single-worker DataLoader to avoid multiprocessing/fork hangs
+            # after CUDA initialization on HPC nodes.
+            try:
+                from torch.utils.data import DataLoader
+                dl_for_cache = DataLoader(
+                    self.dataloader.dataset,
+                    batch_size=self.config.batch_size,
+                    shuffle=False,
+                    collate_fn=self.dataloader.collate_fn,
+                    num_workers=0,
+                    pin_memory=False,
+                    persistent_workers=False,
+                )
+            except Exception:
+                # Fallback: use the existing dataloader
+                dl_for_cache = self.dataloader
+
             self.cache = build_offline_cache_if_needed(
                 cache=self.cache,
-                teacher=self.teacher, tok=self.tok, dataloader=self.dataloader,
+                teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
                 config=self.config, teacher_device=self.teacher_device,
                 sanitize_logits_fn=self._sanitize_logits,
             )
