@@ -215,7 +215,7 @@ unset PYTHONPATH PYTHONHOME
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
   --datasets "fineweb" \
-  --fineweb_tokens "${FINEWEB_TOKENS:-\\1000000}" \
+  --fineweb_tokens "${FINEWEB_TOKENS:--1000000}" \
   --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
