@@ -1,9 +1,7 @@
 import glob
 import math
 import os
-import string
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,7 +12,7 @@ from torch.optim import AdamW
 
 from ..config import TrainingConfig, TrainingMetrics
 from .entropy_utils import token_entropy
-from .linucb import LinUCBBandit
+from .linucb_controller import LinUCBBanditController
 from .offline_cache import (
     TeacherOfflineCache,
     build_offline_cache_if_needed,
@@ -58,22 +56,6 @@ def kl_from_vocab_samples(
         return (w * diff).mean()
 
 
-@dataclass
-class BanditTokenRecord:
-    example_idx: int
-    position: int
-    context: torch.Tensor
-    kl_before: float
-
-
-@dataclass
-class BanditPendingBatch:
-    input_ids: torch.Tensor
-    attention_mask: torch.Tensor
-    tokens: List[BanditTokenRecord]
-    temperature: float
-
-
 class Distiller:
     """Main distillation trainer class.
     It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation -
@@ -113,18 +95,14 @@ class Distiller:
         self.cache = None
 
         # LinUCB contextual bandit setup
-        self.bandit: Optional[LinUCBBandit] = None
-        self._bandit_pending: List[BanditPendingBatch] = []
-        self._bandit_step_metrics: Optional[Dict[str, float]] = None
-        self._bandit_reward_metrics: Optional[Dict[str, float]] = None
-        self._pos_cache: Dict[int, float] = {}
+        self.bandit_manager: Optional[LinUCBBanditController] = None
         if self.config.distill_type == "linucb":
-            feature_dim = 6  # [entropy, teacher CE, student CE, KL, POS code, norm position]
-            self.bandit = LinUCBBandit(
-                feature_dim=feature_dim,
-                alpha=self.config.bandit_alpha,
-                lambda_=self.config.bandit_lambda,
-                device=self.config.bandit_device,
+            self.bandit_manager = LinUCBBanditController(
+                tokenizer=self.tok,
+                config=self.config,
+                student_device=self.student_device,
+                teacher_device=self.teacher_device,
+                sanitize_logits_fn=self._sanitize_logits,
             )
 
     def save_checkpoint(self, epoch: int, step: int):
@@ -429,7 +407,7 @@ class Distiller:
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
 
         elif self.config.distill_type == "linucb":
-            if self.bandit is None:
+            if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
             if t_pred is None or t_log_probs is None:
                 raise ValueError("LinUCB distillation requires teacher predictions.")
@@ -444,23 +422,19 @@ class Distiller:
             teacher_ce = (-t_log_probs_T1.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
             student_ce = (-s_log_probs_T1.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
 
-            feature_data = self._prepare_bandit_features(
+            kd_terms, metrics = self.bandit_manager.select_tokens(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 ent_raw=ent_raw.detach(),
                 teacher_ce=teacher_ce,
                 student_ce=student_ce,
                 kl_pos=kl_pos.detach(),
-                targets=targets.detach(),
                 valid_next=valid_next,
-            )
-            kd_terms, pending_batch, metrics = self._bandit_select(
-                feature_data,
-                kl_pos.detach(),
-                input_ids,
-                attention_mask,
-                temperature,
+                temperature=temperature,
             )
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
-            extra = {"pending": pending_batch, "metrics": metrics}
+            if metrics:
+                extra = metrics
 
         elif self.config.distill_type == "random":
             kd_terms = []
@@ -542,260 +516,6 @@ class Distiller:
 
         return kd_loss, extra
 
-    def _token_pos_code(self, token_id: int) -> float:
-        cached = self._pos_cache.get(int(token_id))
-        if cached is not None:
-            return cached
-
-        token = self.tok.convert_ids_to_tokens(int(token_id))
-        token = token.replace("Ġ", "").replace("▁", "").strip()
-
-        if not token:
-            category = 3
-        elif any(ch.isalpha() for ch in token):
-            category = 0
-        elif token.isdigit():
-            category = 1
-        elif all(ch in string.punctuation for ch in token):
-            category = 2
-        else:
-            category = 3
-
-        code = category / 3.0
-        self._pos_cache[int(token_id)] = code
-        return code
-
-    def _prepare_bandit_features(
-        self,
-        ent_raw: torch.Tensor,
-        teacher_ce: torch.Tensor,
-        student_ce: torch.Tensor,
-        kl_pos: torch.Tensor,
-        targets: torch.Tensor,
-        valid_next: torch.Tensor,
-    ) -> List[Optional[Dict[str, torch.Tensor]]]:
-        features: List[Optional[Dict[str, torch.Tensor]]] = []
-        seq_len = valid_next.size(1)
-
-        for i in range(valid_next.size(0)):
-            mask = valid_next[i]
-            valid_idx = torch.where(mask)[0]
-            if valid_idx.numel() == 0:
-                features.append(None)
-                continue
-
-            ent_vals = ent_raw[i, valid_idx].float()
-            teacher_vals = teacher_ce[i, valid_idx].float()
-            student_vals = student_ce[i, valid_idx].float()
-            kl_vals = kl_pos[i, valid_idx].float()
-
-            target_ids = targets[i, valid_idx].tolist()
-            pos_codes = torch.tensor(
-                [self._token_pos_code(tok_id) for tok_id in target_ids],
-                device=ent_vals.device,
-                dtype=torch.float32,
-            )
-            denom = max(1, seq_len - 1)
-            pos_norm = valid_idx.float() / denom
-
-            contexts = torch.stack(
-                (
-                    ent_vals,
-                    teacher_vals,
-                    student_vals,
-                    kl_vals,
-                    pos_codes,
-                    pos_norm.float(),
-                ),
-                dim=1,
-            )
-
-            top25_count = max(1, min(valid_idx.numel(), math.ceil(0.25 * valid_idx.numel())))
-            top25_rel = torch.topk(ent_vals, k=top25_count, largest=True, sorted=False).indices
-            top25_abs = valid_idx[top25_rel]
-
-            features.append(
-                {
-                    "contexts": contexts.detach(),
-                    "valid_indices": valid_idx,
-                    "top25_abs": top25_abs,
-                }
-            )
-
-        return features
-
-    def _bandit_select(
-        self,
-        feature_data: List[Optional[Dict[str, torch.Tensor]]],
-        kl_pos: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        temperature: float,
-    ) -> Tuple[List[torch.Tensor], Optional[BanditPendingBatch], Dict[str, float]]:
-        kd_terms: List[torch.Tensor] = []
-        pending_tokens: List[BanditTokenRecord] = []
-        total_examples = 0
-        total_selected = 0.0
-        total_selected_fraction = 0.0
-        total_overlap_selected = 0.0
-        total_overlap_top25 = 0.0
-
-        max_actions = self.config.bandit_max_tokens if self.config.bandit_max_tokens is not None else None
-
-        for idx, data in enumerate(feature_data):
-            if not data:
-                continue
-            contexts = data["contexts"]  # [N, F]
-            if contexts.size(0) == 0:
-                continue
-
-            contexts_cpu = contexts.detach().cpu()
-            mask, scores = self.bandit.select(
-                contexts_cpu,
-                threshold=self.config.bandit_threshold,
-                max_actions=max_actions,
-            )
-
-            n_valid = contexts_cpu.size(0)
-            eff_min = max(1, min(self.config.bandit_min_tokens, n_valid))
-            if max_actions is not None:
-                eff_min = min(eff_min, max_actions)
-
-            if mask.sum().item() < eff_min:
-                topk = torch.topk(scores, k=eff_min, largest=True, sorted=False).indices
-                new_mask = torch.zeros_like(mask, dtype=torch.bool)
-                new_mask[topk] = True
-                mask = new_mask
-
-            if mask.sum().item() == 0:
-                top_idx = torch.topk(scores, k=1, largest=True).indices
-                mask = torch.zeros_like(mask, dtype=torch.bool)
-                mask[top_idx] = True
-
-            selected_rel = torch.where(mask)[0]
-            valid_idx = data["valid_indices"]
-            selected_abs = valid_idx[selected_rel.to(valid_idx.device)]
-            selected_abs_device = selected_abs.to(kl_pos.device)
-
-            if selected_abs_device.numel() == 0:
-                continue
-
-            kd_terms.append(kl_pos[idx, selected_abs_device].mean())
-
-            for rel_idx, abs_pos in zip(selected_rel.tolist(), selected_abs_device.tolist()):
-                pending_tokens.append(
-                    BanditTokenRecord(
-                        example_idx=idx,
-                        position=abs_pos,
-                        context=contexts_cpu[rel_idx].clone().float(),
-                        kl_before=float(kl_pos[idx, abs_pos].item()),
-                    )
-                )
-
-            total_examples += 1
-            selected_count = float(selected_abs_device.numel())
-            total_selected += selected_count
-            total_selected_fraction += selected_count / n_valid
-
-            top25_abs = data["top25_abs"].to(selected_abs_device.device)
-            intersection = torch.isin(selected_abs_device, top25_abs).float().sum().item()
-            total_overlap_selected += intersection / max(1.0, selected_count)
-            total_overlap_top25 += intersection / max(1, float(top25_abs.numel()))
-
-        if pending_tokens:
-            pending_batch = BanditPendingBatch(
-                input_ids=input_ids.detach().cpu(),
-                attention_mask=attention_mask.detach().cpu(),
-                tokens=pending_tokens,
-                temperature=temperature,
-            )
-        else:
-            pending_batch = None
-
-        metrics: Dict[str, float] = {}
-        if total_examples > 0:
-            metrics = {
-                "bandit/selected_tokens": total_selected / total_examples,
-                "bandit/selected_fraction": total_selected_fraction / total_examples,
-                "bandit/overlap_selected": total_overlap_selected / total_examples,
-                "bandit/overlap_top25": total_overlap_top25 / total_examples,
-            }
-
-        return kd_terms, pending_batch, metrics
-
-    def _process_bandit_rewards(self) -> Optional[Dict[str, float]]:
-        if self.bandit is None or not self._bandit_pending:
-            self._bandit_reward_metrics = None
-            self._bandit_pending.clear()
-            return None
-
-        contexts: List[torch.Tensor] = []
-        rewards: List[float] = []
-
-        with torch.no_grad():
-            was_training = self.student.training
-            if was_training:
-                self.student.eval()
-
-            for record in self._bandit_pending:
-                if not record.tokens:
-                    continue
-
-                input_ids_cpu = record.input_ids
-                attn_cpu = record.attention_mask
-                input_ids_s = input_ids_cpu.to(self.student_device)
-                attn_mask_s = attn_cpu.to(self.student_device)
-
-                s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
-                s_logits = self._sanitize_logits(s_logits, "student_eval")
-                s_pred = s_logits[:, :-1, :]
-                s_log_probs = torch.log_softmax(s_pred / record.temperature, dim=-1)
-                valid_next = attn_mask_s[:, 1:].bool()
-
-                input_ids_t = input_ids_cpu.to(self.teacher_device)
-                attn_mask_t = attn_cpu.to(self.teacher_device)
-                t_logits = self.teacher(input_ids_t, attention_mask=attn_mask_t, output_hidden_states=False).logits
-                t_logits = self._sanitize_logits(t_logits, "teacher_eval")
-                t_pred = t_logits[:, :-1, :]
-                t_log_probs = torch.log_softmax(t_pred / record.temperature, dim=-1)
-                kl_pos_after = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
-
-                for token in record.tokens:
-                    if token.example_idx >= kl_pos_after.size(0):
-                        continue
-                    if token.position >= kl_pos_after.size(1):
-                        continue
-                    if not valid_next[token.example_idx, token.position]:
-                        continue
-                    kl_after = kl_pos_after[token.example_idx, token.position].item()
-                    reward = token.kl_before - kl_after
-                    clip_val = float(getattr(self.config, "bandit_reward_clip", 0.0))
-                    if clip_val > 0.0:
-                        reward = max(-clip_val, min(clip_val, reward))
-                    contexts.append(token.context.clone())
-                    rewards.append(reward)
-
-            if was_training:
-                self.student.train()
-
-        self._bandit_pending.clear()
-
-        if not rewards:
-            self._bandit_reward_metrics = None
-            return None
-
-        contexts_tensor = torch.stack(contexts)
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-        self.bandit.update(contexts_tensor, rewards_tensor)
-
-        avg_reward = float(rewards_tensor.mean().item())
-        positive_rate = float((rewards_tensor > 0).float().mean().item())
-        self._bandit_reward_metrics = {
-            "bandit/avg_reward": avg_reward,
-            "bandit/positive_reward_rate": positive_rate,
-        }
-        return self._bandit_reward_metrics
-
     @staticmethod
     def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
         """Sanitize logits to prevent NaNs/Infs during training.
@@ -872,7 +592,6 @@ class Distiller:
         # --- KD loss ---
         # Compute per-position base KD according to mode (positions subset and weights),
         # then replace vocab-sum with RS-KD estimator when enabled.
-        self._bandit_step_metrics = None
         extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
             kd_loss, kd_extra = self._compute_kd_loss(
@@ -886,13 +605,7 @@ class Distiller:
                 T,
             )
             if kd_extra:
-                pending = kd_extra.get("pending")
-                if pending:
-                    self._bandit_pending.append(pending)
-                metrics = kd_extra.get("metrics")
-                if metrics:
-                    self._bandit_step_metrics = metrics
-                    extra_metrics = metrics
+                extra_metrics = kd_extra
         else:
             kd_terms = []
             B = s_log_probs.size(0)
@@ -1032,6 +745,9 @@ class Distiller:
                 config=self.config, teacher_device=self.teacher_device,
                 sanitize_logits_fn=self._sanitize_logits,
             )
+
+        if self.bandit_manager is not None:
+            self.bandit_manager.reset()
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)
@@ -1074,7 +790,9 @@ class Distiller:
                         # Log the current KD temperature to visualize the annealing schedule
                         if self.logger:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
-                    reward_metrics = self._process_bandit_rewards()
+                    reward_metrics = None
+                    if self.bandit_manager is not None:
+                        reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
                     if reward_metrics:
                         last_reward_metrics = reward_metrics
                         if self.logger:
