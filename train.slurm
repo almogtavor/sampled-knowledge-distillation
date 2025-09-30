@@ -87,8 +87,8 @@ for arg in "$@"; do
   fi
 done
 
-# ---------- pick a python3 available on the node ----------
-PY_SYS="$(command -v python3 || true)"
+# ---------- pick a python3 available on the node (prefer 3.10 for bnb/triton compat) ----------
+PY_SYS="$(command -v python3.10 || command -v python3 || true)"
 if [[ -z "${PY_SYS}" ]]; then
   echo "ERROR: python3 not found on this node."
   exit 1
@@ -149,6 +149,22 @@ if [[ -f requirements.txt ]]; then
   TMP_REQ="$TMPDIR/req.no.torch.txt"
   grep -v -E '^[[:space:]]*torch(|vision|audio)' requirements.txt > "$TMP_REQ" || true
   $PY -m pip install --no-cache-dir -r "$TMP_REQ"
+fi
+
+# Ensure triton and bitsandbytes are installed (defensive)
+$PY - <<'PY' >/dev/null 2>&1
+import importlib, sys
+missing = []
+for mod in ("triton", "bitsandbytes"):
+    try:
+        importlib.import_module(mod)
+    except Exception:
+        missing.append(mod)
+sys.exit(0 if not missing else 1)
+PY
+if [[ $? -ne 0 ]]; then
+  echo "Installing triton==2.2.0 and bitsandbytes==0.43.3 (post-reqs)"
+  $PY -m pip install --no-cache-dir triton==2.2.0 bitsandbytes==0.43.3
 fi
 
 # ---------- GPU reorder by free VRAM ----------

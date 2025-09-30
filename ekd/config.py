@@ -39,6 +39,8 @@ class TrainingConfig(BaseModel):
     prompt_col: Optional[str] = None
     answer_col: Optional[str] = None
     dataset_config: Optional[str] = None
+    # FineWeb streaming token budget (used when datasets[0] == "fineweb")
+    fineweb_tokens: int = Field(default=50_000_000, description="Token budget when streaming FineWeb-Edu")
     
     # Training hyperparameters
     epochs: int = 1

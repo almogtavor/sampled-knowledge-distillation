@@ -115,8 +115,51 @@ def load_teacher_with_fallback(
         except Exception as e:
             print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
 
+    # Helper: check if BitsAndBytes + Triton backend are usable in this env
+    def _bnb_triton_available() -> bool:
+        try:
+            # transformers integration class
+            from transformers import BitsAndBytesConfig  # noqa: F401
+        except Exception:
+            return False
+        try:
+            import bitsandbytes as bnb  # noqa: F401
+        except Exception:
+            return False
+        try:
+            import triton  # noqa: F401
+        except Exception:
+            return False
+        # Some bnb builds require triton.ops; probe a representative module
+        try:
+            import importlib
+            importlib.import_module("bitsandbytes.triton.int8_matmul_mixed_dequantize")
+        except Exception:
+            return False
+        return True
+
+    # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
+    try:
+        import importlib
+        _torch_ver = getattr(torch, "__version__", "?")
+        try:
+            _triton = importlib.import_module("triton")
+            _triton_ver = getattr(_triton, "__version__", "installed")
+        except Exception:
+            _triton_ver = "not-installed"
+        try:
+            _bnb = importlib.import_module("bitsandbytes")
+            _bnb_ver = getattr(_bnb, "__version__", "installed")
+        except Exception:
+            _bnb_ver = "not-installed"
+        print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
+    except Exception:
+        pass
+
     # ===== 3) 8-bit quantization on single GPU =====
     try:
+        if not _bnb_triton_available():
+            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
         from transformers import BitsAndBytesConfig
         q8 = BitsAndBytesConfig(load_in_8bit=True)
         one = teacher_gpus[0]
@@ -138,6 +181,8 @@ def load_teacher_with_fallback(
 
     # ===== 4) 4-bit quantization on single GPU (last resort) =====
     try:
+        if not _bnb_triton_available():
+            raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
         from transformers import BitsAndBytesConfig
         q4 = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -161,6 +206,35 @@ def load_teacher_with_fallback(
         return teacher, tok, torch.device(f"cuda:{one}")
     except Exception as e:
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
+
+
+def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337):
+    """
+    Stream FineWeb-Edu and take ~max_tokens worth of text, reproducibly.
+    Returns a list of {prompt, answer} examples.
+    """
+    print(f"[fineweb] Streaming HuggingFaceFW/fineweb-edu with token budget={max_tokens:,}, seed={seed}")
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+
+    # Shuffle with fixed seed for reproducibility (uses a buffer)
+    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+
+    total_tokens = 0
+    examples = []
+    for ex in ds:
+        txt = ex.get("text", None)
+        if not txt:
+            continue
+        # Tokenize with the same tokenizer used for training
+        ids = tokenizer(txt)["input_ids"]
+        n_tokens = len(ids)
+        if total_tokens + n_tokens > max_tokens:
+            break
+        examples.append({"prompt": txt, "answer": ""})
+        total_tokens += n_tokens
+
+    print(f"[fineweb] Sampled ~{len(examples)} docs, {total_tokens:,} tokens")
+    return examples
 
 
 def parse_args_to_config() -> TrainingConfig:
@@ -201,6 +275,8 @@ def parse_args_to_config() -> TrainingConfig:
                         help="name of text prompt column for HF datasets")
     parser.add_argument("--answer_col", type=str, default=None,
                         help="name of answer column for HF datasets")
+    parser.add_argument("--fineweb_tokens", type=int, default=50_000_000,
+                        help="Token budget when streaming FineWeb-Edu (used when datasets[0] == 'fineweb')")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
@@ -361,18 +437,24 @@ def main():
         # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
     else:
-        # Load from Hugging Face dataset if user passes HF dataset name
-        print(f"Loading Hugging Face dataset: {config.datasets[0]}")
-        hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
-            else load_dataset(config.datasets[0])["train"]
-        print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-        examples = []
-        for ex in hf_dataset:
-            examples.append({
-                "prompt": ex[config.prompt_col],
-                "answer": ex[config.answer_col],
-            })
-        dataset = examples
+        # Special-case: FineWeb-Edu streaming with token budget
+        if config.datasets[0].lower() == "fineweb":
+            budget = int(getattr(config, "fineweb_tokens", 50_000_000))
+            print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
+            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed)
+        else:
+            # Load from Hugging Face dataset if user passes HF dataset name
+            print(f"Loading Hugging Face dataset: {config.datasets[0]}")
+            hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
+                else load_dataset(config.datasets[0])["train"]
+            print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
+            examples = []
+            for ex in hf_dataset:
+                examples.append({
+                    "prompt": ex[config.prompt_col],
+                    "answer": ex[config.answer_col],
+                })
+            dataset = examples
 
     collate = DistillCollator(tok, config.max_seq_len)
     # Seeded DataLoader generator for reproducible shuffling
