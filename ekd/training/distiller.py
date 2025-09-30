@@ -1,9 +1,11 @@
 import glob
 import math
 import os
+import string
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ from torch.optim import AdamW
 
 from ..config import TrainingConfig, TrainingMetrics
 from .entropy_utils import token_entropy
+from .linucb import LinUCBBandit
 from .offline_cache import (
     TeacherOfflineCache,
     build_offline_cache_if_needed,
@@ -55,6 +58,22 @@ def kl_from_vocab_samples(
         return (w * diff).mean()
 
 
+@dataclass
+class BanditTokenRecord:
+    example_idx: int
+    position: int
+    context: torch.Tensor
+    kl_before: float
+
+
+@dataclass
+class BanditPendingBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    tokens: List[BanditTokenRecord]
+    temperature: float
+
+
 class Distiller:
     """Main distillation trainer class.
     It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation -
@@ -92,6 +111,21 @@ class Distiller:
 
         # offline teacher logits cache: centralized initialization
         self.cache = None
+
+        # LinUCB contextual bandit setup
+        self.bandit: Optional[LinUCBBandit] = None
+        self._bandit_pending: List[BanditPendingBatch] = []
+        self._bandit_step_metrics: Optional[Dict[str, float]] = None
+        self._bandit_reward_metrics: Optional[Dict[str, float]] = None
+        self._pos_cache: Dict[int, float] = {}
+        if self.config.distill_type == "linucb":
+            feature_dim = 6  # [entropy, teacher CE, student CE, KL, POS code, norm position]
+            self.bandit = LinUCBBandit(
+                feature_dim=feature_dim,
+                alpha=self.config.bandit_alpha,
+                lambda_=self.config.bandit_lambda,
+                device=self.config.bandit_device,
+            )
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
@@ -275,36 +309,47 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
-    def _compute_kd_loss(self, t_pred: torch.Tensor, t_log_probs: torch.Tensor, 
-                         s_log_probs: torch.Tensor, valid_next: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        """Compute knowledge distillation loss based on the configured distillation type.
-        
+    def _compute_kd_loss(
+        self,
+        t_pred: torch.Tensor,
+        t_log_probs: torch.Tensor,
+        s_pred: torch.Tensor,
+        s_log_probs: torch.Tensor,
+        valid_next: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: float,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+        """Compute knowledge distillation loss for the configured strategy.
+
         Args:
             t_pred: Teacher predictions [B, L-1, V]
-            t_log_probs: Teacher log probabilities [B, L-1, V] 
-            s_log_probs: Student log probabilities [B, L-1, V]
-            valid_next: Valid next token positions [B, L-1]
-            
+            t_log_probs: Teacher log probabilities [B, L-1, V]
+            s_pred: Student logits aligned to next-token positions [B, L-1, V]
+            s_log_probs: Student log probabilities at KD temperature [B, L-1, V]
+            valid_next: Boolean mask of valid next-token positions [B, L-1]
+            input_ids: Input ids [B, L]
+            attention_mask: Attention mask [B, L]
+            temperature: KD temperature used for the current batch
+
         Returns:
-            kd_loss: Computed KD loss tensor
+            Tuple containing the KD loss tensor and optional auxiliary info (for LinUCB).
         """
+        extra: Optional[Dict[str, Any]] = None
+
         if self.config.distill_type == "vanilla":
-            # KL for all positions for vanilla (sum over vocab so it becomes [B, L-1])
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
-            
+
         elif self.config.distill_type == "top-k-tok":
-            # top-k% tokens by entropy among valid positions only
-            # selection by entropy (T=1 for selection is common) ----
             if t_pred is None or t_log_probs is None:
                 raise ValueError("top-k-tok distillation requires teacher predictions.")
 
-            # Base selector: teacher entropy (exact or cached) per position.
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
-            ent_masked = ent_raw.masked_fill(~valid_next, float('-inf')) # ignore invalid
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)
+            ent_masked = ent_raw.masked_fill(~valid_next, float('-inf'))
 
-            pct = max(0.0, min(1.0, self.config.k_percent / 100.0)) # e.g. 0.2
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
@@ -312,14 +357,13 @@ class Distiller:
             if score_enabled:
                 score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
-            # top-k-tok: select positions first, then compute KL only on those
             kd_terms = []
             batch_size = valid_next.size(0)
             for i in range(batch_size):
-                mask = valid_next[i]  # [L-1] - valid positions for sequence i
-                n_valid = int(mask.sum().item())  # Count valid positions
+                mask = valid_next[i]
+                n_valid = int(mask.sum().item())
                 if n_valid < 3:
-                    continue  # Skip sequences with too few valid tokens
+                    continue
                 k = max(1, min(n_valid, math.ceil(pct * n_valid)))
 
                 if score_enabled:
@@ -343,14 +387,10 @@ class Distiller:
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
 
         elif self.config.distill_type == "bucket":
-            # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
-            # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
-            # This excludes both the lowest 70% and highest 20% entropy tokens
             if t_pred is None or t_log_probs is None:
                 raise ValueError("bucket distillation requires teacher predictions.")
 
-            # Bucket selection shares the same score machinery as top-k.
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
@@ -388,6 +428,40 @@ class Distiller:
 
             kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
 
+        elif self.config.distill_type == "linucb":
+            if self.bandit is None:
+                raise RuntimeError("LinUCB bandit is not initialized.")
+            if t_pred is None or t_log_probs is None:
+                raise ValueError("LinUCB distillation requires teacher predictions.")
+
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)
+            t_log_probs_T1 = torch.log_softmax(t_pred, dim=-1)
+            s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+            kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+
+            targets = input_ids[:, 1:].to(self.student_device)
+            targets = targets.masked_fill(~valid_next, 0)
+            teacher_ce = (-t_log_probs_T1.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+            student_ce = (-s_log_probs_T1.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+
+            feature_data = self._prepare_bandit_features(
+                ent_raw=ent_raw.detach(),
+                teacher_ce=teacher_ce,
+                student_ce=student_ce,
+                kl_pos=kl_pos.detach(),
+                targets=targets.detach(),
+                valid_next=valid_next,
+            )
+            kd_terms, pending_batch, metrics = self._bandit_select(
+                feature_data,
+                kl_pos.detach(),
+                input_ids,
+                attention_mask,
+                temperature,
+            )
+            kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+            extra = {"pending": pending_batch, "metrics": metrics}
+
         elif self.config.distill_type == "random":
             kd_terms = []
             Bsz = t_log_probs.size(0)
@@ -404,7 +478,6 @@ class Distiller:
                     keep = torch.zeros_like(valid_next_i)
                     keep[selected_indices] = True
                     if keep.any():
-                        # Compute KL *only* for the selected tokens
                         kd_terms.append(
                             self._kl_loss(
                                 t_log_probs[i][keep].to(self.student_device),
@@ -413,70 +486,315 @@ class Distiller:
                         )
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+            else:
+                kd_loss = t_pred.sum() * 0.0
+
         elif self.config.distill_type == "pos-rs-kd":
-            # RS-KD over POSITIONS: sample K% positions by entropy-based distribution q(i)
-            # q(i) ∝ H_i^alpha ;  q ← (1-ε) q + ε·uniform ; floor on q to avoid degeneracy
-            ent = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent = self._entropy_for_selection(input_ids, t_pred)
             kd_terms = []
             Bsz = t_pred.size(0)
             alpha = float(getattr(self.config, "rs_alpha", 1.0))
             q_floor = float(getattr(self.config, "rs_floor", 1e-6))
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-        
+
             for i in range(Bsz):
-                valid_next_i = valid_next[i]  # [L-1] bool of valid positions
+                valid_next_i = valid_next[i]
                 valid_count = int(valid_next_i.sum().item())
                 if valid_count < 3:
                     continue
-                # Entropy over valid positions
-                ent_valid = ent[i][valid_next_i].float() # [n_valid]
-                ent_valid = torch.clamp(ent_valid, min=1e-8) # Make strictly positive for exponentiation
-                # q_un ∝ H^alpha (Unnormalized proposal distribution). Higher H -> higher sampling prob
+                ent_valid = ent[i][valid_next_i].float()
+                ent_valid = torch.clamp(ent_valid, min=1e-8)
                 if alpha == 0.0:
-                    q_un = torch.ones_like(ent_valid) # uniform if alpha=0
+                    q_un = torch.ones_like(ent_valid)
                 else:
                     q_un = ent_valid.pow(alpha)
-        
+
                 q_un_sum = q_un.sum()
                 if q_un_sum <= 0:
-                    # fallback to uniform if degenerate
                     q = torch.full_like(q_un, 1.0 / q_un.numel())
                 else:
-                    q = q_un / q_un_sum  # normalize
-                    # floor to avoid zero probs
+                    q = q_un / q_un_sum
                     q = torch.clamp(q, min=q_floor)
-                    q = q / q.sum()  # renormalize
-        
+                    q = q / q.sum()
+
                 k_count = max(1, int(valid_count * pct))
-                # Sample indices within the "valid positions" subspace
-                # torch.multinomial expects probs sum to 1
-                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
-        
-                # Map relative -> absolute indices
-                valid_idx = torch.where(valid_next_i)[0]  # absolute positions
-                selected_abs = valid_idx[sel_rel]  # [k]
-                # KL on selected positions (like top-k branch)
+                sel_rel = torch.multinomial(q, num_samples=k_count, replacement=False)
+
+                valid_idx = torch.where(valid_next_i)[0]
+                selected_abs = valid_idx[sel_rel]
                 idx_t = selected_abs.to(t_log_probs.device)
                 kl_sel = self._kl_loss(
                     t_log_probs[i, idx_t, :].to(self.student_device),
                     s_log_probs[i, selected_abs, :]
-                )  # [k]
-        
-                # Importance weights ∝ 1/q(i). Normalize to sum=1 to keep scale comparable.
-                q_sel = q[sel_rel]  # [k]
+                )
+
+                q_sel = q[sel_rel]
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                 w = w / w.sum()
                 kd_terms.append((kl_sel * w).sum())
             if kd_terms:
                 kd_loss = torch.stack(kd_terms).mean()
-            else: # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+            else:
+                kd_loss = t_pred.sum() * 0.0
+
         else:
             raise ValueError(f"Unknown distill_type: {self.config.distill_type}")
-            
-        return kd_loss
+
+        return kd_loss, extra
+
+    def _token_pos_code(self, token_id: int) -> float:
+        cached = self._pos_cache.get(int(token_id))
+        if cached is not None:
+            return cached
+
+        token = self.tok.convert_ids_to_tokens(int(token_id))
+        token = token.replace("Ġ", "").replace("▁", "").strip()
+
+        if not token:
+            category = 3
+        elif any(ch.isalpha() for ch in token):
+            category = 0
+        elif token.isdigit():
+            category = 1
+        elif all(ch in string.punctuation for ch in token):
+            category = 2
+        else:
+            category = 3
+
+        code = category / 3.0
+        self._pos_cache[int(token_id)] = code
+        return code
+
+    def _prepare_bandit_features(
+        self,
+        ent_raw: torch.Tensor,
+        teacher_ce: torch.Tensor,
+        student_ce: torch.Tensor,
+        kl_pos: torch.Tensor,
+        targets: torch.Tensor,
+        valid_next: torch.Tensor,
+    ) -> List[Optional[Dict[str, torch.Tensor]]]:
+        features: List[Optional[Dict[str, torch.Tensor]]] = []
+        seq_len = valid_next.size(1)
+
+        for i in range(valid_next.size(0)):
+            mask = valid_next[i]
+            valid_idx = torch.where(mask)[0]
+            if valid_idx.numel() == 0:
+                features.append(None)
+                continue
+
+            ent_vals = ent_raw[i, valid_idx].float()
+            teacher_vals = teacher_ce[i, valid_idx].float()
+            student_vals = student_ce[i, valid_idx].float()
+            kl_vals = kl_pos[i, valid_idx].float()
+
+            target_ids = targets[i, valid_idx].tolist()
+            pos_codes = torch.tensor(
+                [self._token_pos_code(tok_id) for tok_id in target_ids],
+                device=ent_vals.device,
+                dtype=torch.float32,
+            )
+            denom = max(1, seq_len - 1)
+            pos_norm = valid_idx.float() / denom
+
+            contexts = torch.stack(
+                (
+                    ent_vals,
+                    teacher_vals,
+                    student_vals,
+                    kl_vals,
+                    pos_codes,
+                    pos_norm.float(),
+                ),
+                dim=1,
+            )
+
+            top25_count = max(1, min(valid_idx.numel(), math.ceil(0.25 * valid_idx.numel())))
+            top25_rel = torch.topk(ent_vals, k=top25_count, largest=True, sorted=False).indices
+            top25_abs = valid_idx[top25_rel]
+
+            features.append(
+                {
+                    "contexts": contexts.detach(),
+                    "valid_indices": valid_idx,
+                    "top25_abs": top25_abs,
+                }
+            )
+
+        return features
+
+    def _bandit_select(
+        self,
+        feature_data: List[Optional[Dict[str, torch.Tensor]]],
+        kl_pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        temperature: float,
+    ) -> Tuple[List[torch.Tensor], Optional[BanditPendingBatch], Dict[str, float]]:
+        kd_terms: List[torch.Tensor] = []
+        pending_tokens: List[BanditTokenRecord] = []
+        total_examples = 0
+        total_selected = 0.0
+        total_selected_fraction = 0.0
+        total_overlap_selected = 0.0
+        total_overlap_top25 = 0.0
+
+        max_actions = self.config.bandit_max_tokens if self.config.bandit_max_tokens is not None else None
+
+        for idx, data in enumerate(feature_data):
+            if not data:
+                continue
+            contexts = data["contexts"]  # [N, F]
+            if contexts.size(0) == 0:
+                continue
+
+            contexts_cpu = contexts.detach().cpu()
+            mask, scores = self.bandit.select(
+                contexts_cpu,
+                threshold=self.config.bandit_threshold,
+                max_actions=max_actions,
+            )
+
+            n_valid = contexts_cpu.size(0)
+            eff_min = max(1, min(self.config.bandit_min_tokens, n_valid))
+            if max_actions is not None:
+                eff_min = min(eff_min, max_actions)
+
+            if mask.sum().item() < eff_min:
+                topk = torch.topk(scores, k=eff_min, largest=True, sorted=False).indices
+                new_mask = torch.zeros_like(mask, dtype=torch.bool)
+                new_mask[topk] = True
+                mask = new_mask
+
+            if mask.sum().item() == 0:
+                top_idx = torch.topk(scores, k=1, largest=True).indices
+                mask = torch.zeros_like(mask, dtype=torch.bool)
+                mask[top_idx] = True
+
+            selected_rel = torch.where(mask)[0]
+            valid_idx = data["valid_indices"]
+            selected_abs = valid_idx[selected_rel.to(valid_idx.device)]
+            selected_abs_device = selected_abs.to(kl_pos.device)
+
+            if selected_abs_device.numel() == 0:
+                continue
+
+            kd_terms.append(kl_pos[idx, selected_abs_device].mean())
+
+            for rel_idx, abs_pos in zip(selected_rel.tolist(), selected_abs_device.tolist()):
+                pending_tokens.append(
+                    BanditTokenRecord(
+                        example_idx=idx,
+                        position=abs_pos,
+                        context=contexts_cpu[rel_idx].clone().float(),
+                        kl_before=float(kl_pos[idx, abs_pos].item()),
+                    )
+                )
+
+            total_examples += 1
+            selected_count = float(selected_abs_device.numel())
+            total_selected += selected_count
+            total_selected_fraction += selected_count / n_valid
+
+            top25_abs = data["top25_abs"].to(selected_abs_device.device)
+            intersection = torch.isin(selected_abs_device, top25_abs).float().sum().item()
+            total_overlap_selected += intersection / max(1.0, selected_count)
+            total_overlap_top25 += intersection / max(1, float(top25_abs.numel()))
+
+        if pending_tokens:
+            pending_batch = BanditPendingBatch(
+                input_ids=input_ids.detach().cpu(),
+                attention_mask=attention_mask.detach().cpu(),
+                tokens=pending_tokens,
+                temperature=temperature,
+            )
+        else:
+            pending_batch = None
+
+        metrics: Dict[str, float] = {}
+        if total_examples > 0:
+            metrics = {
+                "bandit/selected_tokens": total_selected / total_examples,
+                "bandit/selected_fraction": total_selected_fraction / total_examples,
+                "bandit/overlap_selected": total_overlap_selected / total_examples,
+                "bandit/overlap_top25": total_overlap_top25 / total_examples,
+            }
+
+        return kd_terms, pending_batch, metrics
+
+    def _process_bandit_rewards(self) -> Optional[Dict[str, float]]:
+        if self.bandit is None or not self._bandit_pending:
+            self._bandit_reward_metrics = None
+            self._bandit_pending.clear()
+            return None
+
+        contexts: List[torch.Tensor] = []
+        rewards: List[float] = []
+
+        with torch.no_grad():
+            was_training = self.student.training
+            if was_training:
+                self.student.eval()
+
+            for record in self._bandit_pending:
+                if not record.tokens:
+                    continue
+
+                input_ids_cpu = record.input_ids
+                attn_cpu = record.attention_mask
+                input_ids_s = input_ids_cpu.to(self.student_device)
+                attn_mask_s = attn_cpu.to(self.student_device)
+
+                s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
+                s_logits = self._sanitize_logits(s_logits, "student_eval")
+                s_pred = s_logits[:, :-1, :]
+                s_log_probs = torch.log_softmax(s_pred / record.temperature, dim=-1)
+                valid_next = attn_mask_s[:, 1:].bool()
+
+                input_ids_t = input_ids_cpu.to(self.teacher_device)
+                attn_mask_t = attn_cpu.to(self.teacher_device)
+                t_logits = self.teacher(input_ids_t, attention_mask=attn_mask_t, output_hidden_states=False).logits
+                t_logits = self._sanitize_logits(t_logits, "teacher_eval")
+                t_pred = t_logits[:, :-1, :]
+                t_log_probs = torch.log_softmax(t_pred / record.temperature, dim=-1)
+                kl_pos_after = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+
+                for token in record.tokens:
+                    if token.example_idx >= kl_pos_after.size(0):
+                        continue
+                    if token.position >= kl_pos_after.size(1):
+                        continue
+                    if not valid_next[token.example_idx, token.position]:
+                        continue
+                    kl_after = kl_pos_after[token.example_idx, token.position].item()
+                    reward = token.kl_before - kl_after
+                    clip_val = float(getattr(self.config, "bandit_reward_clip", 0.0))
+                    if clip_val > 0.0:
+                        reward = max(-clip_val, min(clip_val, reward))
+                    contexts.append(token.context.clone())
+                    rewards.append(reward)
+
+            if was_training:
+                self.student.train()
+
+        self._bandit_pending.clear()
+
+        if not rewards:
+            self._bandit_reward_metrics = None
+            return None
+
+        contexts_tensor = torch.stack(contexts)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        self.bandit.update(contexts_tensor, rewards_tensor)
+
+        avg_reward = float(rewards_tensor.mean().item())
+        positive_rate = float((rewards_tensor > 0).float().mean().item())
+        self._bandit_reward_metrics = {
+            "bandit/avg_reward": avg_reward,
+            "bandit/positive_reward_rate": positive_rate,
+        }
+        return self._bandit_reward_metrics
 
     @staticmethod
     def _sanitize_logits(x: torch.Tensor, name: str) -> torch.Tensor:
@@ -514,11 +832,13 @@ class Distiller:
         # Decide whether we need full teacher logits now
         cached_items = None
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
+        if self.config.distill_type == "linucb":
+            use_vocab_rs_kd = False
         # Score-based selection needs fresh teacher logits even if the cache could satisfy EKD,
         # because we require per-position KL and student CE statistics that aren't stored offline.
         score_requires_teacher = bool(getattr(self.config, "score_token_selection", False)) \
             and self.config.distill_type in {"top-k-tok", "bucket"}
-        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd"} or score_requires_teacher
+        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd", "linucb"} or score_requires_teacher
         if use_vocab_rs_kd:
             # try offline cache to avoid teacher forward; fall back to teacher if cache missing
             cached_items = self._lookup_cache_batch(input_ids)
@@ -552,8 +872,27 @@ class Distiller:
         # --- KD loss ---
         # Compute per-position base KD according to mode (positions subset and weights),
         # then replace vocab-sum with RS-KD estimator when enabled.
+        self._bandit_step_metrics = None
+        extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
-            kd_loss = self._compute_kd_loss(t_pred, t_log_probs, s_log_probs, valid_next, input_ids)
+            kd_loss, kd_extra = self._compute_kd_loss(
+                t_pred,
+                t_log_probs,
+                s_pred,
+                s_log_probs,
+                valid_next,
+                input_ids,
+                attn_mask,
+                T,
+            )
+            if kd_extra:
+                pending = kd_extra.get("pending")
+                if pending:
+                    self._bandit_pending.append(pending)
+                metrics = kd_extra.get("metrics")
+                if metrics:
+                    self._bandit_step_metrics = metrics
+                    extra_metrics = metrics
         else:
             kd_terms = []
             B = s_log_probs.size(0)
@@ -657,9 +996,9 @@ class Distiller:
                 f"(total={total.item()}, kd={kd_loss.item()}, ce={ce_loss.item()})")
             # Return a tiny zero-like loss with grad so autograd graph stays valid
             zero = s_pred.sum() * 0.0
-            return zero + zero, 0.0, 0.0
+            return zero + zero, 0.0, 0.0, None
 
-        return total, kd_loss.item(), ce_loss.item()
+        return total, kd_loss.item(), ce_loss.item(), extra_metrics
 
     def compute_cache_signature(self) -> Dict[str, Any]:
         """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
@@ -711,10 +1050,13 @@ class Distiller:
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
+            bandit_running: Dict[str, float] = {}
+            bandit_steps = 0
+            last_reward_metrics: Optional[Dict[str, float]] = None
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
             for step, batch in enumerate(self.dataloader):
-                loss, kl_val, ce_val = self._forward_batch(batch)
+                loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
                 
                 # Scale loss by gradient accumulation steps
                 loss = loss / self.config.gradient_accumulation_steps
@@ -732,6 +1074,11 @@ class Distiller:
                         # Log the current KD temperature to visualize the annealing schedule
                         if self.logger:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
+                    reward_metrics = self._process_bandit_rewards()
+                    if reward_metrics:
+                        last_reward_metrics = reward_metrics
+                        if self.logger:
+                            self.logger.log(reward_metrics, self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 
@@ -742,6 +1089,10 @@ class Distiller:
                 running["loss"] += loss.item() * self.config.gradient_accumulation_steps  # Unscale for logging
                 running["kl"] += kl_val
                 running["ce"] += ce_val
+                if bandit_metrics:
+                    for key, value in bandit_metrics.items():
+                        bandit_running[key] = bandit_running.get(key, 0.0) + value
+                    bandit_steps += 1
                 
                 # Logging every step using TrainingMetrics
                 metrics = TrainingMetrics(
@@ -756,6 +1107,8 @@ class Distiller:
                 # Log metrics
                 if self.logger:
                     log_metrics = {**metrics.to_dict(), "train/step": step + 1, "train/global_step": self.global_step}
+                    if bandit_metrics:
+                        log_metrics.update(bandit_metrics)
                     self.logger.log(log_metrics, self.global_step)
                     
                 if (step + 1) % log_every == 0:
@@ -763,13 +1116,25 @@ class Distiller:
                     avg_loss = running['loss'] / n
                     avg_kl = running['kl'] / n
                     avg_ce = running['ce'] / n
+                    avg_bandit: Dict[str, float] = {}
+                    if bandit_steps > 0:
+                        avg_bandit = {k: v / bandit_steps for k, v in bandit_running.items()}
                     
                     elapsed = time.time() - step_start 
                     step_start = time.time()
+                    bandit_str = ""
+                    if avg_bandit:
+                        sel = avg_bandit.get("bandit/selected_tokens", 0.0)
+                        overlap = avg_bandit.get("bandit/overlap_selected", 0.0)
+                        bandit_str = f" | bandit_sel={sel:.2f} overlap={overlap:.2f}"
+                    reward_str = ""
+                    if last_reward_metrics:
+                        avg_reward = last_reward_metrics.get("bandit/avg_reward", 0.0)
+                        reward_str = f" | bandit_reward={avg_reward:.4f}"
                     print(
                         f"ep{epoch + 1} step{step + 1} | "
                         f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
-                        f"| global_step={self.global_step} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
+                        f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
                     )
                     
                     # Log averages using new combined logger or legacy loggers
@@ -780,6 +1145,10 @@ class Distiller:
                         "train/elapsed_time": elapsed,
                         "train/steps_per_second": log_every / elapsed
                     }
+                    if avg_bandit:
+                        avg_metrics.update(avg_bandit)
+                    if last_reward_metrics:
+                        avg_metrics.update(last_reward_metrics)
                     
                     # Log averages
                     if self.logger:
@@ -787,6 +1156,8 @@ class Distiller:
                         self.logger.flush()
                         
                     running = {k: 0.0 for k in running}
+                    bandit_running = {}
+                    bandit_steps = 0
         
         # Final checkpoint and cleanup at the end
         if self.config.checkpoint_steps > 0:

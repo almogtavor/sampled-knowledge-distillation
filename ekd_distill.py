@@ -1,20 +1,20 @@
 import argparse
-import random
-import numpy as np
-from pathlib import Path
-from datetime import datetime
 import os
-from typing import List, Tuple, Optional
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+from datasets import load_dataset
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from ekd.config import TrainingConfig
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
 from ekd.training.distiller import Distiller
-from ekd.config import TrainingConfig
-from datasets import load_dataset
 
 # Import logging utils with fallback
 try:
@@ -244,7 +244,7 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"], default="vanilla")
+    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
     parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
@@ -276,6 +276,20 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Weight for student cross-entropy component in score-based KD")
     parser.add_argument("--score_kl_weight", type=float, default=1.0,
                         help="Weight for teacher-student KL component in score-based KD")
+    parser.add_argument("--bandit_alpha", type=float, default=1.0,
+                        help="Exploration coefficient for LinUCB contextual bandit")
+    parser.add_argument("--bandit_lambda", type=float, default=1.0,
+                        help="L2 regularization strength for LinUCB covariance matrix")
+    parser.add_argument("--bandit_threshold", type=float, default=0.0,
+                        help="Minimum UCB score required for LinUCB to keep a token")
+    parser.add_argument("--bandit_min_tokens", type=int, default=1,
+                        help="Force LinUCB to keep at least this many tokens per example")
+    parser.add_argument("--bandit_max_tokens", type=int, default=None,
+                        help="Optional cap on the number of tokens LinUCB can keep per example")
+    parser.add_argument("--bandit_device", type=str, default="cpu",
+                        help="Device to maintain LinUCB statistics (cpu or cuda)")
+    parser.add_argument("--bandit_reward_clip", type=float, default=5.0,
+                        help="Absolute clip value applied to KL improvement rewards before LinUCB updates")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
     parser.add_argument("--alpha_ce", type=float, default=0.1,
