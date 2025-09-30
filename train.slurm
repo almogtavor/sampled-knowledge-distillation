@@ -9,6 +9,8 @@
 #SBATCH --gpus=4
 #SBATCH --output=logs/train.%j.log
 #SBATCH --error=logs/train.%j.log
+# Ensure W&B agent env vars propagate into job
+#SBATCH --export=ALL
 
 set -euo pipefail
 cd /home/joberant/NLP_2425b/$USER/ekd
@@ -212,10 +214,8 @@ unset PYTHONPATH PYTHONHOME
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
-  --datasets "gsm8k" \
-  --dataset_config "main" \
-  --prompt_col "question" \
-  --answer_col "answer" \
+  --datasets "fineweb" \
+  --fineweb_tokens "${FINEWEB_TOKENS:--1000000}" \
   --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \

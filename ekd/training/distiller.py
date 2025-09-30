@@ -163,9 +163,23 @@ class Distiller:
         if self.cache is not None:
             items = self._lookup_cache_batch(input_ids)
             if items is not None:
-                # Stack cached per-example arrays
-                H = [torch.as_tensor(it["H_hat"]) for it in items]  # each [L-1]
-                return torch.stack(H, dim=0).to(self.student_device)  # [B, L-1]
+                H_list = []
+                for it in items:
+                    if "H_hat_u8" in it:
+                        # Dequantize from uint8 using cap ln(V)
+                        H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
+                        V = int(it.get("rs", {}).get("sentinel_id", 0))
+                        H_cap = math.log(max(2, V)) if V > 0 else 1.0
+                        H_f = (H_u8.float() / 255.0) * H_cap
+                        H_list.append(H_f)
+                    elif "H_hat" in it:
+                        H_list.append(torch.as_tensor(it["H_hat"]).float())
+                    else:
+                        # Missing Ĥ in cache: fall back to exact
+                        H_list = None
+                        break
+                if H_list is not None:
+                    return torch.stack(H_list, dim=0).to(self.student_device)
 
         # need exact from t_pred
         assert t_pred is not None, "Exact entropy requested but teacher logits are unavailable."
@@ -628,19 +642,20 @@ class Distiller:
             if kd_extra:
                 extra_metrics = kd_extra
         else:
-            kd_terms = []
-            B = s_log_probs.size(0)
-            for i in range(B):
-                valid_i = valid_next[i]
-                if valid_i.sum() == 0:
-                    continue
-
-                # Gather RS-KD samples from new packed cache format or build online when cache missing
-                if cached_items is not None:
+            # Replace vocab-sum with RS-KD estimator. Two paths:
+            # 1) cached_items available: decode precomputed per-position samples (keep existing per-position loop)
+            # 2) no cache: build samples online in a fully batched, vectorized way across all valid positions
+            if cached_items is not None:
+                kd_terms = []
+                B = s_log_probs.size(0)
+                for i in range(B):
+                    valid_i = valid_next[i]
+                    if valid_i.sum() == 0:
+                        continue
                     rs = cached_items[i]["rs"]
                     U = int(rs["U"])  # entries per position
                     sentinel = int(rs["sentinel_id"])  # Vocab size sentinel id
-                    packed = torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8)  # [(L-1)*U*3]
+                    packed = torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8)
 
                     def get_pos_slice(p: int):
                         # decode per-position block to (ids, probs)
@@ -648,60 +663,62 @@ class Distiller:
                         block = packed[p * U * 3:(p + 1) * U * 3]
                         ids, probs = decode_ids_probs_from_block(block, U, sentinel)
                         return ids, probs
-                else:
-                    # Need teacher logprobs for online proposal
-                    assert t_log_probs is not None, "Teacher logits required for online RS-KD when cache missing"
-                    with torch.no_grad():
-                        # Use teacher at current KD temperature for proposal, but t_logp_sel at T=1 for KL
-                        t_full_i_Tkd = t_log_probs[i]            # log p at T_kd
-                        p_i = t_full_i_Tkd.exp()
-                        t_full_i_T1 = torch.log_softmax(t_pred[i] / 1.0, dim=-1)  # log p at T=1
-                    beta = float(getattr(self.config, "rs_vocab_beta", 1.0))
-                    S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
-                    idx_list, tlogp_list, q_list = [], [], []
-                    for pos, is_valid in enumerate(valid_i.tolist()):
-                        if not is_valid:
-                            idx_list.append(torch.empty(0, dtype=torch.long))
-                            tlogp_list.append(torch.empty(0))
-                            q_list.append(torch.empty(0))
-                            continue
-                        p_pos = p_i[pos]
-                        q_un = p_pos.clamp_min(1e-12).pow(beta) if beta != 1.0 else p_pos.clamp_min(1e-12)
-                        q = q_un / q_un.sum()
-                        S = min(S_vocab, q.numel())
-                        idx = torch.multinomial(q, num_samples=S, replacement=False)
-                        idx_list.append(idx.cpu())
-                        tlogp_list.append(t_full_i_T1[pos, idx].cpu())
-                        q_list.append(q[idx].cpu())
 
-                    def get_pos_slice(p: int):
-                        return idx_list[p], tlogp_list[p], q_list[p]
-
-                # For each position, compute KL estimate using only sampled tokens
-                for pos, is_valid in enumerate(valid_i.tolist()):
-                    if not is_valid:
-                        continue
-                    if cached_items is not None:
+                    pos_indices = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)
+                    for pos in pos_indices.tolist():
                         ids, probs = get_pos_slice(pos)
                         if ids.numel() == 0:
                             continue
-                        # Forward KL approx at KD temperature T using teacher empirical probs
                         loss_pos = -(probs * s_log_probs[i, pos].index_select(0, ids)).sum()
                         kd_terms.append(loss_pos)
-                    else:
-                        # Online fallback retained for now (rare path). Build samples as before.
-                        idx_cpu, tlogp_cpu, q_cpu = get_pos_slice(pos)
-                        idx = torch.as_tensor(idx_cpu).to(self.student_device, dtype=torch.long)
-                        if idx.numel() == 0:
-                            continue
-                        t_logp_sel = torch.as_tensor(tlogp_cpu).to(self.student_device)
-                        q_sel = torch.as_tensor(q_cpu).to(self.student_device)
-                        s_logp_sel = s_log_probs[i, pos, idx]
-                        kd_terms.append(kl_from_vocab_samples(
-                            t_logp_sel, s_logp_sel, q_sel, self_norm=True, T_kd=T
-                        ))
 
-            kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
+                kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
+            else:
+                # Vectorized online RS-KD over vocabulary: flatten all valid positions across the batch
+                assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"
+                # Move necessary teacher tensors to the student device for gathers with student log-probs
+                t_logp_Tkd = t_log_probs.to(self.student_device)           # [B, L-1, V]
+                t_logp_T1 = torch.log_softmax(t_pred.to(self.student_device) / 1.0, dim=-1)  # [B, L-1, V]
+                p_Tkd = t_logp_Tkd.exp()                                   # [B, L-1, V]
+
+                mask = valid_next  # [B, L-1] bool
+                P_total = int(mask.sum().item())
+                if P_total == 0:
+                    kd_loss = s_pred.sum() * 0.0
+                else:
+                    # Gather all valid rows once: [P_total, V]
+                    p_rows = p_Tkd[mask]
+                    s_rows = s_log_probs[mask]
+                    t1_rows = t_logp_T1[mask]
+
+                    beta = float(getattr(self.config, "rs_vocab_beta", 1.0))
+                    S_vocab = int(getattr(self.config, "rs_vocab_samples", 64))
+
+                    # Build proposal q per-row: q ∝ p_Tkd^beta (with clamp for safety), normalize row-wise
+                    q_un = p_rows.clamp_min(1e-12)
+                    if beta != 1.0:
+                        q_un = q_un.pow(beta)
+                    q = q_un / q_un.sum(dim=-1, keepdim=True)  # [P_total, V]
+
+                    # Single batched sampling for all rows
+                    S_eff = min(S_vocab, q.size(-1))
+                    idx_all = torch.multinomial(q, num_samples=S_eff, replacement=False)  # [P_total, S_eff]
+
+                    # Gather per-row selections for teacher (T=1), proposal q, and student log-probs
+                    t_logp1_sel = torch.gather(t1_rows, 1, idx_all)  # [P_total, S_eff]
+                    q_sel = torch.gather(q, 1, idx_all)              # [P_total, S_eff]
+                    s_logp_sel = torch.gather(s_rows, 1, idx_all)    # [P_total, S_eff]
+
+                    # Vectorized self-normalized importance-weighted KL estimator across rows
+                    gamma = 1.0 / max(1e-12, T)
+                    p1 = torch.exp(t_logp1_sel)
+                    pT_un = p1.pow(gamma)
+                    w = pT_un / q_sel.clamp_min(1e-12)
+                    w = w / w.sum(dim=1, keepdim=True)
+                    logpT_approx = torch.log(pT_un) - torch.log(pT_un.sum(dim=1, keepdim=True).clamp_min(1e-12))
+                    diff = logpT_approx - s_logp_sel
+                    loss_rows = (w * diff).sum(dim=1)  # [P_total]
+                    kd_loss = loss_rows.mean()
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
         kd_loss = kd_loss * T2

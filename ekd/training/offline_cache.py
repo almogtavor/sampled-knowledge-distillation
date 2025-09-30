@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import time
+import math
 from pathlib import Path
 from typing import Dict, Any
 
@@ -427,14 +428,24 @@ def _build_cache_pass(
                 # Build index of valid positions (CPU long)
                 pos_idx = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)
 
-                # Preallocate H_hat with zeros and fill only at valid positions (loop kept scalar-only)
-                H_hat_arr = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
+                # Decide format from signature; always store Ĥ
+                sig = cache.manifest.get('signature', {})
+                use_u8 = bool(sig.get('H_hat_u8', True))
+
+                # Preallocate and compute per-position truncated entropy only for valid positions
+                H_arr = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
                 for pos_t in pos_idx:
                     pos = int(pos_t.item())
-                    H_hat = truncated_entropy_topk_tail_midpoint(pred_i[pos], k=k_approx)
-                    H_hat_arr[pos] = H_hat
+                    H_val = truncated_entropy_topk_tail_midpoint(pred_i[pos], k=k_approx)
+                    H_arr[pos] = H_val
+                if use_u8:
+                    # Quantize to uint8 using cap = ln(V) (natural units), monotonic for selection tasks
+                    H_cap = max(1e-6, math.log(max(2, V)))
+                    H_norm = (H_arr.clamp(min=0.0, max=H_cap) / H_cap) * 255.0
+                    H_stored = torch.round(H_norm).to(torch.uint8).cpu()  # [L-1]
+                else:
+                    H_stored = H_arr.to(torch.float16).cpu()
                 # Build fixed-U packed rows with Gumbel sampling (batched over valid rows)
-                sig = cache.manifest.get('signature', {})
                 tau_target = float(sig.get('kd_temperature', 1.0))
                 U_max = int(sig.get('rs_vocab_samples', 12))  # number of unique tokens to store per position for the subsequent sampling
                 N_samples = int(sig.get('rs_samples', S_SAMPLES_DEFAULT))
@@ -459,7 +470,7 @@ def _build_cache_pass(
                     "key": key,
                     "valid_mask": valid_i.cpu(),
                     "topk_m": k_approx,
-                    "H_hat": H_hat_arr.to(torch.float16).cpu(),  # [L-1]
+                    ("H_hat_u8" if use_u8 else "H_hat"): H_stored,
                     "rs": {
                         "U": int(U_max),
                         "N": int(N_samples),
@@ -587,12 +598,13 @@ def build_offline_cache_if_needed(
         "max_seq_len": int(getattr(config, "max_seq_len", 0)),
         "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
         # RS packing/signature knobs
-        "kd_temperature": float(getattr(config, "kd_temperature", getattr(config, "kd_temperature", 1.0))),
+        "kd_temperature": float(getattr(config, "kd_temperature", 1.0)),
         "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
         "rs_samples": int(getattr(config, "rs_samples", S_SAMPLES_DEFAULT)),
         "id_bits": int(ID_BITS),
         "prob_bits": int(PROB_BITS),
         "dataset_len": int(len(dataloader.dataset)) if hasattr(dataloader, "dataset") else -1,
+        "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
     }
 
     if cache.signature_matches(sig):
