@@ -27,8 +27,9 @@ START_TIME_EPOCH=$(date +%s)
 echo "Job started at $START_TIME"
 
 # Convert hyphens to underscores for directory names
+DATE_TAG=$(date +%Y%m%d_%H%M)
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/models/model_${SLURM_JOB_ID}"
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/models/model_${SLURM_JOB_ID}_${DATE_TAG}_${DISTILL_TYPE_DIR}_k${K_PERCENT}"
 EVAL_OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/eval"
 
 # Default virtual environment directory
@@ -40,6 +41,7 @@ echo "DISTILL_TYPE      = $DISTILL_TYPE"
 echo "K_PERCENT         = $K_PERCENT"
 echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
 echo "KD_SWEEP_TAG      = $KD_SWEEP_TAG"
+echo "DATE_TAG          = $DATE_TAG"
 echo "VENV_DIR          = $VENV_DIR"
 echo "OUTPUT_DIR        = $OUTPUT_DIR"
 echo "User              = $USER"
@@ -246,4 +248,13 @@ if [[ -n "$EVAL_SUITE" ]]; then
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."
+fi
+
+# Also save a copy of the log with a descriptive filename
+SAFE_TYPE="$DISTILL_TYPE_DIR"
+RICH_LOG="results/logs/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
+SRC_LOG="logs/train.${SLURM_JOB_ID}.log"
+if [[ -f "$SRC_LOG" ]]; then
+  cp -f "$SRC_LOG" "$RICH_LOG" || true
+  echo "Saved rich log copy to $RICH_LOG"
 fi

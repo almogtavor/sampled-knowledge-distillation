@@ -11,7 +11,7 @@ import hashlib
 import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -298,8 +298,8 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("svamp", 100),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
-    ("arc_challenge", 300),
-    ("arc_easy", 300),
+    ("arc_challenge", 200),
+    ("arc_easy", 200),
     # ("hellaswag", 500),
     # ("piqa", 500),
     # exact-match
@@ -425,6 +425,8 @@ def run_lmeval_suite(
     # Random limiting flags have changed across versions; detect both variants
     _has_limit_type = _help_code == 0 and ("--limit-type" in _help_out)
     _has_limit_mode = _help_code == 0 and ("--limit_mode" in _help_out)
+    # Per-sample logging (needed for ECE)
+    _has_log_samples = _help_code == 0 and ("--log_samples" in _help_out)
 
     base_args = [
         "lm-eval",
@@ -433,6 +435,11 @@ def run_lmeval_suite(
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
+    # Enable per-sample logging if supported (helps compute ECE later)
+    if _has_log_samples:
+        base_args += ["--log_samples"]
+    else:
+        print("[lm-eval] This lm-eval version lacks --log_samples; will skip ECE metrics.")
     if _has_seed_flag:
         base_args += ["--seed", str(seed)]
     elif _has_fewshot_seed_flag:
@@ -502,6 +509,135 @@ def run_lmeval_suite(
                 task_status[task] = f"failed:{rc}"
         i += len(gpu_ids)
     return out_dir if good_any else None, task_status
+
+# ---------- ECE (Expected Calibration Error) from LM-Eval samples ----------
+def _softmax(xs: List[float]) -> List[float]:
+    if not xs:
+        return []
+    m = max(xs)
+    exps = [math.exp(x - m) for x in xs]
+    s = sum(exps)
+    return [e / s for e in exps]
+
+def compute_ece(confidences: List[float], correctness: List[int], n_bins: int = 15) -> float:
+    """Compute Expected Calibration Error for top-1 predictions.
+
+    Args:
+        confidences: list of predicted top-1 probabilities in [0,1]
+        correctness: list of 0/1 indicating if prediction was correct
+        n_bins: number of equal-width bins over [0,1]
+    Returns:
+        Scalar ECE value in [0,1].
+    """
+    assert len(confidences) == len(correctness)
+    n = len(confidences)
+    if n == 0:
+        return float("nan")
+    # Initialize bins
+    bins: List[List[int]] = [[] for _ in range(n_bins)]
+    bin_confs: List[List[float]] = [[] for _ in range(n_bins)]
+    for c, y in zip(confidences, correctness):
+        # Clamp to [0,1]
+        c = 0.0 if c < 0 else (1.0 if c > 1 else c)
+        # Rightmost-inclusive for c==1.0
+        idx = min(int(c * n_bins), n_bins - 1)
+        bins[idx].append(int(y))
+        bin_confs[idx].append(float(c))
+    ece = 0.0
+    for i in range(n_bins):
+        m = len(bins[i])
+        if m == 0:
+            continue
+        acc_i = sum(bins[i]) / m
+        conf_i = sum(bin_confs[i]) / m
+        ece += (m / n) * abs(acc_i - conf_i)
+    return ece
+
+def _parse_sample_line_for_mc(line: Dict[str, Any]) -> Optional[Tuple[List[float], int]]:
+    """Attempt to extract (choice_scores, gold_index) from an lm-eval sample JSONL line.
+
+    Returns list of scores (higher is better, e.g., log-likelihoods) and gold index.
+    Returns None if the line does not look like a multiple-choice sample with usable data.
+    """
+    # Try common fields for label index
+    gold_idx = None
+    for k in ("label", "gold_idx", "gold_index"):
+        if isinstance(line.get(k), int):
+            gold_idx = int(line[k])
+            break
+    if gold_idx is None:
+        # Some tasks log gold as letter (A/B/C/D)
+        gold = line.get("gold") or line.get("answer")
+        if isinstance(gold, str) and len(gold) == 1 and gold in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            gold_idx = ord(gold) - ord('A')
+    # Collect choice scores
+    scores: Optional[List[float]] = None
+    # Direct list of numbers
+    if isinstance(line.get("choice_scores"), list) and all(isinstance(x, (int, float)) for x in line["choice_scores"]):
+        scores = [float(x) for x in line["choice_scores"]]
+    # Choices as list of dicts with score-like fields
+    if scores is None and isinstance(line.get("choices"), list) and line["choices"]:
+        cand_keys = ("loglikelihood", "logprob", "score")
+        first = line["choices"][0]
+        if isinstance(first, dict):
+            for k in cand_keys:
+                if k in first and all(isinstance(c.get(k), (int, float)) for c in line["choices"]):
+                    scores = [float(c[k]) for c in line["choices"]]
+                    break
+    if scores is None or gold_idx is None:
+        return None
+    if not (0 <= gold_idx < len(scores)):
+        return None
+    return scores, gold_idx
+
+def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) -> Dict[str, Dict[str, float]]:
+    """Parse lm-eval sample logs (if present) and compute ECE per multiple-choice task.
+
+    Looks for samples/*.jsonl under the lm-eval output directory, extracts per-example
+    choice scores and gold labels, converts scores to probabilities with softmax,
+    and computes top-1 ECE.
+    """
+    if not lmeval_dir or not lmeval_dir.exists():
+        return {}
+    # Gather all sample files
+    sample_files = list(lmeval_dir.rglob("*.jsonl"))
+    # Filter to the typical samples/ subdir first if present
+    preferred = [p for p in sample_files if "samples" in p.as_posix().split("/")]
+    files = preferred or sample_files
+    per_task: Dict[str, Dict[str, float]] = {}
+    for p in files:
+        try:
+            # Task name from filename (strip extension)
+            task_name = p.stem
+            confidences: List[float] = []
+            correctness: List[int] = []
+            with open(p, "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        obj = json.loads(ln)
+                    except Exception:
+                        continue
+                    parsed = _parse_sample_line_for_mc(obj)
+                    if parsed is None:
+                        continue
+                    scores, gold_idx = parsed
+                    probs = _softmax(scores)
+                    if not probs:
+                        continue
+                    pred_idx = int(max(range(len(probs)), key=lambda i: probs[i]))
+                    conf = float(probs[pred_idx])
+                    confidences.append(conf)
+                    correctness.append(1 if pred_idx == gold_idx else 0)
+            if len(confidences) >= 10:
+                ece = compute_ece(confidences, correctness, n_bins=bins)
+                per_task.setdefault(task_name, {})["ece"] = float(ece)
+                per_task[task_name]["ece_n"] = float(len(confidences))
+        except Exception as e:
+            print(f"Failed to compute ECE from {p}: {e}")
+    return per_task
 
 # ---------- Lighteval (summarization) ----------
 def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
@@ -811,6 +947,37 @@ def save_json(obj: dict, path: Path) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     print(f"[json] Wrote {path}")
 
+def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """Compute macro-averages across tasks for each numeric metric.
+
+    - Excludes keys ending with '_stderr'.
+    - Excludes obvious count-like fields such as 'ece_n'.
+    - Returns per-metric averages and 'avg_all' over the per-task combined means.
+    """
+    metric_values: Dict[str, List[float]] = {}
+    # Accumulate values per metric key across tasks
+    for task_metrics in merged.values():
+        for mk, mv in task_metrics.items():
+            if not isinstance(mv, (int, float)):
+                continue
+            if mk.endswith("_stderr"):
+                continue
+            if mk in {"ece_n"}:
+                continue
+            if not math.isfinite(float(mv)):
+                continue
+            metric_values.setdefault(mk, []).append(float(mv))
+    # Compute simple means
+    averages: Dict[str, float] = {}
+    for mk, vals in metric_values.items():
+        if vals:
+            averages[f"avg_{mk}"] = sum(vals) / len(vals)
+    # Overall average across metric means (if any)
+    per_metric_means = [v for k, v in averages.items()]
+    if per_metric_means:
+        averages["avg_all"] = sum(per_metric_means) / len(per_metric_means)
+    return averages
+
 # ---------- Main pipeline ----------
 def main():
     parser = argparse.ArgumentParser()
@@ -895,6 +1062,8 @@ def main():
             suite=args.suite,
         )
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
+        # Derive ECE from sample logs when available
+        ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
 
         # Summarization (HEAVY only)
         lighteval_file = run_lighteval(model_dir, tag, results_dir, suite=args.suite)
@@ -921,6 +1090,7 @@ def main():
 
         merged = merge_model_results([
             lmeval_metrics,
+            ece_metrics,
             lighteval_metrics,
             he_metrics,
             mbpp_metrics,
@@ -934,7 +1104,8 @@ def main():
         # --- Save results to JSON for this model ---
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
-        payload = {"tag": tag, "suite": args.suite, "results": merged, "task_status": task_status}
+        averages = compute_averages(merged)
+        payload = {"tag": tag, "suite": args.suite, "results": merged, "averages": averages, "task_status": task_status}
         save_json(payload, json_result_file)
 
         # Log results to W&B and TensorBoard
