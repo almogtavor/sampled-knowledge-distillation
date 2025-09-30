@@ -13,7 +13,7 @@
 \usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 \usepackage{amsmath} % Added for \tfrac and other math commands
 \usepackage{amssymb} % Added for \mathbb and additional math symbols
-
+\usepackage{adjustbox}
 % For proper rendering and hyphenation of words containing Latin characters (including in bib files)
 \usepackage[T1]{fontenc}
 % For Vietnamese characters
@@ -32,6 +32,7 @@
 % However, it will improve the aesthetics of text in
 % the typewriter font.
 \usepackage{inconsolata}
+\usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 
 
 % If the title and author information does not fit in the area allocated, uncomment the following
@@ -104,7 +105,7 @@ $
 $
 denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,         \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,          \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -240,10 +241,79 @@ $\alpha{=}1$,
 $\alpha_{\text{ce}}\!\in\![0.05,0.2]$.
 A tiny probability floor prevents numerical blow-ups in $1/q$.
 
+\begin{table}[t]
+	\centering
+	\begin{adjustbox}{max width=\linewidth}
+		\begin{tabular}{lrrr}
+			\toprule
+			Method                    & Entries / token          & B / entry & Total (TB)   \\
+			\midrule
+			Full KD                   & 100{,}000                & 1         & 10{,}000.0   \\
+			Top-K 300                 & 300                      & 3         & 90.0         \\
+			RS-KD (paper)             & 12                       & 3         & 3.6          \\
+			\textbf{Ours (+H=1B)}     & 12                       & 3         & \textbf{3.7} \\
+			\quad offline sel.~(25\%) & $12 \!\times\! 0.25 = 3$ & 3         & \textbf{0.9} \\
+			Vanilla CE                & 1                        & 3         & 0.3          \\
+			\bottomrule
+		\end{tabular}
+	\end{adjustbox}
+	\caption{Cache footprint for $N{=}10^{11}{=}100B$ train tokens. RS-KD (paper) follows their packing: 17-bit vocab id + 7-bit prob $=$ 3 B per sampled logit, 12 samples/token $\Rightarrow$ 36 B/token (3.6 TB). \textit{Ours} stores the same 12$\times$3 B plus a per-position entropy $\hat H$ in uint8 (additional 1 B/token), totaling 37 B/token (3.7 TB). The \textit{offline sel.~(25\%)} variant assumes deterministic preselection of the top-25\% positions, so $\hat H$ is omitted and storage scales by $k{=}0.25$ to $0.25\!\cdot\!12\!\cdot\!3=9$ B/token (0.9 TB). Totals use decimal TB, $\mathrm{TB}=\text{bytes/token}\times N/10^{12}$.}
+	\label{tab:storage}
+\end{table}
+
+\subsection{Storage accounting}
+Our cache packs each stored vocab sample into exactly 3 bytes: a 17-bit token id and a 7-bit probability (q7), written as a single 24-bit word. In addition, we store a per-position entropy approximation $\hat H$ in uint8 (1 byte). With $U{=}12$ stored samples per valid position, the average cost is
+\[
+	\text{B/token} = U \cdot 3 \;+ \underbrace{1}_{\text{uint8 }\hat H}
+	= 12\cdot 3 + 1 = 37\text{B/token},
+\]
+which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
+\[
+	\underbrace{(12 \cdot 3)}_{\text{RS-KD }=36} \;+\; \underbrace{1}_{\text{ours}}
+	= 37\text{B/token}.
+\]
+
+If the selection strategy is fixed and deterministic (e.g., always distill on the top-25\% highest-entropy positions chosen offline), we can achieve substantial additional storage \& compute savings by omitting $\hat H$ entirely and only retain RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
+\begin{align*}
+	\text{bytes/token} \;=\; k \cdot U \cdot 3
+	\;=\; 0.25 \cdot 12 \cdot 3 \\
+	\;=\; 9~\text{B/token} \quad\Rightarrow\quad 0.9~\text{TB}.
+\end{align*}
+We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache, but the one-time offline preselection is straightforward and offers an additional $\sim\!\times4$ reduction when $k{=}25\%$.
+
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach. Models are pretrained on FineWeb-Edu for 1M tokens and evaluated zero-shot. All evaluations report pass@1 accuracy as the primary metric.
+\subsection{Datasets}
+
+\paragraph{Mathematical reasoning.}
+\textbf{GSM8K} \citep{cobbe2021gsm8k} contains grade-school math word problems with natural language solutions. We use the standard train/test split for distillation training and evaluation.
+\textbf{SVAMP} \citep{patel2021svamp} provides single-step arithmetic reasoning problems with algebraic variations. We leverage the available train/test split for consistent evaluation.
+
+\paragraph{Reading comprehension and commonsense reasoning.}
+\textbf{LAMBADA (OpenAI)} \citep{paperno2016lambada} tests language models' ability to predict the final word of passages requiring broad context. Since this benchmark provides only a test set without an official training split, we use it exclusively for zero-shot evaluation.
+\textbf{HellaSwag} \citep{zellers2019hellaswag} requires selecting the most plausible continuation of everyday scenarios. We use the standard train/validation/test split.
+\textbf{PIQA} \citep{bisk2020piqa} evaluates physical commonsense reasoning through questions about everyday situations. Evaluation follows the train/validation/test split.
+
+\paragraph{Science and knowledge.}
+\textbf{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
+
+\paragraph{Competition-level benchmarks.}
+\textbf{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination. 
+\textbf{IFEval} \citep{zhou2023ifeval} assesses instruction following through verifiable constraints.
+
+\subsection{Experimental setup}
+
+For benchmarks with available training splits (GSM8K, SVAMP, ARC-Challenge, ARC-Easy, HellaSwag, PIQA), we apply SampledKD during student training and evaluate on the respective test sets. For evaluation-only benchmarks (LAMBADA, AIME'25, IFEval), we assess the distilled models in a zero-shot setting to measure knowledge transfer effectiveness.
+
+All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
 
 \section{Related Work}
 
-\subsection{KD for LLMs} Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs: sequence-level KD for NMT \citep{kim2016sequencekd}, reverse-KL objectives for generation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation (GKD) to mitigate exposure bias \citep{agarwal2024gkd}. Cross-tokenizer distillation has been addressed by Universal Logit Distillation (ULD) via optimal transport \citep{boizard2024uld}.
+Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e.g., DistilBERT \citep{sanh2019distilbert}) have been extended to generative LMs, including sequence-level KD for neural machine translation (NMT) \citep{kim2016sequencekd}, student-to-teacher KL distillation (MiniLLM) \citep{gu2023minillm}, and on-policy distillation, where the student generates its own text and learns from the teacher's feedback, to mitigate exposure bias (GKD) \citep{agarwal2024gkd}.
+More recently, cross-tokenizer distillation has been enabled by Universal Logit Distillation (ULD) \citep{boizard2024uld} and others.
 
 \subsection{Sparse logit KD and calibration}
 Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students.
@@ -296,7 +366,7 @@ Thus, the entropy tail is
 with unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
