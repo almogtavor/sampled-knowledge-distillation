@@ -295,11 +295,11 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
     ("gsm8k", 50),
-    ("svamp", 100),
+    ("svamp", 50),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
-    ("arc_challenge", 200),
-    ("arc_easy", 200),
+    ("arc_challenge", 50),
+    ("arc_easy", 50),
     # ("hellaswag", 500),
     # ("piqa", 500),
     # exact-match
