@@ -80,7 +80,11 @@
 
 \section{Introduction}
 
-Large language models (LLMs) deliver state-of-the-art performance but are costly to serve and adapt. Knowledge distillation (KD) amortizes these costs by training a compact student to imitate a larger teacher \citep{hinton2015distillation}. While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) \textbf{train-inference mismatch} in sequence generation, and (ii) \textbf{efficiency limits} from storing or querying full teacher logits.
+Large language models (LLMs) achieve state-of-the-art results across diverse tasks, but their size makes them expensive to serve and difficult to adapt.
+Recent work shows that a small fraction of high-entropy "forking" tokens disproportionately drives learning in reinforcement learning from reasoning tasks \citep{wang2025highentropy}, suggesting that selective supervision may yield better efficiency-accuracy trade-offs.
+Motivated by this insight, we study knowledge distillation (KD), a standard approach that compresses LLMs by training a smaller student model to imitate a larger teacher \citep{hinton2015distillation}, and ask whether focusing KD on these high-entropy tokens can deliver more efficient distillation without sacrificing performance.
+
+While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) train-inference mismatch in sequence generation, and (ii) efficiency limits from storing or querying full teacher logits.
 
 To address (i), recent work proposes on-policy distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd} or replacing them if uninformative (SKD) \citep{xu2024speculative}.
 To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
