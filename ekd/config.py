@@ -1,5 +1,6 @@
+from typing import List, Literal, Optional
+
 from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
 
 
 class TrainingConfig(BaseModel):
@@ -10,14 +11,10 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd"] = "vanilla"
+    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
     alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")    
-    # RS-KD parameters (for distill_type="pos-rs-kd")
-    rs_alpha: float = Field(default=1.0, description="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
-    rs_epsilon: float = Field(default=0.02, description="Mixture with uniform for tail coverage: q ← (1-ε)q + ε·uniform")
-    rs_floor: float = Field(default=1e-6, description="Minimum probability floor to avoid huge weights / degeneracy")
     kd_temperature: float = Field(default=1.0, description="Unified KD temperature used for teacher/student log-softmax and loss scaling")
     entropy_approx_temperature: float = Field(default=1.0, description="Temperature used during offline pass for entropy approximation (and RS-KD proposal if applicable)")
     # KD temperature annealing (optional)
@@ -33,6 +30,22 @@ class TrainingConfig(BaseModel):
     # Bucket mode parameters (for distill_type="bucket")
     bucket_lower_percent: int = Field(default=70, description="Lower bound for bucket mode (e.g., 70% means skip bottom 70%)")
     bucket_upper_percent: int = Field(default=80, description="Upper bound for bucket mode (e.g., 80% means skip top 20%)")
+
+    # Score-KD parameters
+    score_token_selection: bool = Field(default=False, description="Use composite score (entropy + student CE + KL) to rank tokens instead of pure entropy")
+    score_normalize: Literal["none", "z", "minmax"] = "z"
+    score_entropy_weight: float = Field(default=1.0, description="Weight for teacher entropy component in score-based KD")
+    score_ce_weight: float = Field(default=1.0, description="Weight for student cross-entropy component in score-based KD")
+    score_kl_weight: float = Field(default=1.0, description="Weight for teacher-student KL component in score-based KD")
+
+    # LinUCB contextual bandit parameters
+    bandit_alpha: float = Field(default=1.0, description="Exploration coefficient for LinUCB (higher = more exploratory)")
+    bandit_lambda: float = Field(default=1.0, description="L2 regularization for LinUCB covariance matrix")
+    bandit_threshold: float = Field(default=0.0, description="Minimum UCB score for a token to be selected")
+    bandit_min_tokens: int = Field(default=1, description="Minimum number of tokens to distill per example when using LinUCB")
+    bandit_max_tokens: Optional[int] = Field(default=None, description="Optional cap on tokens distilled per example in LinUCB mode")
+    bandit_device: str = Field(default="cpu", description="Device to maintain the LinUCB statistics on (cpu or cuda)")
+    bandit_reward_clip: float = Field(default=5.0, description="Absolute clip value applied to KL improvement rewards before LinUCB update")
     
     # Dataset settings
     datasets: List[str]
