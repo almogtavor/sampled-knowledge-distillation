@@ -162,6 +162,54 @@ No need to specify the original base model; the evaluator reads it from the chec
 - **Cache management**: Handled via SLURM environment variables
 - **Results**: Logged to W&B and TensorBoard
 
+## 🌀 How to run (Slurm + W&B Sweeps)
+
+We support both one-off Slurm runs and Weights & Biases Sweeps.
+
+### Slurm (single run)
+
+Run a training job with your desired method and K:
+
+```bash
+sbatch train.slurm top-k-tok 20 light 3
+#            ^distill_type ^k_percent ^eval   ^epochs
+```
+
+Defaults used by the script:
+- Dataset: FineWeb-Edu streaming (respecting `FINEWEB_TOKENS`, default 5,000,000)
+- Models: teacher=`Qwen/Qwen3-8B`, student=`Qwen/Qwen3-0.6B`
+- Checkpoints saved to `kd_<method>_run_out_models/model_<JOBID>`
+
+Monitor logs:
+
+```bash
+tail -f logs/train.<jobid>.log
+```
+
+### W&B Sweeps (grid launchers)
+
+We provide ready-to-use sweep YAMLs in `sweeps/`. First, create a sweep and then start an agent.
+
+1) Create a sweep (pick one):
+
+```bash
+wandb sweep sweeps/sweep_compare_k.yaml
+wandb sweep sweeps/sweep_compare_methods.yaml
+wandb sweep sweeps/sweep_anneal_compare_methods.yaml
+```
+
+2) Copy the printed SWEEP_ID (e.g., `user/project/abcd1234`) and start an agent:
+
+```bash
+wandb agent user/project/abcd1234
+```
+
+Notes:
+- The Slurm script exports all environment variables (`#SBATCH --export=ALL`) so the agent’s `WANDB_*` env flows into the job.
+- You can run multiple agents (even on different nodes) to parallelize submissions; Slurm will queue them.
+- For a quick pass, edit the YAML to set `epochs: [1]`.
+- To customize the virtual env per run, add a sweep param and pass `--venv=${venv}` to the command in the YAML.
+
 ## � Entropy Ablation (Top‑k overlap)
 
 Use `ablate.slurm` to run the entropy agreement ablation between exact entropy and truncated Top‑k+Tail.

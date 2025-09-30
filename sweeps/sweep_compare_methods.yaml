@@ -1,0 +1,24 @@
+# sweep_compare_methods.yaml
+name: compare_methods
+method: grid
+parameters:
+  distill_type:
+    values: ["vanilla", "top-k-tok", "random", "pos-rs-kd"]
+  k_percent:
+    values: [20]
+  eval_suite:
+    values: ["light"]
+  epochs:
+    values: [3]
+  anneal_flag:
+    values: [""]
+command:
+  - bash
+  - -lc
+  - >
+    sbatch train.slurm
+    ${distill_type}
+    ${k_percent}
+    ${eval_suite}
+    ${epochs}
+    ${anneal_flag}

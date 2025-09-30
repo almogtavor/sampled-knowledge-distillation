@@ -1,0 +1,24 @@
+# sweep_compare_k.yaml
+name: compare_k
+method: grid
+parameters:
+  distill_type:
+    values: ["top-k-tok"]   # set to ["vanilla"] if you want the vanilla-only sweep
+  k_percent:
+    values: [0, 1, 2, 5, 10, 12, 15, 20, 25, 30, 40, 50, 75, 100]
+  eval_suite:
+    values: ["light"]       # matches kd_sweep.sh default
+  epochs:
+    values: [3]             # set to [1] for a quick pass
+  anneal_flag:
+    values: [""]            # no annealing
+command:
+  - bash
+  - -lc
+  - >
+    sbatch train.slurm
+    ${distill_type}
+    ${k_percent}
+    ${eval_suite}
+    ${epochs}
+    ${anneal_flag}
