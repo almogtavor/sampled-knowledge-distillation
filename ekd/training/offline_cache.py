@@ -403,23 +403,29 @@ def _build_cache_pass(
         for batch in dataloader:
             input_ids = batch["input_ids"]  # [B, L]
             attn_mask = batch["attention_mask"]  # [B, L]
+
+            # If every item in this batch is already present, skip teacher forward entirely.
+            B = int(input_ids.size(0))
+            keys = [TeacherOfflineCache.key_from_ids(input_ids[i]) for i in range(B)]
+            present = [cache.has(k) for k in keys]
+            if all(present):
+                continue
+
+            # Otherwise, run teacher once for the whole batch and only write missing items.
             input_ids_t = input_ids.to(teacher_device)
             attn_t = attn_mask.to(teacher_device)
-
-            out = teacher(
-                input_ids_t, attention_mask=attn_t, output_hidden_states=False
-            )
+            out = teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False)
             t_logits = sanitize_logits_fn(out.logits, "teacher")  # [B,L,V]
 
-            B, L, V = t_logits.shape
+            _, L, V = t_logits.shape
             V_last = V
             t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
             valid_next = attn_mask[:, 1:].bool()  # [B, L-1]
 
             # per example
             for i in range(B):
-                key = TeacherOfflineCache.key_from_ids(input_ids[i])
-                if cache.has(key):
+                key = keys[i]
+                if present[i]:
                     continue
 
                 valid_i = valid_next[i]  # [L-1] (bool on CPU)
@@ -561,6 +567,10 @@ def _recompute_and_persist_stats(
     if V_base:
         stats["baseline_full_logits_bytes"] = int(total_valid_positions * V_base * 4)
 
+    # Also persist the total number of valid positions cached across all items
+    # as a proxy for "tokens written" into the cache.
+    stats["tokens_written"] = int(total_valid_positions)
+
     # Persist stats in manifest
     cache.manifest.setdefault("stats", {})
     cache.manifest["stats"] = stats
@@ -656,6 +666,16 @@ def build_offline_cache_if_needed(
         total_items = len(cache.manifest.get("items", {}))
         print(f"[logits-cache][warn] Stats recompute failed: {e}. Continuing without stats.")
     build_wall_elapsed = time.time() - build_wall_start
+
+    # Enrich stats with dataset name for traceability
+    try:
+        ds_list = list(getattr(config, "datasets", []))
+        dataset_name = " ".join(ds_list) if ds_list else "unknown"
+        cache.manifest.setdefault("stats", {})
+        cache.manifest["stats"].update({"dataset_name": dataset_name})
+        cache.save_manifest()
+    except Exception:
+        pass
 
     saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))
     print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")

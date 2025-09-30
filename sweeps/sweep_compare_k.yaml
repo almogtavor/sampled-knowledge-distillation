@@ -9,16 +9,19 @@ parameters:
   eval_suite:
     values: ["light"]       # matches kd_sweep.sh default
   epochs:
-    values: [3]             # set to [1] for a quick pass
+    values: [1]             # set to [1] for a quick pass
   anneal_flag:
     values: [""]            # no annealing
 command:
   - bash
   - -lc
   - >
-    sbatch train.slurm
+    JOB_ID=$(sbatch --parsable --export=ALL
+    train.slurm
     ${distill_type}
     ${k_percent}
-    ${eval_suite}
-    ${epochs}
-    ${anneal_flag}
+    ${epochs});
+    echo "Submitted SLURM job ${JOB_ID}";
+    # Wait until the job leaves the queue (RUNNING/COMPLETED/FAILED/etc.)
+    while squeue -h -j "${JOB_ID}" >/dev/null 2>&1; do sleep 20; done;
+    echo "SLURM job ${JOB_ID} finished."
