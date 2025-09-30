@@ -61,3 +61,21 @@ def process_docs_aimo(dataset):
         return {"test": test}
     else:  # Single Dataset (when test_split is specified)
         return dataset.map(_map)
+
+# utils.py
+from typing import Any
+
+def process_docs_ifeval(dataset: Any):
+    def _map(row):
+        # IFEval rows have 'prompt' (the instruction to follow)
+        prompt = row.get("prompt") or ""
+        # No gold 'answer' in IFEval; leave empty string
+        return {"input": prompt, "answer": ""}
+
+    # Support both DatasetDict and single Dataset (when test_split specified)
+    if hasattr(dataset, "keys"):  # DatasetDict
+        split = "test" if "test" in dataset else next(iter(dataset.keys()))
+        mapped = dataset[split].map(_map)
+        return {"test": mapped}
+    else:
+        return dataset.map(_map)
