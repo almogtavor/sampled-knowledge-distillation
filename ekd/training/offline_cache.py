@@ -395,6 +395,7 @@ def _build_cache_pass(
     """
     teacher.eval()
     build_start_time = time.time()
+    last_log_time = build_start_time
     maybe_cache = 0
     V_last = None
     with torch.no_grad():
@@ -472,8 +473,14 @@ def _build_cache_pass(
                 maybe_cache += 1
                 # periodic progress print every 100 items
                 if maybe_cache % 100 == 0:
-                    elapsed = time.time() - build_start_time
-                    print(f"[logits-cache] Progress: cached {maybe_cache} new items so far... elapsed={elapsed:.2f}s")
+                    now = time.time()
+                    total_elapsed = now - build_start_time
+                    delta_elapsed = now - last_log_time
+                    print(
+                        f"[logits-cache] Progress: cached {maybe_cache} new items so far... "
+                        f"total={total_elapsed:.2f}s, since_prev={delta_elapsed:.2f}s"
+                    )
+                    last_log_time = now
     return maybe_cache, V_last
 
 
