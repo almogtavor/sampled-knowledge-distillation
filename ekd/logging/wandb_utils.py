@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, TYPE_CHECKING
 from datetime import datetime
+import re
 
 # Optional imports
 try:
@@ -103,13 +104,15 @@ class WandBLogger:
         """Log an artifact to W&B."""
         if self.enabled and self.run:
             try:
-                artifact = wandb.Artifact(name=name, type=type, description=description)
+                # W&B artifact name may only contain [A-Za-z0-9_.-]
+                safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", name)
+                artifact = wandb.Artifact(name=safe_name, type=type, description=description)
                 if os.path.isdir(artifact_path):
                     artifact.add_dir(artifact_path)
                 else:
                     artifact.add_file(artifact_path)
                 self.run.log_artifact(artifact)
-                print(f"Artifact '{name}' logged to W&B")
+                print(f"Artifact '{safe_name}' logged to W&B")
             except Exception as e:
                 print(f"Error logging artifact to W&B: {e}")
 
