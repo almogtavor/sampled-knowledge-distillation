@@ -212,10 +212,8 @@ unset PYTHONPATH PYTHONHOME
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
-  --datasets "gsm8k" \
-  --dataset_config "main" \
-  --prompt_col "question" \
-  --answer_col "answer" \
+  --datasets "fineweb" \
+  --fineweb_tokens "${FINEWEB_TOKENS:-5000000}" \
   --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 16 \
