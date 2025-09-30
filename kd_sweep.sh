@@ -70,6 +70,27 @@ elif [[ "$MODE" == "anneal_method" ]]; then
   K_ARG="$3"
   sbatch train.slurm "$METHOD" "$K_ARG" "$KD_SWEEP_TAG" anneal
 
+elif [[ "$MODE" == "score_weights" ]]; then
+  # Sweep score-based top-k weighting combinations at fixed K
+  # ex: `bash kd_sweep.sh score_weights 25`
+  K_SCORE="${2:-25}"
+  METHOD="top-k-tok"
+  SCORE_NORM_DEFAULT="${SCORE_NORMALIZE_OVERRIDE:-z}"
+  read -r -d '' SCORE_COMBOS <<'EOF'
+e_only 1.0 0.0 0.0
+balanced 1.0 1.0 1.0
+entropy_kl 1.0 0.0 1.0
+ce_heavy 0.5 1.5 0.0
+kl_heavy 0.5 0.0 1.5
+kl_tilt 0.0 0.5 1.5
+moderate 0.8 0.8 0.4
+EOF
+  while read -r LABEL W_ENT W_CE W_KL; do
+    [[ -z "$LABEL" ]] && continue
+    echo "[score_weights] Submitting $LABEL weights (ent=$W_ENT ce=$W_CE kl=$W_KL)"
+    sbatch --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "" "$KD_SWEEP_TAG"
+  done <<< "$SCORE_COMBOS"
+
 else
   usage; exit 1
 fi

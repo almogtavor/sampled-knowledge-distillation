@@ -45,6 +45,30 @@ echo "User              = $USER"
 echo "GPUs requested    = $SLURM_GPUS"
 echo "======================"
 
+# ---------- optional score-based selection overrides ----------
+SCORE_TOKEN_SELECTION=${SCORE_TOKEN_SELECTION:-0}
+SCORE_NORMALIZE=${SCORE_NORMALIZE:-}
+SCORE_ENTROPY_WEIGHT=${SCORE_ENTROPY_WEIGHT:-}
+SCORE_CE_WEIGHT=${SCORE_CE_WEIGHT:-}
+SCORE_KL_WEIGHT=${SCORE_KL_WEIGHT:-}
+
+EXTRA_ARGS=()
+if [[ "$SCORE_TOKEN_SELECTION" == "1" ]]; then
+  EXTRA_ARGS+=(--score_token_selection)
+fi
+if [[ -n "$SCORE_NORMALIZE" ]]; then
+  EXTRA_ARGS+=(--score_normalize "$SCORE_NORMALIZE")
+fi
+if [[ -n "$SCORE_ENTROPY_WEIGHT" ]]; then
+  EXTRA_ARGS+=(--score_entropy_weight "$SCORE_ENTROPY_WEIGHT")
+fi
+if [[ -n "$SCORE_CE_WEIGHT" ]]; then
+  EXTRA_ARGS+=(--score_ce_weight "$SCORE_CE_WEIGHT")
+fi
+if [[ -n "$SCORE_KL_WEIGHT" ]]; then
+  EXTRA_ARGS+=(--score_kl_weight "$SCORE_KL_WEIGHT")
+fi
+
 # ---------- caches / env ----------
 mkdir -p logs
 export TMPDIR="$PWD/tmp";               mkdir -p "$TMPDIR"
@@ -229,7 +253,8 @@ unset PYTHONPATH PYTHONHOME
   --output_dir "$OUTPUT_DIR" \
   --seed "${SEED:-1337}" \
   $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
-  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi)
+  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi) \
+  "${EXTRA_ARGS[@]}"
 
 END_TIME=$(date -u)
 END_TIME_EPOCH=$(date +%s)
