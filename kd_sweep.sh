@@ -13,12 +13,15 @@ usage() {
 
 MODE="$1"
 K_FIXED="${2:-20}"
+KD_SWEEP_TAG=$(date +%Y%m%d_%H%M)-$MODE
 
 # One label to group all runs from this invocation
 export KD_SWEEP_NAME="${KD_SWEEP_NAME:-$(date +%Y%m%d_%H%M)-$MODE}"
 # Optional W&B defaults propagated to jobs
 export WANDB_PROJECT="${WANDB_PROJECT:-selective-entropy-knowledge-distillation}"
 # export WANDB_ENTITY="your_team"
+
+echo Starting kd_sweep="$KD_SWEEP_TAG" jobs
 
 if [[ "$MODE" == "compare_k" ]]; then
   METHOD="${2:-top-k-tok}"
@@ -27,10 +30,10 @@ if [[ "$MODE" == "compare_k" ]]; then
   for K in 0 1 2 5 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
       echo "[compare_k] Submitting vanilla K=$K and waiting for completion..."
-      sbatch --wait train.slurm vanilla "$K" light
+      sbatch --wait train.slurm vanilla "$K" light "$KD_SWEEP_TAG"
     else
       echo "[compare_k] Submitting $METHOD K=$K and waiting for completion..."
-      sbatch --wait train.slurm "$METHOD" "$K" light
+      sbatch --wait train.slurm "$METHOD" "$K" light "$KD_SWEEP_TAG"
     fi
   done
 
@@ -41,9 +44,9 @@ elif [[ "$MODE" == "coarse_k" ]]; then
   # Submit with EPOCHS=1 to override train.slurm default
   for K in "${K_LIST[@]}"; do
     if [[ "$K" -eq 100 ]]; then
-      sbatch --export=ALL,EPOCHS=1 train.slurm vanilla "$K"
+      sbatch --export=ALL,EPOCHS=1 train.slurm vanilla "$K" "$KD_SWEEP_TAG"
     else
-      sbatch --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K"
+      sbatch --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K" "$KD_SWEEP_TAG"
     fi
   done
 
@@ -51,13 +54,13 @@ elif [[ "$MODE" == "coarse_k" ]]; then
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
-    sbatch train.slurm "$METHOD" "$K_FIXED"
+    sbatch train.slurm "$METHOD" "$K_FIXED" "$KD_SWEEP_TAG"
   done
 
 elif [[ "$MODE" == "anneal_compare_methods" ]]; then
   # Run all methods with temperature annealing enabled
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
-    sbatch train.slurm "$METHOD" "$K_FIXED" anneal
+    sbatch train.slurm "$METHOD" "$K_FIXED" "$KD_SWEEP_TAG" anneal
   done
 
 elif [[ "$MODE" == "anneal_method" ]]; then
@@ -65,7 +68,7 @@ elif [[ "$MODE" == "anneal_method" ]]; then
   [[ $# -lt 3 ]] && usage && exit 1
   METHOD="$2"
   K_ARG="$3"
-  sbatch train.slurm "$METHOD" "$K_ARG" anneal
+  sbatch train.slurm "$METHOD" "$K_ARG" "$KD_SWEEP_TAG" anneal
 
 else
   usage; exit 1
