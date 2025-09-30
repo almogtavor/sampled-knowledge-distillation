@@ -23,11 +23,14 @@ export WANDB_PROJECT="${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
 if [[ "$MODE" == "compare_k" ]]; then
   METHOD="${2:-top-k-tok}"
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)
+  # Run sequentially: wait for each job to finish before submitting the next
   for K in 0 1 2 5 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
-      sbatch train.slurm vanilla "$K" light
+      echo "[compare_k] Submitting vanilla K=$K and waiting for completion..."
+      sbatch --wait train.slurm vanilla "$K" light
     else
-      sbatch train.slurm "$METHOD" "$K" light
+      echo "[compare_k] Submitting $METHOD K=$K and waiting for completion..."
+      sbatch --wait train.slurm "$METHOD" "$K" light
     fi
   done
 

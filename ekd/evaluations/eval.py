@@ -288,7 +288,10 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 
 # NOTE: Task names follow lm-eval harness conventions. Some tasks may be unavailable
 # in older harness versions; failures are tolerated and reported.
-# LIGHT suite (coffee-break): strict caps via --limit (first-N selection by harness)
+# LIGHT suite (coffee-break): each tuple is (task, sample_count). We attempt to
+# draw a SEEDED RANDOM subset of that many samples per task (when the lm-eval CLI
+# supports random limiting). If the installed lm-eval version lacks such a flag,
+# we fall back to the harness default (typically first-N) and print a warning.
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
     ("gsm8k", 50),
@@ -297,8 +300,8 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     ("arc_challenge", 300),
     ("arc_easy", 300),
-    ("hellaswag", 500),
-    ("piqa", 500),
+    # ("hellaswag", 500),
+    # ("piqa", 500),
     # exact-match
     ("aime25", None),
     ("ifeval", None)
@@ -316,7 +319,6 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("svamp", None),
     ("asdiv", None), # arithmetic subset (ASDiv-A handled inside task)
     ("hendrycks_math", None),  # MATH
-    ("aime24", None),
     ("aime25", None),
     ("olympiadbench", None),
     ("piqa", None),
@@ -343,7 +345,6 @@ TASK_TIMEOUTS = {
     "hellaswag": 1200,
     "svamp": 900,
     "gsm8k": 1200,
-    "aime24": 900,
     "aime25": 2000,
     # heavy add-ons
     "asdiv": 1200,
@@ -416,9 +417,14 @@ def run_lmeval_suite(
     # Include local task YAMLs if present
     # Seed for downstream tools; default to env or EVAL_SEED set by main
     seed = int(os.environ.get("EVAL_SEED", "42"))
-    # Check if lm-eval CLI supports --seed (older versions may not)
+    # Probe lm-eval CLI support for seed and random limiting (version-dependent)
     _help_code, _help_out = run(["lm-eval", "--help"])
-    _lm_eval_supports_seed = _help_code == 0 and ("--seed" in _help_out or "--fewshot-seed" in _help_out)
+    _has_seed_flag = _help_code == 0 and ("--seed" in _help_out)
+    _has_fewshot_seed_flag = _help_code == 0 and ("--fewshot-seed" in _help_out)
+    _lm_eval_supports_seed = _has_seed_flag or _has_fewshot_seed_flag
+    # Random limiting flags have changed across versions; detect both variants
+    _has_limit_type = _help_code == 0 and ("--limit-type" in _help_out)
+    _has_limit_mode = _help_code == 0 and ("--limit_mode" in _help_out)
 
     base_args = [
         "lm-eval",
@@ -427,10 +433,15 @@ def run_lmeval_suite(
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
-    if _lm_eval_supports_seed:
+    if _has_seed_flag:
         base_args += ["--seed", str(seed)]
+    elif _has_fewshot_seed_flag:
+        base_args += ["--fewshot-seed", str(seed)]
+
+    _warned_no_random_limit = False
 
     def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
+        nonlocal _warned_no_random_limit
         cmd = base_args + ["--tasks", task, "--device", device]
         # Some generate_until tasks stall when probing batch_size=auto; force bs=1
         GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
@@ -440,6 +451,15 @@ def run_lmeval_suite(
             cmd += ["--batch_size", "auto"]
         if isinstance(limit, (int, float)):
             cmd += ["--limit", str(limit)]
+            # Prefer randomized subset selection when supported by this lm-eval version
+            if _has_limit_type:
+                cmd += ["--limit-type", "random"]
+            elif _has_limit_mode:
+                cmd += ["--limit_mode", "random"]
+            else:
+                if not _warned_no_random_limit:
+                    print("[lm-eval] Warning: CLI lacks a random subset flag; using first-N for --limit.")
+                    _warned_no_random_limit = True
         return cmd
 
     # Parallel across physical GPUs (mask each process to one GPU)
