@@ -18,8 +18,9 @@ cd /home/joberant/NLP_2425b/$USER/ekd
 DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
-EPOCHS="${4:-${EPOCHS:-3}}"   # default 3, override via env
-ANNEAL_FLAG=${5:-""}
+KD_SWEEP_TAG=${4:-}
+EPOCHS="${5:-${EPOCHS:-3}}"   # default 3, override via env
+ANNEAL_FLAG=${6:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)
 START_TIME_EPOCH=$(date +%s)
@@ -27,7 +28,8 @@ echo "Job started at $START_TIME"
 
 # Convert hyphens to underscores for directory names
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_models/model_${SLURM_JOB_ID}"
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/models/model_${SLURM_JOB_ID}"
+EVAL_OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/eval"
 
 # Default virtual environment directory
 VENV_DIR="$PWD/fastenv310_3_new"
@@ -239,7 +241,7 @@ echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
-  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."

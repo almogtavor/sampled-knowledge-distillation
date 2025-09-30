@@ -822,6 +822,7 @@ def main():
     parser.add_argument("--max_parallel", type=int, default=None,
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
+    parser.add_argument("--output_dir", type=str, default="evaluation_json_results")
     # Logging configuration (default project updated per request)
     parser.add_argument("--wandb_project", type=str, default="selective-entropy-knowledge-distillation",
                         help="W&B project slug (e.g., 'selective-entropy-knowledge-distillation').")
@@ -836,7 +837,7 @@ def main():
     work_dir = Path(args.work_dir)
     exports_dir = work_dir / "exports"
     results_dir = work_dir / "results"
-    json_results_dir = Path("evaluation_json_results")
+    json_results_dir = Path(args.output_dir)
     ensure_dir(exports_dir)
     ensure_dir(results_dir)
     ensure_dir(json_results_dir)
