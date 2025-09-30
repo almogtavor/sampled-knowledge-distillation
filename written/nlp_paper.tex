@@ -82,18 +82,28 @@
 
 Large language models (LLMs) deliver state-of-the-art performance but are costly to serve and adapt. Knowledge distillation (KD) amortizes these costs by training a compact student to imitate a larger teacher \citep{hinton2015distillation}. While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) \textbf{train-inference mismatch} in sequence generation, and (ii) \textbf{efficiency limits} from storing or querying full teacher logits.
 
-To address (i), recent work proposes \emph{on-policy} distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd}. To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}. Storing more logits improves quality but erodes the efficiency goal.
+To address (i), recent work proposes on-policy distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd} or replacing them if uninformative (SKD) \citep{xu2024speculative}.
+To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
+Storing more logits improves quality but erodes the efficiency goal.
 
-We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs. Our thesis is that the KD budget should be spent \emph{selectively at the token level} (where the teacher can add the most information) while keeping \emph{unbiased} class-level supervision when it is applied. Concretely, we:
+We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs.
+Our thesis is that the KD budget should be spent selectively at the token level (where the teacher can add the most information) while keeping unbiased class-level supervision when it is applied.
+Concretely, we:
 
 \begin{itemize}
-	\item Introduce \textbf{token-selective distillation}: choose a subset of tokens for KD using scores such as teacher entropy, teacher-student KL, and student CE;
-	\item Estimate the teacher distribution at selected tokens with \textbf{Random-Sampling KD}---importance-sampling teacher classes and reweighting---so the gradient matches full KD in expectation while storing only a handful of logits \citep{anshumann2025sparse};
-	\item Maintain standard cross-entropy (CE) on \emph{all} tokens to stabilize training and calibration \citep{guo2017calibration}; and
-	\item Add simple curricula (increasing KD coverage over time) and optional EMA-based self-distillation for robustness.
+	\item Introduce token selective KD to allocate supervision to informative tokens using teacher entropy, teacher--student KL, or student CE. We explore various scroring functions.
+	\item Use an offline teacher pass to build compact caches, then apply unbiased class sampling (RS-KD) with importance weights, matching full-KD gradients while storing only a few logits.
+	\item Retain cross-entropy on all tokens for calibration and stability.
+	\item Add simple curricula (increasing KD coverage) and optional EMA self-distillation.
 \end{itemize}
 
-Empirically, we compare against (a) full Random-Sampling KD at every token, (b) deterministic top-$K$ logit truncation baselines including SLIM-style sparse logits \citep{raman2023slim}, and (c) token/data selection schemes such as GLS for NMT \citep{wang2021selectivekd}, token-level uncertainty-aware post-training \citep{liu2025tokenlevel}, and progressive chain-of-thought distillation \citep{feng2024kpod}. We evaluate both in-distribution and under distribution shift using the ShiftKD protocol \citep{zhang2023shiftkd}. Our results indicate that token-selective, \emph{unbiased} KD attains a stronger accuracy-efficiency Pareto frontier while preserving calibration.
+Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, and (d) full Random-Sampling KD at every step \citep{anshumann2025sparse}.
+Our main experiments apply token selection by teacher entropy---testing top $k\%$ thresholds across a broad sweep ($k \in \{100,90,80,\dots,5,2,1\}$), as well as bucketed ranges (e.g.\ 5--15\%).
+We also evaluate Top-$m$+Tail entropy approximations to reduce the computational cost of full softmax when scoring, and use the Gumbel-Max trick to sample directly from cached logits, eliminating the need to compute softmax normalization during teacher forwards.
+Beyond entropy, we score tokens by alternative signals (student CE, teacher--student KL, mixtures thereof) and test curriculum schedules.
+To assess robustness, we include instruction-following benchmarks.
+Finally, we ablate variants such as annealed temperature, disabling CE, and an optional second phase of on-policy KD.
+Our results show that token-selective, unbiased KD achieves the best accuracy--efficiency Pareto frontier while maintaining calibration.
 
 \subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
@@ -120,7 +130,7 @@ We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty scor
 	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
 	\frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
 \]
-which is unbiased for the uniform positional mean. In practice, we sample \emph{without} replacement within each sequence for lower variance and use a Hájek-style normalization: $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S} w_t=1$, then take $\sum_{t\in S} w_t\,\mathrm{KL}(p_t\|s_t)$.
+which is unbiased for the uniform positional mean. We sample positions without replacement and use Hájek weights, $w_t \propto 1/q_{\text{pos}}(t)$ with $\sum_{t\in S} w_t = 1$, which yields an approximately unbiased estimate of the uniform positional mean with reduced variance.
 A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
 
 \subsection{Discussion}
@@ -142,18 +152,14 @@ Crucially, we separate \emph{offline} teacher processing from \emph{online} stud
 For each training sequence and position $t$:
 \begin{enumerate}
 	\item Compute a top-$m$ entropy proxy $H_t$ via TkT-LB (\S\ref{sec:entropy}) to drive position selection.
-	\item Construct a class proposal $q_{\text{voc}}(\cdot\,|\,t)$ (typically $q_{\text{voc}}\!=\!p_t$, or a tempered variant) and draw $R$ samples with replacement. Let $C_t(i)$ be the sampled count of class $i$.
-	\item Form a sub-distribution over the sampled classes using importance weights
-	      \[
-		      \tilde p_t(i) \;\propto\; \frac{p_t(i)}{q_{\text{voc}}(i\,|\,t)} \, C_t(i),
-		      \qquad i \in \mathcal{S}_t,
-	      \]
-	      then normalize over $\mathcal{S}_t=\{i: C_t(i)>0\}$. Choosing $R$ so that $\mathbb{E}[|\mathcal{S}_t|]\!\approx\!K_{\text{voc}}$ yields a budget comparable to top-$K_{\text{voc}}$ but without truncation bias.
+	\item Draw $R$ samples with replacement via Gumbel-Max over $p_t^\tau$ (temperature $\tau{=}1$ by default), compute unique ids and counts, and retain the top-$U$ unique classes by count. Convert empirical frequencies to 7-bit q7 with a residual correction to preserve normalization; pad to $U$ using a sentinel id ($=V$).
+	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{id,q7\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the q7s.
 \end{enumerate}
-Only $(\mathcal{S}_t, \tilde p_t)$ and the scalar $H_t$ are stored (no full logits), typically in fp16.
+Only the packed samples and scalar $H_t$ are stored (no full logits).
 
 \subsection{Online stage (student, many epochs)}
-At each batch we:
+We sample positions without replacement using $q_{\text{pos}}(t)\propto H_t^\alpha$ with Hájek weights ($\sum w_t=1$).
+For each selected $t$, we reconstruct $\tilde p_t$ from q7, form self-normalized importance weights $w \propto p_T/q$ over the cached classes, and compute the sampled KD term. We multiply by $T^2$ (standard KD) and add CE on all tokens with weight $\alpha_{\text{ce}}$.
 \begin{enumerate}
 	\item For each sequence, sample a subset $S$ of positions using $q_{\text{pos}}(t)\!\propto\!H_t^\alpha$ (without replacement, $|S|{=}K_{\text{pos}}$) and weights $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S}w_t{=}1$.
 	\item For each $t \in S$, compute the \emph{sampled} KD term only on the cached subset:
@@ -174,24 +180,25 @@ RS-KD's importance weighting ensures that, for fixed $t$, the expectation of the
 TkT-LB supplies $H_t$ at $\mathcal{O}(m)$ cost, so both sampling decisions avoid any full-$V$ passes.
 Together, SampledKD reduces cost from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence while matching full-KD gradients in expectation.
 
-\subsection{Complexity and knobs}
-Storage per position is $\mathcal{O}(K_{\text{voc}})$ (indices $+$ probs). Online compute scales with $K_{\text{pos}}\!\times\!K_{\text{voc}}$. Good defaults:
-$K_{\text{voc}}\!\approx\!12$ expected uniques (choose $R$ accordingly),
-$\tau{=}1$ for $q_{\text{voc}}$ temperature,
-$K_{\text{pos}}\!\in\![8,32]$,
-$\alpha{=}1$,
-$\alpha_{\text{ce}}\!\in\![0.05,0.2]$.
-A tiny probability floor prevents numerical blow-ups in $1/q$.
+We use self-normalized importance sampling (SNIS), trading a small bias for lower variance; a floor on $q$ distribution improves stability.
+We follow standard KD scaling by multiplying the KD loss by $T^2$. While self-normalization and probability floors introduce a small bias, we find they substantially reduce variance and improve stability without affecting downstream accuracy.
 
-\section{Entropy Approximation}
+\subsection{Complexity and knobs}
+Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (ids+q7 plus 1-byte $\hat H$).
+
+\noindent\textbf{Defaults.} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
+
+\section{Entropy Approximation and Gumbel Trick}
 \label{sec:entropy}
 We estimate token uncertainty via a Top-$k$-plus-tail construction. Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
 $
 	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}
 $
-denote the softmax probabilities and partition function. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
+denote the softmax probabilities and partition function.
+
+\noindent\emph{Units.} We compute entropy in nats (natural logarithm). When quantizing to 8-bit, we normalize by $\ln V$. Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits. Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,          \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}}\,,         \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -244,10 +251,10 @@ Midpoint gives the best top-$k$ position overlap with exact entropy at substanti
 \vspace{-0.75em}
 
 \subsection{Storage accounting}
-Our cache packs each stored vocab sample into exactly 3 bytes: a 17-bit token id and a 7-bit probability (q7), written as a single 24-bit word. In addition, we store a per-position entropy approximation $\hat H$ in uint8 (1 byte). With $U{=}12$ stored samples per valid position, the average cost is
+For each selected position we store $U$ sampled classes in a 24-bit word (17-bit id, 7-bit quantized probability), plus a 1-byte entropy proxy $\hat H$ (uint8 scaled by $\ln V$).
+This is $3U+1$ bytes per valid position; with $U{=}12$ this is $37$~B/token.
 \[
-	\text{B/token} = U \cdot 3 \;+ \underbrace{1}_{\text{uint8 }\hat H}
-	= 12\cdot 3 + 1 = 37\text{B/token},
+	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token}.
 \]
 which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
 \[
@@ -255,13 +262,13 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 	= 37\text{B/token}.
 \]
 
-If the selection strategy is fixed and deterministic (e.g., always distill on the top-25\% highest-entropy positions chosen offline), we can achieve substantial additional storage and compute savings by omitting $\hat H$ entirely and only retain RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
+If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
 	\text{B/token} \; & =\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3                                                 \\
+	\;=\; 0.25 \cdot 12 \cdot 3                                                \\
 	\;                & =\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
-We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache, but the one-time offline preselection is straightforward and offers an additional $\sim\!\times4$ reduction when $k{=}25\%$.
+We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
 Table~\ref{tab:storage} summarizes the storage requirements across different methods.
 
 
@@ -304,7 +311,7 @@ We evaluate SampledKD on a diverse set of language understanding and reasoning b
 \textbf{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
 
 \paragraph{Competition-level benchmarks.}
-\textbf{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination. 
+\textbf{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination.
 \textbf{IFEval} \citep{zhou2023ifeval} assesses instruction following through verifiable constraints.
 
 \subsection{Experimental setup}
@@ -357,7 +364,7 @@ Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                              \\
 	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
@@ -369,7 +376,7 @@ Thus, the entropy tail is
 with unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
