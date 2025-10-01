@@ -900,6 +900,66 @@ class Distiller:
                             ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
                             # Short-circuit to avoid computing below using keep_mask
                             pass
+                        elif distill == "pos-rs-kd":
+                            alpha = float(getattr(self.config, "rs_alpha", 1.0))
+                            q_floor = float(getattr(self.config, "rs_floor", 1e-6))
+                            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                            kd_terms_local = []
+
+                            # Optional: score-based q(i)
+                            use_score = bool(getattr(self.config, "score_token_selection", False))
+                            if use_score:
+                                ent_for_score = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
+                                score_ctx = self._prepare_score_context(
+                                    ent_raw=ent_for_score,
+                                    kl_pos=kd_pos_proxy,
+                                    s_log_probs=None,
+                                    valid_next=valid_next,
+                                    input_ids=input_ids,
+                                    student_ce_override=ce_pos_proxy,
+                                )
+                            for i in range(valid_next.size(0)):
+                                mask_i = valid_next[i]
+                                n_valid = int(mask_i.sum().item())
+                                if n_valid < 3:
+                                    continue
+
+                                if use_score:
+                                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                                    if combined is None:
+                                        continue
+                                    base = combined[mask_i].float()
+                                else:
+                                    ent_i = self._entropy_for_selection(input_ids, t_pred=None)[i]
+                                    base = ent_i[mask_i].float()
+
+                                base = torch.clamp(base - base.min(), min=1e-8)
+                                q_un = torch.ones_like(base) if alpha == 0.0 else base.pow(alpha)
+                                if q_un.sum() <= 0:
+                                    q = torch.full_like(q_un, 1.0 / q_un.numel())
+                                else:
+                                    q = q_un / q_un.sum()
+                                    q = torch.clamp(q, min=q_floor)
+                                    q = q / q.sum()
+
+                                k_count = max(1, int(n_valid * pct))
+                                rel_sel = torch.multinomial(q, num_samples=k_count, replacement=False)  # [k]
+                                valid_idx_i = torch.where(mask_i)[0]
+                                abs_sel = valid_idx_i[rel_sel]
+
+                                # KD over selected rows with importance correction
+                                q_sel = q[rel_sel]                    # [k]
+                                w = 1.0 / torch.clamp(q_sel, min=q_floor)
+                                w = w / w.sum()
+
+                                kd_terms_local.append((kd_pos_proxy[i, abs_sel] * w).sum())
+                            kd_loss = (
+                                torch.stack(kd_terms_local).mean()
+                                if kd_terms_local else s_pred.sum() * 0.0
+                            )
+
+                            # CE on ALL valid rows to mirror top-k-tok (or keep it off if you prefer)
+                            ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
 
                         # If not the bandit short-circuit above, compute losses using keep_mask
                         if distill != "linucb":
