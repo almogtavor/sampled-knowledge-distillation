@@ -91,7 +91,7 @@ elif [[ "$MODE" == "score_weights" ]]; then
   for CONFIG in "${SCORE_CONFIGS[@]}"; do
     IFS=':' read -r LABEL W_ENT W_CE W_KL <<< "$CONFIG"
     echo "[score_weights] Submitting $LABEL weights (ent=$W_ENT ce=$W_CE kl=$W_KL)"
-    sbatch --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "light" "$KD_SWEEP_TAG"
+    sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "light" "$KD_SWEEP_TAG"
   done
 
 else

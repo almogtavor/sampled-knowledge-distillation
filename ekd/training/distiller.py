@@ -160,28 +160,26 @@ class Distiller:
         Otherwise, compute exact entropy online via t_pred.
         Output shape: [B, L-1]
         """
-        if self.cache is not None:
+        # If t_pred is None, we are *expecting* to use the cache. Hard-fail on any miss.
+        if t_pred is None:
+            if self.cache is None:
+                raise RuntimeError("Entropy requested with t_pred=None but no cache is set.")
             items = self._lookup_cache_batch(input_ids)
-            if items is not None:
-                H_list = []
-                for it in items:
-                    if "H_hat_u8" in it:
-                        # Dequantize from uint8 using cap ln(V)
-                        H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
-                        V = int(it.get("rs", {}).get("sentinel_id", 0))
-                        H_cap = math.log(max(2, V)) if V > 0 else 1.0
-                        H_f = (H_u8.float() / 255.0) * H_cap
-                        H_list.append(H_f)
-                    elif "H_hat" in it:
-                        H_list.append(torch.as_tensor(it["H_hat"]).float())
-                    else:
-                        # Missing Ĥ in cache: fall back to exact
-                        H_list = None
-                        break
-                if H_list is not None:
-                    return torch.stack(H_list, dim=0).to(self.student_device)
-
-        # need exact from t_pred
+            if items is None:
+                raise RuntimeError("Cache miss: at least one example not present in the offline cache.")
+            H_list = []
+            for it in items:
+                if "H_hat_u8" in it:
+                    H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
+                    V = int(it.get("rs", {}).get("sentinel_id", 0))
+                    H_cap = math.log(max(2, V)) if V > 0 else 1.0
+                    H_f = (H_u8.float() / 255.0) * H_cap
+                    H_list.append(H_f)
+                elif "H_hat" in it:
+                    H_list.append(torch.as_tensor(it["H_hat"]).float())
+                else:
+                    raise RuntimeError("Cache item lacks H_hat / H_hat_u8; cache is incomplete.")
+            return torch.stack(H_list, dim=0).to(self.student_device)
         assert t_pred is not None, "Exact entropy requested but teacher logits are unavailable."
         B = t_pred.size(0)
         ent_list = []
@@ -220,11 +218,11 @@ class Distiller:
         self,
         ent_raw: torch.Tensor,
         kl_pos: torch.Tensor,
-        s_log_probs: torch.Tensor,
+        s_log_probs: Optional[torch.Tensor],
         valid_next: torch.Tensor,
         input_ids: torch.Tensor,
+        student_ce_override: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """Pre-compute tensors needed for score-based token ranking"""
         weights = (
             float(getattr(self.config, "score_entropy_weight", 1.0)),
             float(getattr(self.config, "score_ce_weight", 1.0)),
@@ -235,13 +233,20 @@ class Distiller:
 
         norm_mode = getattr(self.config, "score_normalize", "z")
 
-        targets = input_ids[:, 1:].to(self.student_device)
-        targets = targets.masked_fill(~valid_next, 0)
-        target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
-
+        # entropy / kl components
         ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
         kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+
+        # student CE component
+        if student_ce_override is not None:
+            student_ce = student_ce_override.detach().masked_fill(~valid_next, 0.0)
+        else:
+            if s_log_probs is None:
+                raise ValueError("s_log_probs is required unless student_ce_override is provided.")
+            targets = input_ids[:, 1:].to(self.student_device)
+            targets = targets.masked_fill(~valid_next, 0)
+            target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
 
         return {
             "weights": weights,
@@ -301,7 +306,7 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
-    # === Sampled softmax helpers (used only in cached RS-KD path when elimiate_softmax=True) ===
+    # === Sampled softmax helpers (used only in cached RS-KD path when eliminate_softmax=True) ===
     def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> torch.Tensor:
         """Draw M uniform 'negatives' from [0, V). Overlap with U/avoid is allowed."""
         if M <= 0 or V <= 0:
@@ -624,47 +629,35 @@ class Distiller:
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
         # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
-        do_elim_softmax = bool(getattr(self.config, "elimiate_softmax", False))
-        s_log_probs = None  # set to log_softmax on-demand when needed
+        do_elim_softmax = bool(getattr(self.config, "eliminate_softmax", False))
+        s_log_probs = None  # set to log_softmax on-demand when needed (only non-elimination paths)
 
-        # Decide whether we need full teacher logits now
-        cached_items = None
+        # Decide path: cached RS-KD with softmax elimination vs. fallback
+        cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
+        do_elim = bool(getattr(self.config, "eliminate_softmax", False)) and (cached_items is not None)
+        # Whether we will use the cached RS-KD vocabulary estimator path at all
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
-        if self.config.distill_type == "linucb":
-            use_vocab_rs_kd = False
-        # Score-based selection needs fresh teacher logits even if the cache could satisfy EKD,
-        # because we require per-position KL and student CE statistics that aren't stored offline.
-        score_requires_teacher = bool(getattr(self.config, "score_token_selection", False)) and self.config.distill_type in {"top-k-tok", "bucket"}
-        need_teacher_full = self.config.distill_type in {"vanilla", "top-k-tok", "bucket", "pos-rs-kd", "linucb"} or score_requires_teacher
-        if use_vocab_rs_kd:
-            # try offline cache to avoid teacher forward; fall back to teacher if cache missing
-            cached_items = self._lookup_cache_batch(input_ids)
-            if cached_items is not None and not score_requires_teacher:
-                need_teacher_full = False
 
-        # Inform per-batch whether we hit the logits cache or run the teacher online
-        if not self._printed_cache_info:
-            if not need_teacher_full and cached_items is not None:
-                print("[logits-cache] Using cached teacher logits/statistics (no online teacher forward).")
-            elif not need_teacher_full:
-                print("[logits-cache] Cache considered but empty for this batch; skipping teacher forward due to mode.")
-            elif getattr(self.config, "offline_cache", False):
-                print("[logits-cache] Cache miss or not applicable - running online teacher forward.")
-            else:
-                print("[logits-cache] Disabled - running online teacher forward.")
-            self._printed_cache_info = True
-
-        if need_teacher_full:
+        # Only run teacher forward if we are NOT in elimination mode or cache is missing
+        t_pred = t_log_probs = None
+        if not do_elim:
             input_ids_t = input_ids.to(self.teacher_device)
             attn_t = attn_mask.to(self.teacher_device)
             with torch.no_grad():
                 t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-                t_logits = self._sanitize_logits(t_logits, "teacher") # [B, L, V]
-            t_pred = t_logits[:, :-1, :]  # [B, L-1, V]
-            t_log_probs = torch.log_softmax(t_pred / T, dim=-1)  # [B, L-1, V]
+                t_logits = self._sanitize_logits(t_logits, "teacher")  # [B, L, V]
+            t_pred = t_logits[:, :-1, :]
+            t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
+            if not self._printed_cache_info:
+                if getattr(self.config, "offline_cache", False) and cached_items is None:
+                    print("[logits-cache] Cache miss or not available → running online teacher forward.")
+                else:
+                    print("[logits-cache] Running online teacher forward (elimination off).")
+                self._printed_cache_info = True
         else:
-            t_pred = t_log_probs = None
-            # message already printed above
+            if not self._printed_cache_info:
+                print("[logits-cache] Softmax elimination active with cache → skipping online teacher forward.")
+                self._printed_cache_info = True
 
         # --- KD loss ---
         # Compute per-position base KD according to mode (positions subset and weights),
@@ -691,7 +684,6 @@ class Distiller:
             # 2) no cache: build samples online in a fully batched, vectorized way across all valid positions
             if cached_items is not None:
                 # ===== Flatten valid positions across the whole batch =====
-                do_elim = do_elim_softmax
                 V = int(s_pred.size(-1))
                 M_neg = int(getattr(self.config, "sampled_softmax_negatives", 1024))
 
@@ -748,6 +740,41 @@ class Distiller:
                             ids_U[r, :u] = ids_r.to(self.student_device)
                             probs_U[r, :u] = probs_r.to(self.student_device)
 
+                    # --- Proxies for score selection / bandit on elimination path (no full softmax) ---
+                    # We will compute per-position:
+                    #  - s_logp_on_U via importance-corrected sampled softmax over U ∪ M
+                    #  - kd_pos_proxy_rows = cross-entropy over U w.r.t cached q_U (for ranking/loss)
+                    #  - ce_pos_proxy_rows = sampled CE using gold y and shared negatives M
+                    sum_qU = probs_U.sum(dim=1, keepdim=True)                  # [P,1]
+                    denom = (sum_qU + (M_neg / max(1, V))).clamp_min(1e-12)    # [P,1]
+                    denom_log = denom.log()
+
+                    log_qU = probs_U.clamp_min(1e-12).log() - denom_log        # [P,U]
+                    log_qM = (-math.log(max(1, V)) - denom_log)                # [P,1]
+
+                    z_U = torch.gather(s_rows, 1, ids_U) / T                   # [P,U]
+                    zcorr_U = z_U - log_qU                                     # [P,U]
+                    zcorr_M = (z_M_all if M_neg > 0 else z_U[:, :0]) - log_qM  # [P,M]
+
+                    logZ = torch.logsumexp(torch.cat([zcorr_U, zcorr_M], dim=1), dim=1, keepdim=True)  # [P,1]
+                    s_logp_on_U = zcorr_U - logZ                                # [P,U]
+
+                    kd_pos_proxy_rows = -(probs_U * s_logp_on_U).sum(dim=1)     # [P]
+
+                    y_rows = input_ids_s[batch_idx, pos_idx + 1]                # [P]
+                    z_y = s_rows.gather(1, y_rows.view(-1, 1)).squeeze(1) / T   # [P]
+                    z_M_ce = (z_M_all - (math.log(max(1, V)))) if M_neg > 0 else z_y.view(-1, 1)[:, :0]
+                    z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1)         # [P, 1+M]
+                    logZ_ce = torch.logsumexp(z_all, dim=1)                     # [P]
+                    ce_pos_proxy_rows = -(z_y - logZ_ce)                        # [P]
+
+                    # Scatter proxies back to [B, L-1]
+                    Bsz, Lm1 = valid_next.size()
+                    kd_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
+                    ce_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
+                    kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows
+                    ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows
+
                     if not do_elim:
                         # ---------- EKD over cached subset U (vectorized over all positions) ----------
                         if s_log_probs is None:
@@ -757,37 +784,151 @@ class Distiller:
                         kd_loss = -(probs_U * s_logp_on_U).sum(dim=1).mean()
                         ce_loss_override = None
                     else:
-                        # ---------- Sampled softmax KD over U ∪ M (vectorized over all positions) ----------
-                        sum_qU = probs_U.sum(dim=1, keepdim=True)                                    # [P_total, 1]
-                        denom = (sum_qU + (M_neg / max(1, V))).clamp_min(1e-12)                      # [P_total, 1]
-                        denom_log = denom.log()
+                        # ---------- Elimination path with selection-aware proxies ----------
+                        distill = getattr(self.config, "distill_type", "vanilla")
+                        score_enabled = bool(getattr(self.config, "score_token_selection", False))
 
-                        log_qU = probs_U.clamp_min(1e-12).log() - denom_log                          # [P_total, U_max]
-                        log_qM = (log_qM_base - denom_log)                                           # [P_total, 1]
+                        # Default: keep all valid rows
+                        keep_mask = valid_next.clone()
 
-                        z_U = torch.gather(s_rows, 1, ids_U) / T                                     # [P_total, U_max]
-                        zcorr_U = z_U - log_qU
-                        zcorr_M = z_M_all - log_qM                                                   # [P_total, M_neg]
-                        logZ = torch.logsumexp(
-                            torch.cat([zcorr_U, zcorr_M], dim=1), dim=1, keepdim=True
-                        )                                                                             # [P_total, 1]
+                        # Build score context only if needed and supported types
+                        score_ctx = None
+                        if score_enabled and distill in {"top-k-tok", "bucket", "random"}:
+                            # entropy from cache (t_pred=None so _entropy_for_selection will read cache if available)
+                            ent_for_score = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
+                            score_ctx = self._prepare_score_context(
+                                ent_raw=ent_for_score,
+                                kl_pos=kd_pos_proxy,
+                                s_log_probs=None,
+                                valid_next=valid_next,
+                                input_ids=input_ids,
+                                student_ce_override=ce_pos_proxy
+                            )
 
-                        s_logp_on_U = zcorr_U - logZ                                                 # [P_total, U_max]
-                        kd_loss = -(probs_U * s_logp_on_U).sum(dim=1).mean()
+                        if distill == "top-k-tok":
+                            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                            for i in range(valid_next.size(0)):
+                                mask_i = valid_next[i]
+                                n_valid = int(mask_i.sum().item())
+                                if n_valid < 3:
+                                    continue
+                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                valid_idx_i = torch.where(mask_i)[0]
+                                if score_enabled and score_ctx is not None:
+                                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                                    if combined is None:
+                                        continue
+                                    scores = combined[mask_i]
+                                else:
+                                    # fallback: use cached entropy
+                                    ent_i = self._entropy_for_selection(input_ids, t_pred=None)[i]
+                                    scores = ent_i[mask_i]
+                                if scores.numel() == 0:
+                                    continue
+                                _, top_rel = torch.topk(scores, k=k, largest=True, sorted=False)
+                                sel_abs = valid_idx_i[top_rel]
+                                keep_mask[i, sel_abs] = True
 
-                        # --------- Sampled CE (optional, vectorized) ----------
-                        ce_loss_override = None
-                        if self.config.enable_ce:
-                            # gold ids for each position: use input_ids_s to avoid device mismatch
-                            y = input_ids_s[batch_idx, pos_idx + 1]                                  # [P_total]
-                            z_y = s_rows.gather(1, y.view(-1, 1)).squeeze(1) / T                     # [P_total]
-                            if M_neg > 0:
-                                z_M_ce = z_M_all - log_qM_base                                       # [P_total, M_neg]
-                                z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1)                  # [P_total, 1+M]
+                        elif distill == "bucket":
+                            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                            ent_for_bucket = None
+                            if not score_enabled:
+                                ent_for_bucket = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
+                            for i in range(valid_next.size(0)):
+                                mask_i = valid_next[i]
+                                if mask_i.sum() < 3:
+                                    continue
+                                if score_enabled and score_ctx is not None:
+                                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                                    if combined is None:
+                                        continue
+                                    vec = combined[mask_i].float()
+                                else:
+                                    vec = ent_for_bucket[i][mask_i].float()
+                                low = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
+                                high = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
+                                rel = torch.where(mask_i)[0]
+                                sel = (vec >= low) & (vec <= high)
+                                if sel.any():
+                                    keep_mask[i, rel[sel]] = True
+
+                        elif distill == "random":
+                            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                            for i in range(valid_next.size(0)):
+                                mask_i = valid_next[i]
+                                n_valid = int(mask_i.sum().item())
+                                if n_valid < 2:
+                                    continue
+                                k = max(1, int(n_valid * pct))
+                                valid_idx_i = torch.where(mask_i)[0]
+                                if score_enabled and score_ctx is not None:
+                                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                                    if combined is None:
+                                        continue
+                                    scores = combined[mask_i].float()
+                                    s = scores - scores.min()
+                                    s = torch.clamp(s, min=1e-8)
+                                    probs = s / s.sum()
+                                    rel = torch.multinomial(probs, num_samples=k, replacement=False)
+                                    sel_abs = valid_idx_i[rel]
+                                else:
+                                    perm = torch.randperm(valid_idx_i.numel(), device=self.student_device)
+                                    sel_abs = valid_idx_i[perm[:k]]
+                                keep_mask[i, sel_abs] = True
+
+                        elif distill == "linucb":
+                            if self.bandit_manager is None:
+                                raise RuntimeError("LinUCB bandit is not initialized.")
+                            # Build entropy from cache
+                            ent_for_bandit = self._entropy_for_selection(input_ids, t_pred=None)
+                            # Use proxies for all features to avoid teacher/full softmax
+                            kd_terms, metrics = self.bandit_manager.select_tokens(
+                                input_ids=input_ids,
+                                attention_mask=attn_mask,
+                                ent_raw=ent_for_bandit.detach(),
+                                teacher_ce=ce_pos_proxy.detach(),
+                                student_ce=ce_pos_proxy.detach(),
+                                kl_pos=kd_pos_proxy.detach(),
+                                valid_next=valid_next,
+                                temperature=T,
+                            )
+                            kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
+                            extra_metrics = metrics or None
+                            # Sampled CE proxy over all rows (no indices from bandit selection here)
+                            ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
+                            # Short-circuit to avoid computing below using keep_mask
+                            pass
+
+                        # If not the bandit short-circuit above, compute losses using keep_mask
+                        if distill != "linucb":
+                            # Map selection to flattened rows
+                            # If not the bandit short-circuit above, compute losses using keep_mask
+                            keep_rows = keep_mask[batch_idx, pos_idx] if P_total > 0 else torch.zeros(
+                                0, dtype=torch.bool, device=self.student_device
+                            )
+
+                            if distill == "top-k-tok":
+                                if keep_rows.any():
+                                    # KD: only on selected rows (same as before)
+                                    kd_loss = kd_pos_proxy_rows[keep_rows].mean()
+                                    # CE: on ALL valid rows to match old top-k behavior
+                                    if self.config.enable_ce:
+                                        ce_loss_override = ce_pos_proxy_rows.mean()
+                                    else:
+                                        ce_loss_override = None
+                                else:
+                                    kd_loss = s_pred.sum() * 0.0
+                                    ce_loss_override = None
                             else:
-                                z_all = z_y.view(-1, 1)                                              # [P_total, 1]
-                            logZ_ce = torch.logsumexp(z_all, dim=1)                                  # [P_total]
-                            ce_loss_override = -(z_y - logZ_ce).mean()
+                                # bucket/random: keep previous behavior (KD and CE both on the selected rows)
+                                if keep_rows.any():
+                                    kd_loss = kd_pos_proxy_rows[keep_rows].mean()
+                                    ce_loss_override = ce_pos_proxy_rows[keep_rows].mean() if self.config.enable_ce else None
+                                else:
+                                    kd_loss = s_pred.sum() * 0.0
+                                    ce_loss_override = None
             else:
                 # Vectorized online RS-KD over vocabulary: flatten all valid positions across the batch
                 assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"
@@ -842,7 +983,7 @@ class Distiller:
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
-            # if sampled CE was computed in the cached path with elimiate_softmax=True, use it
+            # if sampled CE was computed in the cached path with eliminate_softmax=True, use it
             if 'ce_loss_override' in locals() and ce_loss_override is not None:
                 ce_loss = ce_loss_override
             else:
