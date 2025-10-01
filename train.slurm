@@ -50,10 +50,20 @@ echo "======================"
 
 # ---------- caches / env ----------
 mkdir -p logs
-export TMPDIR="$PWD/tmp";               mkdir -p "$TMPDIR"
+export TMPDIR="$PWD/tmp"
+mkdir -p "$TMPDIR"
+export TMP="$TMPDIR"; export TEMP="$TMPDIR"
+export XDG_CACHE_HOME="$PWD/tmp/xdg_cache";   mkdir -p "$XDG_CACHE_HOME"
 export HF_HOME="$TMPDIR/hf";            mkdir -p "$HF_HOME/hub" "$HF_HOME/datasets"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+# W&B caches away from $HOME
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";            mkdir -p "$WANDB_DIR"
+export TORCH_HOME="$PWD/tmp/torch";          mkdir -p "$TORCH_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
@@ -66,7 +76,9 @@ export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
 export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
-export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";          mkdir -p "$WANDB_DIR"
+# Explicitly redirect W&B cache (artifacts, uploads) away from $HOME
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
 export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_DISABLED=${WANDB_DISABLED:-false}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
@@ -244,7 +256,7 @@ echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
-  sbatch --dependency=afterok:${SLURM_JOB_ID} --gpus=3 evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."

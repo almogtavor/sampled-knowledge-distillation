@@ -690,107 +690,104 @@ class Distiller:
             # 1) cached_items available: decode precomputed per-position samples (keep existing per-position loop)
             # 2) no cache: build samples online in a fully batched, vectorized way across all valid positions
             if cached_items is not None:
-                kd_terms = []
-                sampled_ce_terms = []  # only used if elimiate_softmax=True and CE enabled
-                B = s_pred.size(0)
+                # ===== Flatten valid positions across the whole batch =====
                 do_elim = do_elim_softmax
-
                 V = int(s_pred.size(-1))
                 M_neg = int(getattr(self.config, "sampled_softmax_negatives", 1024))
-                # ---- sample once per batch (shared across all sequences/positions) ----
-                ids_M_shared = torch.randint(low=0, high=max(1, V), size=(M_neg,), device=self.student_device, dtype=torch.long)
-                # log q_M = log(1/V), reused everywhere
-                log_qM_base = -math.log(max(1, V))
 
-                for i in range(B):
-                    valid_i = valid_next[i]
-                    if valid_i.sum() == 0:
-                        continue
+                valid_mask = valid_next  # [B, L-1] (on student_device)
+                batch_idx, pos_idx = torch.nonzero(valid_mask, as_tuple=True)  # [P_total], [P_total]
+                P_total = int(batch_idx.numel())
 
-                    rs = cached_items[i]["rs"]
-                    U = int(rs["U"])  # entries per position
-                    sentinel = int(rs["sentinel_id"])  # Vocab size sentinel id
-                    packed = torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8)
+                if P_total == 0:
+                    kd_loss = s_pred.sum() * 0.0
+                    ce_loss_override = None
+                else:
+                    # ---- shared negatives for the whole batch ----
+                    ids_M_shared = torch.randint(
+                        low=0, high=max(1, V), size=(M_neg,), device=self.student_device, dtype=torch.long
+                    )
+                    log_qM_base = -math.log(max(1, V))
 
-                    # positions we’ll distill on
-                    pos_indices = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)  # [P_i]
-                    P_i = int(pos_indices.numel())
-                    if P_i == 0:
-                        continue
+                    # Student rows once for all selected positions: [P_total, V]
+                    s_rows = s_pred[batch_idx, pos_idx]  # [P_total, V]
+                    # Gather negatives once: [P_total, M_neg]
+                    if M_neg > 0:
+                        z_M_all = s_rows[:, ids_M_shared] / T
+                    else:
+                        z_M_all = s_rows.new_zeros((P_total, 0))
 
-                    # ---- pre-gather negatives for ALL positions of this sequence in one shot ----
-                    # shape: [P_i, M_neg]; each row is logits for the same ids_M_shared
-                    s_rows = s_pred[i, pos_indices]                                # [P_i, V]
-                    z_M_all = torch.gather(s_rows, 1, ids_M_shared.expand(P_i, -1)) / T  # [P_i, M_neg]
-
-                    # ---- decode cache ONCE into dense [P_i, U] tensors ----
-                    # (tiny Python loop building two dense tensors; heavy math is vectorized on GPU)
+                    # ---- Prepare packed cache per batch example, track U per example ----
                     from .offline_cache import decode_ids_probs_from_block
-                    ids_U = torch.empty((P_i, U), dtype=torch.long, device=self.student_device)
-                    probs_U = torch.empty((P_i, U), dtype=torch.float32, device=self.student_device)
-                    # prefill pads: id 0, prob 0
-                    ids_U.fill_(0)
-                    probs_U.zero_()
+                    B = s_pred.size(0)
+                    packed_by_b, U_by_b, sen_by_b = [], [], []
+                    for b in range(B):
+                        rs = cached_items[b]["rs"]
+                        packed_by_b.append(torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8))
+                        U_by_b.append(int(rs["U"]))
+                        sen_by_b.append(int(rs["sentinel_id"]))
 
-                    # each block is 3*U bytes (uint8 triplets), laid out per position
-                    for r, pos in enumerate(pos_indices.tolist()):
-                        block = packed[pos * U * 3:(pos + 1) * U * 3]
+                    # Pad to U_max to allow a single dense gather
+                    U_max = max(U_by_b) if len(U_by_b) > 0 else 0
+                    ids_U = torch.zeros((P_total, U_max), dtype=torch.long, device=self.student_device)
+                    probs_U = torch.zeros((P_total, U_max), dtype=torch.float32, device=self.student_device)
+
+                    # Tiny decode loop (only copying into dense buffers; all heavy math is vectorized)
+                    for r in range(P_total):
+                        b = int(batch_idx[r].item())
+                        p = int(pos_idx[r].item())
+                        U = U_by_b[b]
+                        sentinel = sen_by_b[b]
+                        packed = packed_by_b[b]
+                        if U == 0:
+                            continue
+                        block = packed[p * U * 3:(p + 1) * U * 3]
                         ids_r, probs_r = decode_ids_probs_from_block(block, U, sentinel)
-                        u_r = ids_r.numel()  # may be < U
-                        if u_r > 0:
-                            ids_U[r, :u_r] = ids_r.to(self.student_device)
-                            probs_U[r, :u_r] = probs_r.to(self.student_device)
+                        u = ids_r.numel()
+                        if u > 0:
+                            ids_U[r, :u] = ids_r.to(self.student_device)
+                            probs_U[r, :u] = probs_r.to(self.student_device)
 
                     if not do_elim:
-                        # --- EKD over cached subset U, still vectorized over positions ---
-                        # s_log_probs computed lazily above if needed
+                        # ---------- EKD over cached subset U (vectorized over all positions) ----------
                         if s_log_probs is None:
                             s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
-                        s_rows_logp = s_log_probs[i, pos_indices]                         # [P_i, V]
-                        s_logp_on_U = torch.gather(s_rows_logp, 1, ids_U)                 # [P_i, U]
-                        loss_i = -(probs_U * s_logp_on_U).sum(dim=1).mean()
-                        kd_terms.append(loss_i)
+                        s_rows_logp = s_log_probs[batch_idx, pos_idx]          # [P_total, V]
+                        s_logp_on_U = torch.gather(s_rows_logp, 1, ids_U)      # [P_total, U_max]
+                        kd_loss = -(probs_U * s_logp_on_U).sum(dim=1).mean()
+                        ce_loss_override = None
                     else:
-                        # =========================
-                        # KD with sampled softmax (vectorized):
-                        # =========================
-                        # q over S_t is renormalized across U ∪ M:
-                        # denom = sum(q_U) + M_neg * (1/V). q_U are already normalized over U (cache).
-                        sum_qU = probs_U.sum(dim=1, keepdim=True)                              # [P_i, 1]
-                        denom = (sum_qU + (M_neg / max(1, V))).clamp_min(1e-12)               # [P_i, 1]
+                        # ---------- Sampled softmax KD over U ∪ M (vectorized over all positions) ----------
+                        sum_qU = probs_U.sum(dim=1, keepdim=True)                                    # [P_total, 1]
+                        denom = (sum_qU + (M_neg / max(1, V))).clamp_min(1e-12)                      # [P_total, 1]
+                        denom_log = denom.log()
 
-                        # per-part log q after renormalization:
-                        log_qU = probs_U.clamp_min(1e-12).log() - denom.log() # [P_i, U]
-                        log_qM = (log_qM_base - denom.log())  # [P_i, 1] -> broadcast to M
+                        log_qU = probs_U.clamp_min(1e-12).log() - denom_log                          # [P_total, U_max]
+                        log_qM = (log_qM_base - denom_log)                                           # [P_total, 1]
 
-                        # gather student logits on U in one shot
-                        z_U = torch.gather(s_rows, 1, ids_U) / T     # [P_i, U]
+                        z_U = torch.gather(s_rows, 1, ids_U) / T                                     # [P_total, U_max]
+                        zcorr_U = z_U - log_qU
+                        zcorr_M = z_M_all - log_qM                                                   # [P_total, M_neg]
+                        logZ = torch.logsumexp(
+                            torch.cat([zcorr_U, zcorr_M], dim=1), dim=1, keepdim=True
+                        )                                                                             # [P_total, 1]
 
-                        # corrected logits
-                        zcorr_U = z_U - log_qU  # [P_i, U]
-                        zcorr_M = z_M_all - log_qM  # [P_i, M]
-                        logZ = torch.logsumexp(torch.cat([zcorr_U, zcorr_M], dim=1), dim=1, keepdim=True)  # [P_i,1]
+                        s_logp_on_U = zcorr_U - logZ                                                 # [P_total, U_max]
+                        kd_loss = -(probs_U * s_logp_on_U).sum(dim=1).mean()
 
-                        s_logp_on_U = zcorr_U - logZ  # [P_i, U]
-                        loss_i = -(probs_U * s_logp_on_U).sum(dim=1).mean()  # scalar
-                        kd_terms.append(loss_i)
-
-                        # --------- Sampled CE (vectorized, optional) ----------
+                        # --------- Sampled CE (optional, vectorized) ----------
+                        ce_loss_override = None
                         if self.config.enable_ce:
-                            # gold ids for each position
-                            y = input_ids_s[i, pos_indices + 1]  # [P_i]
-                            z_y = torch.gather(s_rows, 1, y.view(-1, 1)).squeeze(1) / T  # [P_i]
-                            # negatives use q(i)=1/V (no renorm for CE)
-                            z_M_ce = z_M_all - log_qM_base   # [P_i, M]
-                            z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1) # [P_i, 1+M]
-                            logZ_ce = torch.logsumexp(z_all, dim=1)  # [P_i]
-                            ce_losses = -(z_y - logZ_ce)  # [P_i]
-                            sampled_ce_terms.append(ce_losses.mean())
-
-                kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
-                ce_loss_override = None
-                if do_elim and self.config.enable_ce:
-                    ce_loss_override = torch.stack(sampled_ce_terms).mean() if sampled_ce_terms else s_pred.sum() * 0.0
+                            # gold ids for each position: use input_ids_s to avoid device mismatch
+                            y = input_ids_s[batch_idx, pos_idx + 1]                                  # [P_total]
+                            z_y = s_rows.gather(1, y.view(-1, 1)).squeeze(1) / T                     # [P_total]
+                            if M_neg > 0:
+                                z_M_ce = z_M_all - log_qM_base                                       # [P_total, M_neg]
+                                z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1)                  # [P_total, 1+M]
+                            else:
+                                z_all = z_y.view(-1, 1)                                              # [P_total, 1]
+                            logZ_ce = torch.logsumexp(z_all, dim=1)                                  # [P_total]
+                            ce_loss_override = -(z_y - logZ_ce).mean()
             else:
                 # Vectorized online RS-KD over vocabulary: flatten all valid positions across the batch
                 assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"

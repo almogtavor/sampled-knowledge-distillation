@@ -64,7 +64,7 @@ def load_teacher_with_fallback(
         from transformers import BitsAndBytesConfig
         q8 = BitsAndBytesConfig(load_in_8bit=True)
         one = teacher_gpus[0]
-        print(f"[teacher] Trying 8-bit quantization fallback on cuda:{one}", flush=True)
+        print(f"[teacher] Trying 8-bit quantization on cuda:{one}", flush=True)
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map={"": one},
