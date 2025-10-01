@@ -322,7 +322,7 @@ def parse_args_to_config() -> TrainingConfig:
     # Sampled softmax elimination (only in cached RS-KD path)
     parser.add_argument("--eliminate_softmax", action="store_true", default=True,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
-    parser.add_argument("--sampled_softmax_negatives", type=int, default=512,
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=750,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
