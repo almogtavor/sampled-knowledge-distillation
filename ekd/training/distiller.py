@@ -160,28 +160,26 @@ class Distiller:
         Otherwise, compute exact entropy online via t_pred.
         Output shape: [B, L-1]
         """
-        if self.cache is not None:
+        # If t_pred is None, we are *expecting* to use the cache. Hard-fail on any miss.
+        if t_pred is None:
+            if self.cache is None:
+                raise RuntimeError("Entropy requested with t_pred=None but no cache is set.")
             items = self._lookup_cache_batch(input_ids)
-            if items is not None:
-                H_list = []
-                for it in items:
-                    if "H_hat_u8" in it:
-                        # Dequantize from uint8 using cap ln(V)
-                        H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
-                        V = int(it.get("rs", {}).get("sentinel_id", 0))
-                        H_cap = math.log(max(2, V)) if V > 0 else 1.0
-                        H_f = (H_u8.float() / 255.0) * H_cap
-                        H_list.append(H_f)
-                    elif "H_hat" in it:
-                        H_list.append(torch.as_tensor(it["H_hat"]).float())
-                    else:
-                        # Missing Ĥ in cache: fall back to exact
-                        H_list = None
-                        break
-                if H_list is not None:
-                    return torch.stack(H_list, dim=0).to(self.student_device)
-
-        # need exact from t_pred
+            if items is None:
+                raise RuntimeError("Cache miss: at least one example not present in the offline cache.")
+            H_list = []
+            for it in items:
+                if "H_hat_u8" in it:
+                    H_u8 = torch.as_tensor(it["H_hat_u8"], dtype=torch.uint8)
+                    V = int(it.get("rs", {}).get("sentinel_id", 0))
+                    H_cap = math.log(max(2, V)) if V > 0 else 1.0
+                    H_f = (H_u8.float() / 255.0) * H_cap
+                    H_list.append(H_f)
+                elif "H_hat" in it:
+                    H_list.append(torch.as_tensor(it["H_hat"]).float())
+                else:
+                    raise RuntimeError("Cache item lacks H_hat / H_hat_u8; cache is incomplete.")
+            return torch.stack(H_list, dim=0).to(self.student_device)
         assert t_pred is not None, "Exact entropy requested but teacher logits are unavailable."
         B = t_pred.size(0)
         ent_list = []
@@ -632,7 +630,7 @@ class Distiller:
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
         # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
         do_elim_softmax = bool(getattr(self.config, "eliminate_softmax", False))
-        s_log_probs = None  # set to log_softmax on-demand when needed
+        s_log_probs = None  # set to log_softmax on-demand when needed (only non-elimination paths)
 
         # Decide path: cached RS-KD with softmax elimination vs. fallback
         cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
@@ -798,17 +796,14 @@ class Distiller:
                         if score_enabled and distill in {"top-k-tok", "bucket", "random"}:
                             # entropy from cache (t_pred=None so _entropy_for_selection will read cache if available)
                             ent_for_score = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
-                            # Dummy s_log_probs placeholder (unused) to satisfy API
-                            s_log_probs_dummy = s_pred.new_zeros((*s_pred.shape[:2], 1))
                             score_ctx = self._prepare_score_context(
                                 ent_raw=ent_for_score,
                                 kl_pos=kd_pos_proxy,
                                 s_log_probs=None,
                                 valid_next=valid_next,
                                 input_ids=input_ids,
-                                student_ce_override=ce_pos_proxy  # <-- pass proxy
+                                student_ce_override=ce_pos_proxy
                             )
-                            score_ctx["student_ce"] = ce_pos_proxy  # override with CE proxy
 
                         if distill == "top-k-tok":
                             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
