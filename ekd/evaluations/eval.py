@@ -304,7 +304,7 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # ("piqa", 500),
     # exact-match
     ("aime25", None),
-    ("ifeval", None)
+    # ("ifeval", None)
 ]
 # Optional tiny adds (off by default): BoolQ 200, HumanEval full
 LIGHT_ENABLE_OPTIONALS = os.environ.get("LIGHT_EXTRAS", "0") == "1"
