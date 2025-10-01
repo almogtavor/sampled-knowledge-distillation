@@ -76,20 +76,23 @@ elif [[ "$MODE" == "score_weights" ]]; then
   K_SCORE="${2:-25}"
   METHOD="top-k-tok"
   SCORE_NORM_DEFAULT="${SCORE_NORMALIZE_OVERRIDE:-z}"
-  read -r -d '' SCORE_COMBOS <<'EOF'
-e_only 1.0 0.0 0.0
-balanced 1.0 1.0 1.0
-entropy_kl 1.0 0.0 1.0
-ce_heavy 0.5 1.5 0.0
-kl_heavy 0.5 0.0 1.5
-kl_tilt 0.0 0.5 1.5
-moderate 0.8 0.8 0.4
-EOF
-  while read -r LABEL W_ENT W_CE W_KL; do
-    [[ -z "$LABEL" ]] && continue
+  
+  # Define weight combinations: label ent_weight ce_weight kl_weight
+  declare -a SCORE_CONFIGS=(
+    "e_only:1.0:0.0:0.0"
+    "balanced:1.0:1.0:1.0"
+    "entropy_kl:1.0:0.0:1.0"
+    # "ce_heavy:0.5:1.5:0.0"
+    # "kl_heavy:0.5:0.0:1.5"
+    # "kl_tilt:0.0:0.5:1.5"
+    # "moderate:0.8:0.8:0.4"
+  )
+  
+  for CONFIG in "${SCORE_CONFIGS[@]}"; do
+    IFS=':' read -r LABEL W_ENT W_CE W_KL <<< "$CONFIG"
     echo "[score_weights] Submitting $LABEL weights (ent=$W_ENT ce=$W_CE kl=$W_KL)"
     sbatch --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "" "$KD_SWEEP_TAG"
-  done <<< "$SCORE_COMBOS"
+  done
 
 else
   usage; exit 1
