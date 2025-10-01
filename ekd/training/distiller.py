@@ -302,11 +302,11 @@ class Distiller:
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
     # === Sampled softmax helpers (used only in cached RS-KD path when elimiate_softmax=True) ===
-def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> torch.Tensor:
-    """Draw M uniform 'negatives' from [0, V). Overlap with U/avoid is allowed."""
-    if M <= 0 or V <= 0:
-        return torch.empty(0, dtype=torch.long, device=device)
-    return torch.randint(low=0, high=V, size=(M,), device=device, dtype=torch.long)
+    def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> torch.Tensor:
+        """Draw M uniform 'negatives' from [0, V). Overlap with U/avoid is allowed."""
+        if M <= 0 or V <= 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.randint(low=0, high=V, size=(M,), device=device, dtype=torch.long)
 
     def _student_log_probs_sampled(self, z_sel: torch.Tensor, q_sel: torch.Tensor, T: float) -> torch.Tensor:
         """Return log softmax over the sampled set S with importance correction: log s(i) ∝ z_i/T - log q(i)."""
@@ -695,10 +695,18 @@ def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> to
                 B = s_pred.size(0)
                 do_elim = do_elim_softmax
 
+                V = int(s_pred.size(-1))
+                M_neg = int(getattr(self.config, "sampled_softmax_negatives", 1024))
+                # ---- sample once per batch (shared across all sequences/positions) ----
+                ids_M_shared = torch.randint(low=0, high=max(1, V), size=(M_neg,), device=self.student_device, dtype=torch.long)
+                # log q_M = log(1/V), reused everywhere
+                log_qM_base = -math.log(max(1, V))
+
                 for i in range(B):
                     valid_i = valid_next[i]
                     if valid_i.sum() == 0:
                         continue
+
                     rs = cached_items[i]["rs"]
                     U = int(rs["U"])  # entries per position
                     sentinel = int(rs["sentinel_id"])  # Vocab size sentinel id
@@ -709,55 +717,75 @@ def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> to
                         from .offline_cache import decode_ids_probs_from_block
                         block = packed[p * U * 3:(p + 1) * U * 3]
                         ids, probs = decode_ids_probs_from_block(block, U, sentinel)
-                        return ids, probs
+                        return ids.to(self.student_device), probs.to(self.student_device)
 
-                    pos_indices = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)
-                    for pos in pos_indices.tolist():
+                    pos_indices = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)  # [P_i]
+                    if pos_indices.numel() == 0:
+                        continue
+
+                    # ---- pre-gather negatives for ALL positions of this sequence in one shot ----
+                    # shape: [P_i, M_neg]; each row is logits for the same ids_M_shared
+                    z_M_all = s_pred[i, pos_indices][:, ids_M_shared] / T  # divide by T once
+
+                    for row_idx, pos in enumerate(pos_indices.tolist()):
                         ids_U, probs_U = get_pos_slice(pos)
                         if ids_U.numel() == 0:
                             continue
 
                         if not do_elim:
+                            # fallback: full-vocab softmax path still allowed
                             if s_log_probs is None:
                                 s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
                             loss_pos = -(probs_U * s_log_probs[i, pos].index_select(0, ids_U)).sum()
                             kd_terms.append(loss_pos)
                             continue
 
-                        # --- eliminate full-vocab softmax ---
-                        V = int(s_pred.size(-1))
-                        M_neg = int(getattr(self.config, "sampled_softmax_negatives", 1024))
-                        ids_M = self._proposal_sample_negatives(V=V, M=M_neg, device=self.student_device)
+                        # =========================
+                        # KD with sampled softmax:
+                        # =========================
+                        # q over S_t is renormalized across U∪M:
+                        # denom = sum(q_U) + M_neg * (1/V). q_U are already normalized over U (cache).
+                        sum_qU = float(probs_U.sum().item())  # usually ~1.0
+                        denom = max(1e-12, sum_qU + (M_neg / max(1, V)))
 
-                        # build S_t = U_t ∪ M_t
-                        ids_S = torch.cat([ids_U, ids_M], dim=0)  # [U+M]
-                        # proposal q over S_t:
-                        q_U = probs_U
-                        q_M = torch.full((ids_M.numel(),), 1.0 / max(1, V), device=self.student_device)
-                        q_sel = torch.cat([q_U, q_M], dim=0)
-                        q_sel = q_sel / q_sel.sum().clamp_min(1e-12)
+                        # per-part log q after renormalization:
+                        log_qU = torch.log(probs_U.clamp_min(1e-12)) - math.log(denom)     # [U]
+                        log_qM = log_qM_base - math.log(denom)                              # scalar
 
-                        # gather student logits only on S_t, then importance-corrected sampled softmax
-                        z_sel = s_pred[i, pos].index_select(0, ids_S)  # [U+M]
-                        s_logp_S = self._student_log_probs_sampled(z_sel=z_sel, q_sel=q_sel, T=T)  # [U+M]
+                        # gather student logits on U and reuse pre-gathered M
+                        z_U = s_pred[i, pos].index_select(0, ids_U) / T                     # [U]
+                        z_M = z_M_all[row_idx]                                              # [M]
 
-                        # KD uses only the cached teacher subset U_t with teacher probs probs_U
-                        s_logp_on_U = s_logp_S[:ids_U.numel()]
+                        # corrected logits
+                        zcorr_U = z_U - log_qU                                               # [U]
+                        zcorr_M = z_M - log_qM                                               # [M]
+                        logZ = torch.logsumexp(torch.cat([zcorr_U, zcorr_M], dim=0), dim=0)
+
+                        s_logp_on_U = zcorr_U - logZ
                         loss_pos = -(probs_U * s_logp_on_U).sum()
                         kd_terms.append(loss_pos)
 
-                        # sampled CE (if enabled): gold + same negatives M_t, no correction on gold
+                        # Sampled CE (optional):
                         if self.config.enable_ce:
                             y_t = int(input_ids[i, pos + 1].item())
-                            if ids_M.numel() > 0 and (ids_M == y_t).any():
-                                ids_M = ids_M[ids_M != y_t]
-                            # build tilde z: gold uses z/T; negatives use z/T - log q(i)
+
+                            # CE uses tilde z: gold uses z/T; negatives use z/T - log q(i), with q(i)=1/V only (no renorm)
                             z_y = s_pred[i, pos, y_t] / T
-                            if ids_M.numel() > 0:
-                                z_M = s_pred[i, pos].index_select(0, ids_M) / T - torch.log(torch.full((ids_M.numel(),), 1.0 / max(1, V), device=self.student_device).clamp_min(1e-12))
-                                z_all = torch.cat([z_y.view(1), z_M], dim=0)
+
+                            # reuse negatives; optionally drop the gold if it appears among negatives
+                            if M_neg > 0:
+                                if ids_M_shared.numel() > 0:
+                                    if (ids_M_shared == y_t).any():
+                                        mask = (ids_M_shared != y_t)
+                                        z_M_ce = z_M[mask] - log_qM_base
+                                    else:
+                                        z_M_ce = z_M - log_qM_base
+                                else:
+                                    z_M_ce = z_M  # empty
+                                z_all = torch.cat([z_y.view(1), z_M_ce], dim=0)
                             else:
                                 z_all = z_y.view(1)
+
                             logZ_ce = torch.logsumexp(z_all, dim=0, keepdim=False)
                             ce_loss_pos = -(z_y - logZ_ce)
                             sampled_ce_terms.append(ce_loss_pos)
