@@ -194,7 +194,7 @@ Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; stor
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
 In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
-With this change---and after batching across all valid positions with shared negatives---we improved throughput from $\sim\!2.3\text{s}/\text{step}$ to $\sim\!0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
+With this change---and after batching across all valid positions with shared negatives---we improved throughput from ${\sim}2.3\text{s}/\text{step}$ to ${\sim}0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
 
 \subsection{Student KD (importance-corrected sampled softmax)}
 \label{sec:sampled_softmax}
@@ -255,7 +255,7 @@ A valid lower bound on entropy $H(p)=-\sum_i p_i\log p_i$ is
 \[
 	H_{\text{lb}}=-\sum_{j\le m} p^{\min}_{(j)}\log p^{\min}_{(j)}\;-\;\tau_{\max}\log\tau_{\max},
 \]
-achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep{kaltchenko2025entropyheatmap}, Sec.~3.6, for a self-contained proof and LLM application). A corresponding upper estimate is
+achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep[\S3.6]{kaltchenko2025entropyheatmap} for a self-contained proof and LLM application). A corresponding upper estimate is
 \[
 	H_{\text{ub}}=H_{\text{lb}}+\tau_{\max}\log(V-m),
 \]
@@ -315,9 +315,9 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 
 If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
-	\text{B/token} \; & =\; k \cdot U \cdot 3
+	\text{B}/\text{token} \; & =\; k \cdot U \cdot 3
 	\;=\; 0.25 \cdot 12 \cdot 3                                                \\
-	\;                & =\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
+	\;                & =\; 9~\text{B}/\text{token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
 Table~\ref{tab:storage} summarizes the storage requirements across different methods.
