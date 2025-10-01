@@ -134,8 +134,11 @@ Our results show that token-selective, unbiased KD achieves the best accuracy--e
 
 
 \section{Methodology - Two-Axis Selection (SampledKD)}
+
+\FloatBarrier
+
 \label{sec:twoaxis}
-\begin{figure}[t]
+\begin{figure}[!]
 	\centering
 	\includegraphics[width=\linewidth]{rskd_grid_two_axis_blue.png}
 	\caption{Two-axis SampledKD: position-selective KD along the sequence axis (Y) and RS-KD over classes (X). Offline we cache $U$ class samples and an entropy proxy per position; online we select $K_{\text{pos}}$ positions and compute KD only over cached classes.}
