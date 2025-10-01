@@ -80,7 +80,11 @@
 
 \section{Introduction}
 
-Large language models (LLMs) deliver state-of-the-art performance but are costly to serve and adapt. Knowledge distillation (KD) amortizes these costs by training a compact student to imitate a larger teacher \citep{hinton2015distillation}. While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) \textbf{train-inference mismatch} in sequence generation, and (ii) \textbf{efficiency limits} from storing or querying full teacher logits.
+Large language models (LLMs) achieve state-of-the-art results across diverse tasks, but their size makes them expensive to serve and difficult to adapt.
+Recent work shows that a small fraction of high-entropy "forking" tokens disproportionately drives learning in reinforcement learning from reasoning tasks \citep{wang2025highentropy}, suggesting that selective supervision may yield better efficiency-accuracy trade-offs.
+Motivated by this insight, we study knowledge distillation (KD), a standard approach that compresses LLMs by training a smaller student model to imitate a larger teacher \citep{hinton2015distillation}, and ask whether focusing KD on these high-entropy tokens can deliver more efficient distillation without sacrificing performance.
+
+While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) train-inference mismatch in sequence generation, and (ii) efficiency limits from storing or querying full teacher logits.
 
 To address (i), recent work proposes on-policy distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd} or replacing them if uninformative (SKD) \citep{xu2024speculative}.
 To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
@@ -188,7 +192,43 @@ Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; stor
 
 \noindent\textbf{Defaults.} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
 
-\section{Entropy Approximation and Gumbel Trick}
+\section{Softmax Elimination Optimizations}
+\label{sec:softmax_elimination}
+In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
+With this change—and after batching across all valid positions with shared negatives—we improved throughput from $~2.3s/step$ to $~0.77s/step$ ($\approx3×$ faster) on the same setup.
+
+\paragraph{Student KD (importance-corrected sampled softmax).}
+\label{sec:sampled_softmax}
+We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
+At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
+Let $S_t = U_t \cup M_t$.
+
+For the student, we normalize its logits $z_i$ only over $S_t$ while correcting for the sampling distribution:
+\[
+	\hat s_t(i) = \frac{\exp(z_i/T - \log q(i))}{\sum_{j \in S_t} \exp(z_j/T - \log q(j))},
+\]
+where $T$ is the KD temperature.
+The KD loss uses these $\hat s_t(i)$ on the cached teacher subset $U_t$. This replaces a full $\mathcal{O}(V)$ softmax with $\mathcal{O}(|S_t|)$.
+The $-\log q(i)$ term yields an importance-sampling estimator whose expectation matches the full-softmax \citep{jean2015large}.
+
+\paragraph{Sampled CE.}
+Define $\tilde z_i = z_i/T - \log q(i)$ for negatives and $\tilde z_{y_t}=z_{y_t}/T$ for the gold token (no importance correction).
+Where $y_t$ is gold next-token id at position $t$, and $i$ indexes token classes ($i\in S_t$ for KD; $i\in\{y_t\}\cup M_t$ for CE).
+
+For the cross-entropy, we include the gold token $y_t$ and negatives $M_t$ (reused from the sampled softmax\S\ref{sec:sampled_softmax}):
+\begin{align*}
+	\hat s^{\text{CE}}_t(i) = \frac{\exp(\tilde z_i)}{\sum_{j \in \{y_t\}\cup M_t} \exp(\tilde z_j)},
+\end{align*}
+Which results
+\(
+\widehat{\text{CE}}_t = -\log \hat s^{\text{CE}}_t(y_t),
+\)
+as the sampled CE loss.
+This yields an unbiased approximation to full softmax CE with cost proportional to $|M_t|$.
+Prior empirical studies show that $~1k$ negatives suffice for good convergence \citep{blanc2018adaptive}.
+
+% \section{Entropy Approximation and Gumbel Trick}
+\paragraph{Entropy Approximation.}
 \label{sec:entropy}
 We estimate token uncertainty via a Top-$k$-plus-tail construction, and draw teacher samples for RS-KD via the Gumbel-Max trick—so no full softmax normalization is required during teacher forwards.
 Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
@@ -201,7 +241,7 @@ We compute entropy in nats (natural logarithm) and 8-bit quantization.
 Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits.
 Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},           \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},            \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -277,7 +317,7 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
 	\text{B/token} \; & =\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3                                                \\
+	\;=\; 0.25 \cdot 12 \cdot 3                                                 \\
 	\;                & =\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
@@ -376,7 +416,7 @@ Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	 & = -P_T\log\!\frac{P_T}{V-m}                                              \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
 	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
@@ -388,7 +428,7 @@ Thus, the entropy tail is
 with unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
