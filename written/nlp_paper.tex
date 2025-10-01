@@ -91,20 +91,19 @@
 	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose Entropy Knowledge Distillation (EKD), a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. EKD enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
 \end{abstract}
 
-\begin{figure}[t]
+\section{Introduction}
+
+Large language models (LLMs) achieve state-of-the-art results across diverse tasks, but their size makes them expensive to serve and difficult to adapt.
+Recent work shows that a small fraction of high-entropy "forking" tokens disproportionately drives learning in reinforcement learning from reasoning tasks \citep{wang2025highentropy}, suggesting that selective supervision may yield better efficiency-accuracy trade-offs.
+Motivated by this insight, we study knowledge distillation (KD), a standard approach that compresses LLMs by training a smaller student model to imitate a larger teacher \citep{hinton2015distillation}, and ask whether focusing KD on these high-entropy tokens can deliver more efficient distillation without sacrificing performance.
+
+\begin{figure}[t!]
 	\begin{flushright}
 		\includegraphics[width=\linewidth]{kd_intuition.png}
 	\end{flushright}
 	\caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme.}
 	\label{fig:kd_intuition}
 \end{figure}
-
-
-\section{Introduction}
-
-Large language models (LLMs) achieve state-of-the-art results across diverse tasks, but their size makes them expensive to serve and difficult to adapt.
-Recent work shows that a small fraction of high-entropy "forking" tokens disproportionately drives learning in reinforcement learning from reasoning tasks \citep{wang2025highentropy}, suggesting that selective supervision may yield better efficiency-accuracy trade-offs.
-Motivated by this insight, we study knowledge distillation (KD), a standard approach that compresses LLMs by training a smaller student model to imitate a larger teacher \citep{hinton2015distillation}, and ask whether focusing KD on these high-entropy tokens can deliver more efficient distillation without sacrificing performance.
 
 While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) train-inference mismatch in sequence generation, and (ii) efficiency limits from storing or querying full teacher logits.
 
@@ -162,14 +161,14 @@ Only the packed samples and scalar $H_t$ are stored (no full logits).
 \subsection{Online stage (student, many epochs)}
 At each update we (i) select a subset $S$ of token positions, then (ii) compute a sampled KD loss (with optional softmax elimination) and combine it with CE.
 
-\paragraph{Position-selection policies.}
+\subsubsection{Position-selection policies}
 We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
 	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by a score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
 	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
 	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
 	      \[
-		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})}, \sum_{t\in S}w_t=1,
+		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})},\quad \sum_{t\in S}w_t=1,
 	      \]
 	      so that rarely sampled tokens count more and frequent ones count less.
 	\item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
@@ -177,7 +176,7 @@ We evaluate five policies per sequence (uniform random is a baseline):
 \end{enumerate}
 All policies can be run with \textbf{GLS} (Global-level Selection): instead of relying solely on the current batch, we track running ranks over a global FIFO queue to approximate a global threshold (originally proposed for CE in \citet{wang2021selectivekd}); here we apply the same idea to entropy or the composite score.
 
-\paragraph{Loss computation (common to all policies).}
+\subsubsection{Loss computation (common to all policies)}
 For each selected position $t$:
 \begin{enumerate}
 	\item \textbf{Reconstruct teacher target on cached support.} Decode the cached subset $\mathcal{S}_t$ and renormalize the stored q7 counts \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
@@ -192,17 +191,16 @@ For each selected position $t$:
 	      \]
 \end{enumerate}
 Aggregate over positions and combine with CE:
-\[
-	\mathcal{L}
-	\;=\;
-	T^2 \cdot
+\begin{align*}
+	\mathcal{L} =
+	 & T^2 \cdot
 	\begin{cases}
-		\sum_{t\in S} w_t\, \mathrm{KD}_t                     & \text{(RS-KD with Hájek weights)}        \\[2pt]
-		\operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big] & \text{(top-$k$, bucket, bandit, random)}
-	\end{cases}
-	\;+\;
+		\overbrace{\sum_{t\in S} w_t\, \mathrm{KD}_t}^\text{(RS-KD with Hájek weights)} \\[2pt]
+		\underbrace{\operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big]}_\text{(top-$k$, bucket, bandit, random)}
+	\end{cases} \\
+	 & +
 	\alpha_{\text{ce}}\cdot \text{CE}(\text{gold},\, s).
-\]
+\end{align*}
 When softmax elimination is \emph{off}, CE and KD use the full-vocabulary softmax. When elimination is \emph{on}, KD uses the sampled objective above and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens, except under the bucket/random policies where we restrict CE to the selected positions to match their compute budget.
 
 \subsection{Theoretical justification}
@@ -296,7 +294,7 @@ We compute entropy in nats (natural logarithm) and 8-bit quantization.
 Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits.
 Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},            \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},           \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -372,7 +370,7 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
 	\text{B}/\text{token} \; & =\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3                                                               \\
+	\;=\; 0.25 \cdot 12 \cdot 3                                                              \\
 	\;                       & =\; 9~\text{B}/\text{token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
@@ -471,7 +469,7 @@ Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                              \\
 	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
@@ -483,7 +481,7 @@ Thus, the entropy tail is
 with unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
