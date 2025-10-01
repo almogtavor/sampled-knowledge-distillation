@@ -27,15 +27,52 @@ if [[ "$MODE" == "compare_k" ]]; then
   METHOD="${2:-top-k-tok}"
   # Sweep k = 0..100 step 10 (top-k-tok, except k=100 as vanilla)
   # Run sequentially: wait for each job to finish before submitting the next
-  for K in 20 25 30 40 50 75 100; do
+  for K in 10 12 15 20 25 30 40 50 75 100; do
     if [[ "$K" -eq 100 ]]; then
       echo "[compare_k] Submitting vanilla K=$K and waiting for completion..."
-      sbatch --wait --export=ALL,EPOCHS=1 train.slurm vanilla "$K" light "$KD_SWEEP_TAG"
+      sbatch --wait train.slurm vanilla "$K" light "$KD_SWEEP_TAG"
     else
       echo "[compare_k] Submitting $METHOD K=$K and waiting for completion..."
-      sbatch --wait --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K" light "$KD_SWEEP_TAG"
+      sbatch --wait train.slurm "$METHOD" "$K" light "$KD_SWEEP_TAG"
     fi
   done
+
+elif [[ "$MODE" == "compare_k_with_buckets" ]]; then
+  # Run compare_k first, then buckets; both with 4M tokens
+  export FINEWEB_TOKENS=4000000
+
+  echo "[compare_k_with_buckets] === compare_k (top-k-tok) with FINEWEB_TOKENS=$FINEWEB_TOKENS ==="
+  METHOD="${2:-top-k-tok}"
+  for K in 0 1 2 5 10 12 15 20 25 30 40 50 75 100; do
+    if [[ "$K" -eq 100 ]]; then
+      echo "[compare_k_with_buckets/compare_k] Submitting vanilla K=$K and waiting for completion..."
+      sbatch --wait train.slurm vanilla "$K" light "$KD_SWEEP_TAG"
+    else
+      echo "[compare_k_with_buckets/compare_k] Submitting $METHOD K=$K and waiting for completion..."
+      sbatch --wait train.slurm "$METHOD" "$K" light "$KD_SWEEP_TAG"
+    fi
+  done
+
+  echo "[compare_k_with_buckets] === buckets (bucket) with FINEWEB_TOKENS=$FINEWEB_TOKENS ==="
+  METHOD="bucket"
+  declare -a BUCKETS=(
+    "5 15"
+    "10 20"
+    "5 30"
+    "15 35"
+    "15 50"
+    "25 75"
+  )
+  for R in "${BUCKETS[@]}"; do
+    read -r L U <<< "$R"
+    export BUCKET_LOWER_PERCENT="$L"
+    export BUCKET_UPPER_PERCENT="$U"
+    TAG="${KD_SWEEP_TAG:-compare_k_with_buckets}_${L}-${U}"
+
+    echo "[compare_k_with_buckets/buckets] Submitting $METHOD L=$L U=$U and waiting for completion..."
+    sbatch --wait train.slurm "$METHOD" "0" light "$TAG"
+  done
+
 
 elif [[ "$MODE" == "coarse_k" ]]; then
   # --- New mode: quick 1-epoch pass over a default K list
@@ -50,6 +87,17 @@ elif [[ "$MODE" == "coarse_k" ]]; then
     fi
   done
 
+elif [[ "$MODE" == "compare_methods_gsm8k" ]]; then
+  # Run all three methods at fixed k
+  for METHOD in top-k-tok; do
+    sbatch train.slurm "$METHOD" "$K_FIXED" light "$KD_SWEEP_TAG"
+  done
+
+elif [[ "$MODE" == "run_top_k_with_softmax" ]]; then
+  # Run all three methods at fixed k
+  for METHOD in entropy-top-k-with-softmax; do
+    sbatch train.slurm "$METHOD" "$K_FIXED" light "$KD_SWEEP_TAG"
+  done
 
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k

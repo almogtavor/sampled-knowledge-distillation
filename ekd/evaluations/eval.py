@@ -294,12 +294,12 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 # we fall back to the harness default (typically first-N) and print a warning.
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
-    ("gsm8k", 50),
-    ("svamp", 50),
+    ("gsm8k", 250),
+    ("svamp", 250),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
-    ("arc_challenge", 50),
-    ("arc_easy", 50),
+    ("arc_challenge", None),
+    ("arc_easy", None),
     # ("hellaswag", 500),
     # ("piqa", 500),
     # exact-match
@@ -344,7 +344,7 @@ TASK_TIMEOUTS = {
     "arc_challenge": 1500,
     "hellaswag": 1200,
     "svamp": 900,
-    "gsm8k": 1200,
+    "gsm8k": 2000,
     "aime25": 2000,
     # heavy add-ons
     "asdiv": 1200,
