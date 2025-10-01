@@ -220,11 +220,11 @@ class Distiller:
         self,
         ent_raw: torch.Tensor,
         kl_pos: torch.Tensor,
-        s_log_probs: torch.Tensor,
+        s_log_probs: Optional[torch.Tensor],
         valid_next: torch.Tensor,
         input_ids: torch.Tensor,
+        student_ce_override: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """Pre-compute tensors needed for score-based token ranking"""
         weights = (
             float(getattr(self.config, "score_entropy_weight", 1.0)),
             float(getattr(self.config, "score_ce_weight", 1.0)),
@@ -235,13 +235,20 @@ class Distiller:
 
         norm_mode = getattr(self.config, "score_normalize", "z")
 
-        targets = input_ids[:, 1:].to(self.student_device)
-        targets = targets.masked_fill(~valid_next, 0)
-        target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
-
+        # entropy / kl components
         ent_for_score = ent_raw.detach().masked_fill(~valid_next, 0.0)
         kl_for_score = kl_pos.detach().masked_fill(~valid_next, 0.0)
+
+        # student CE component
+        if student_ce_override is not None:
+            student_ce = student_ce_override.detach().masked_fill(~valid_next, 0.0)
+        else:
+            if s_log_probs is None:
+                raise ValueError("s_log_probs is required unless student_ce_override is provided.")
+            targets = input_ids[:, 1:].to(self.student_device)
+            targets = targets.masked_fill(~valid_next, 0)
+            target_logp = s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            student_ce = (-target_logp).detach().masked_fill(~valid_next, 0.0)
 
         return {
             "weights": weights,
@@ -301,7 +308,7 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
-    # === Sampled softmax helpers (used only in cached RS-KD path when elimiate_softmax=True) ===
+    # === Sampled softmax helpers (used only in cached RS-KD path when eliminate_softmax=True) ===
     def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> torch.Tensor:
         """Draw M uniform 'negatives' from [0, V). Overlap with U/avoid is allowed."""
         if M <= 0 or V <= 0:
@@ -624,12 +631,12 @@ class Distiller:
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
         # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
-        do_elim_softmax = bool(getattr(self.config, "elimiate_softmax", False))
+        do_elim_softmax = bool(getattr(self.config, "eliminate_softmax", False))
         s_log_probs = None  # set to log_softmax on-demand when needed
 
         # Decide path: cached RS-KD with softmax elimination vs. fallback
         cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
-        do_elim = bool(getattr(self.config, "elimiate_softmax", False)) and (cached_items is not None)
+        do_elim = bool(getattr(self.config, "eliminate_softmax", False)) and (cached_items is not None)
         # Whether we will use the cached RS-KD vocabulary estimator path at all
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
 
@@ -795,10 +802,11 @@ class Distiller:
                             s_log_probs_dummy = s_pred.new_zeros((*s_pred.shape[:2], 1))
                             score_ctx = self._prepare_score_context(
                                 ent_raw=ent_for_score,
-                                kl_pos=kd_pos_proxy,  # use KD proxy as KL component
-                                s_log_probs=s_log_probs_dummy,
+                                kl_pos=kd_pos_proxy,
+                                s_log_probs=None,
                                 valid_next=valid_next,
                                 input_ids=input_ids,
+                                student_ce_override=ce_pos_proxy  # <-- pass proxy
                             )
                             score_ctx["student_ce"] = ce_pos_proxy  # override with CE proxy
 
@@ -980,7 +988,7 @@ class Distiller:
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
-            # if sampled CE was computed in the cached path with elimiate_softmax=True, use it
+            # if sampled CE was computed in the cached path with eliminate_softmax=True, use it
             if 'ce_loss_override' in locals() and ce_loss_override is not None:
                 ce_loss = ce_loss_override
             else:

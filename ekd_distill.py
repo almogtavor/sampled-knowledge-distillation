@@ -320,10 +320,10 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
     # Sampled softmax elimination (only in cached RS-KD path)
-    parser.add_argument("--elimiate_softmax", action="store_true", default=True,
+    parser.add_argument("--eliminate_softmax", action="store_true", default=True,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     parser.add_argument("--sampled_softmax_negatives", type=int, default=512,
-                        help="Number of uniform negative samples per position when --elimiate_softmax is set")
+                        help="Number of uniform negative samples per position when --eliminate_softmax is set")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
     default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
