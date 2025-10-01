@@ -238,3 +238,4 @@ logits_caches/
 # LaTeX code snippets
 tex.code-snippets
 results/
+evals/
