@@ -291,6 +291,15 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
         "job_id": os.getenv("SLURM_JOB_ID", "local"),
         "experiment_name": experiment_name,
     }
+
+    # If training uses FineWeb, log the token budget when available
+    try:
+        if isinstance(getattr(config, 'datasets', None), list) and 'fineweb' in config.datasets:
+            fw_tokens = getattr(config, 'fineweb_tokens', None)
+            if fw_tokens is not None:
+                wandb_config["fineweb_tokens"] = int(fw_tokens)
+    except Exception:
+        pass
     
     tags = [
         config.distill_type,
@@ -305,6 +314,14 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
         tags.append(f"bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}")
     elif config.distill_type == "vanilla":
         tags.append("all-tokens")
+    # Optional tag to surface FineWeb token budget in the UI
+    try:
+        if isinstance(getattr(config, 'datasets', None), list) and 'fineweb' in config.datasets:
+            fw_tokens = getattr(config, 'fineweb_tokens', None)
+            if fw_tokens is not None:
+                tags.append(f"fineweb_tokens={int(fw_tokens)}")
+    except Exception:
+        pass
     
     return WandBLogger(
         project=getattr(config, 'wandb_project', 'selective-entropy-knowledge-distillation'),

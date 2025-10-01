@@ -241,10 +241,18 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Exponent on entropy for sampling dist: q(i) ∝ H_i^alpha (alpha∈[0,∞))")
     parser.add_argument("--rs_floor", type=float, default=1e-6,
                         help="Minimum probability floor to avoid huge weights / degeneracy")
-    parser.add_argument("--bucket_lower_percent", type=int, default=70, 
-                        help="For bucket mode: lower bound percentile (skip bottom X%)")
-    parser.add_argument("--bucket_upper_percent", type=int, default=80,
-                        help="For bucket mode: upper bound percentile (skip top Y%)")
+    parser.add_argument(
+        "--bucket_lower_percent",
+        type=int,
+        default=int(os.environ.get("BUCKET_LOWER_PERCENT", 70)),
+        help="For bucket mode: lower bound percentile (skip bottom X%)",
+    )
+    parser.add_argument(
+        "--bucket_upper_percent",
+        type=int,
+        default=int(os.environ.get("BUCKET_UPPER_PERCENT", 80)),
+        help="For bucket mode: upper bound percentile (skip top Y%)",
+    )
     parser.add_argument("--score_token_selection", action="store_true", default=False,
                         help="Rank tokens by composite score (entropy + student CE + KL) when selecting top-k/bucket tokens")
     parser.add_argument("--score_normalize", choices=["none", "z", "minmax"], default="z",
@@ -314,7 +322,7 @@ def parse_args_to_config() -> TrainingConfig:
     # Sampled softmax elimination (only in cached RS-KD path)
     parser.add_argument("--elimiate_softmax", action="store_true", default=True,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
-    parser.add_argument("--sampled_softmax_negatives", type=int, default=256,
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=512,
                         help="Number of uniform negative samples per position when --elimiate_softmax is set")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))

@@ -606,10 +606,21 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
     preferred = [p for p in sample_files if "samples" in p.as_posix().split("/")]
     files = preferred or sample_files
     per_task: Dict[str, Dict[str, float]] = {}
+
+    def _normalize_task_from_filename(stem: str) -> str:
+        # Drop common suffixes like "_samples" or ".samples"
+        if stem.endswith("_samples"):
+            stem = stem[: -len("_samples")]
+        if stem.endswith(".samples"):
+            stem = stem[: -len(".samples")]
+        # If there is a normalization variant like ",none", trim to base task
+        if "," in stem:
+            stem = stem.split(",", 1)[0]
+        return stem
     for p in files:
         try:
-            # Task name from filename (strip extension)
-            task_name = p.stem
+            # Task name from filename (strip extension and normalize)
+            task_name = _normalize_task_from_filename(p.stem)
             confidences: List[float] = []
             correctness: List[int] = []
             with open(p, "r", encoding="utf-8") as f:
@@ -639,6 +650,34 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
         except Exception as e:
             print(f"Failed to compute ECE from {p}: {e}")
     return per_task
+
+def _map_ece_to_existing_tasks(ece_metrics: Dict[str, Dict[str, float]],
+                               lmeval_metrics: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    """Map ECE task keys to match the keys present in lm-eval metrics when possible.
+
+    lm-eval often uses task keys like "arc_challenge,none" while sample files may yield
+    base names like "arc_challenge". This function attempts to align ECE entries to the
+    exact keys used in lmeval_metrics so they appear under the same task in the JSON.
+    """
+    if not ece_metrics or not lmeval_metrics:
+        return ece_metrics
+
+    # Build index from base -> full task keys found in lmeval
+    base_to_full: Dict[str, List[str]] = {}
+    for full_key in lmeval_metrics.keys():
+        base_key = full_key.split(",", 1)[0]
+        base_to_full.setdefault(base_key, []).append(full_key)
+
+    remapped: Dict[str, Dict[str, float]] = {}
+    for ece_key, metrics in ece_metrics.items():
+        base_key = ece_key.split(",", 1)[0]
+        candidates = base_to_full.get(base_key, [])
+        if len(candidates) == 1:
+            remapped[candidates[0]] = metrics
+        else:
+            # If ambiguous or no match, keep original key
+            remapped[ece_key] = metrics
+    return remapped
 
 # ---------- Lighteval (summarization) ----------
 def run_lighteval(model_dir: Path, tag: str, results_dir: Path, suite: str) -> Optional[Path]:
@@ -1063,8 +1102,9 @@ def main():
             suite=args.suite,
         )
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
-        # Derive ECE from sample logs when available
-        ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
+        # Derive ECE from sample logs when available and align its task keys
+        raw_ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
+        ece_metrics = _map_ece_to_existing_tasks(raw_ece_metrics, lmeval_metrics)
 
         # Summarization (HEAVY only)
         lighteval_file = run_lighteval(model_dir, tag, results_dir, suite=args.suite)
