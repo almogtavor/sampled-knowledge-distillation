@@ -74,7 +74,7 @@ fi
 
 # ---------- caches / env ----------
 mkdir -p logs
-export TMPDIR="$PWD/tmp"
+export TMPDIR="/home/joberant/NLP_2425b/$USER/ekd/tmp"
 mkdir -p "$TMPDIR"
 export TMP="$TMPDIR"; export TEMP="$TMPDIR"
 export XDG_CACHE_HOME="$PWD/tmp/xdg_cache";   mkdir -p "$XDG_CACHE_HOME"
@@ -85,9 +85,9 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 # W&B caches away from $HOME
-export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
-export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";            mkdir -p "$WANDB_DIR"
-export TORCH_HOME="$PWD/tmp/torch";          mkdir -p "$TORCH_HOME"
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$TMP/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
+export WANDB_DIR="${WANDB_DIR:-$TMP/wandb}";            mkdir -p "$WANDB_DIR"
+export TORCH_HOME="$TMP/torch";          mkdir -p "$TORCH_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
@@ -100,9 +100,8 @@ export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
 export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
-export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";          mkdir -p "$WANDB_DIR"
+export WANDB_DATA_DIR="${WANDB_DATA_DIR:-$TMP/wandb_cache}"; mkdir -p "$WANDB_DATA_DIR"
 # Explicitly redirect W&B cache (artifacts, uploads) away from $HOME
-export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
 export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_DISABLED=${WANDB_DISABLED:-false}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
