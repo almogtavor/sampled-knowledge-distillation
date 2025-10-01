@@ -316,6 +316,10 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     parser.add_argument("--sampled_softmax_negatives", type=int, default=256,
                         help="Number of uniform negative samples per position when --elimiate_softmax is set")
+    parser.add_argument("--use_gls", action="store_true", default=False,
+                        help="Enable global-level selection (GLS) across docs/batch.")
+    parser.add_argument("--gls_queue_size", type=int, default=200000,
+                        help="Max number of scores to keep in GLS FIFO (entropy-based methods).")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
     default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
