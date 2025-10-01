@@ -19,7 +19,7 @@ DISTILL_TYPE=${1:-"top-k-tok"}
 K_PERCENT=${2:-20}
 EVAL_SUITE=${3:-}
 KD_SWEEP_TAG=${4:-}
-EPOCHS="${5:-${EPOCHS:-3}}"   # default 3, override via env
+EPOCHS="${5:-${EPOCHS:-1}}"   # default 1, override via env
 ANNEAL_FLAG=${6:-""}
 echo "Running training with distillation type: $DISTILL_TYPE"
 START_TIME=$(date -u)
@@ -27,8 +27,9 @@ START_TIME_EPOCH=$(date +%s)
 echo "Job started at $START_TIME"
 
 # Convert hyphens to underscores for directory names
+DATE_TAG=$(date +%Y%m%d_%H%M)
 DISTILL_TYPE_DIR=$(echo "$DISTILL_TYPE" | tr '-' '_')
-OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/models/model_${SLURM_JOB_ID}"
+OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/models/model_${SLURM_JOB_ID}_${DATE_TAG}_${DISTILL_TYPE_DIR}_k${K_PERCENT}"
 EVAL_OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/results/kd_${KD_SWEEP_TAG}_out/eval"
 
 # Default virtual environment directory
@@ -39,6 +40,8 @@ echo "SLURM_JOB_ID      = ${SLURM_JOB_ID:-N/A}"
 echo "DISTILL_TYPE      = $DISTILL_TYPE"
 echo "K_PERCENT         = $K_PERCENT"
 echo "EVAL_SUITE        = ${EVAL_SUITE:-None}"
+echo "KD_SWEEP_TAG      = $KD_SWEEP_TAG"
+echo "DATE_TAG          = $DATE_TAG"
 echo "VENV_DIR          = $VENV_DIR"
 echo "OUTPUT_DIR        = $OUTPUT_DIR"
 echo "User              = $USER"
@@ -71,10 +74,20 @@ fi
 
 # ---------- caches / env ----------
 mkdir -p logs
-export TMPDIR="$PWD/tmp";               mkdir -p "$TMPDIR"
+export TMPDIR="$PWD/tmp"
+mkdir -p "$TMPDIR"
+export TMP="$TMPDIR"; export TEMP="$TMPDIR"
+export XDG_CACHE_HOME="$PWD/tmp/xdg_cache";   mkdir -p "$XDG_CACHE_HOME"
 export HF_HOME="$TMPDIR/hf";            mkdir -p "$HF_HOME/hub" "$HF_HOME/datasets"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
+# W&B caches away from $HOME
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";            mkdir -p "$WANDB_DIR"
+export TORCH_HOME="$PWD/tmp/torch";          mkdir -p "$TORCH_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
@@ -87,7 +100,9 @@ export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
 export WANDB_ENTITY=${WANDB_ENTITY:-selective-entropy-knowledge-distillation}
 export WANDB_START_METHOD=${WANDB_START_METHOD:-thread}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
-export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}"
+export WANDB_DIR="${WANDB_DIR:-$PWD/wandb}";          mkdir -p "$WANDB_DIR"
+# Explicitly redirect W&B cache (artifacts, uploads) away from $HOME
+export WANDB_CACHE_DIR="${WANDB_CACHE_DIR:-$PWD/tmp/wandb_cache}"; mkdir -p "$WANDB_CACHE_DIR"
 export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_DISABLED=${WANDB_DISABLED:-false}
 export WANDB_RESUME=${WANDB_RESUME:-allow}
@@ -270,4 +285,13 @@ if [[ -n "$EVAL_SUITE" ]]; then
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."
+fi
+
+# Also save a copy of the log with a descriptive filename
+SAFE_TYPE="$DISTILL_TYPE_DIR"
+RICH_LOG="results/logs/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
+SRC_LOG="logs/train.${SLURM_JOB_ID}.log"
+if [[ -f "$SRC_LOG" ]]; then
+  cp -f "$SRC_LOG" "$RICH_LOG" || true
+  echo "Saved rich log copy to $RICH_LOG"
 fi

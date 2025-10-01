@@ -24,5 +24,12 @@ manual_tasks:
     num_fewshot: 0
 
   - task: ifeval
-    dataset_path: ifeval
+    dataset_path: google/IFEval
+    test_split: train
+    output_type: generate_until
+    generation_kwargs:
+      max_new_tokens: 256
+      do_sample: false
+      temperature: 0.0
+    process_docs: !function ekd.evaluations.utils.process_docs_ifeval
     num_fewshot: 0
