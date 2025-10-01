@@ -88,7 +88,7 @@
 \footnotemark
 \footnotetext{* Equal contribution.}
 \begin{abstract}
-	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose Entropy Knowledge Distillation (EKD), a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. EKD enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
+	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. We enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
 \end{abstract}
 
 \section{Introduction}
@@ -393,7 +393,10 @@ Table~\ref{tab:storage} summarizes the storage requirements across different met
 \section{Evaluation}
 \label{sec:evaluation}
 
-We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach. Models are pretrained on FineWeb-Edu for 1M tokens and evaluated zero-shot. All evaluations report pass@1 accuracy as the primary metric.
+We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach.
+Models are pretrained on FineWeb-Edu for 1M and 4M tokens and evaluated zero-shot.
+All evaluations report pass@1 accuracy as the primary metric.
+
 \subsection{Datasets}
 
 \subsubsection{Mathematical reasoning}
@@ -443,10 +446,6 @@ Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top
 
 \subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2024perplexedperplexityperplexitybaseddata} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
-\subsection{Self-distillation and EMA teachers} Self-distillation regularizes students via a teacher derived from the student itself, e.g., Born-Again Networks \citep{furlanello2018ban} and Mean Teacher (EMA) consistency \citep{tarvainen2017meanteacher}. We adopt an optional EMA self-distill term as a light regularizer complementary to external-teacher KD.
-
-\subsection{Evaluation under shift} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
-
 \section{Limitations and Future Work}
 \label{sec:limits}
 \paragraph{Scale and quantization}
@@ -454,8 +453,8 @@ Our primary teacher-student pair (Qwen3-8B $\rightarrow$ Qwen3-0.6B) and the use
 We expect different behavior at larger teacher/student scales and without low-precision constraints.
 
 \subsection{SampledKD underperformance}
-While SampledKD is principled and builds on successful ideas in sampled softmax and RS-KD, our results do not yet match full KD at equal wall-clock.
-This may be due to (i) scale and quantization, (ii) interaction between positional selection and class sampling, and (iii) optimization techniques (e.g. softmax elimination) (iv) implementation details.
+While SampledKD is principled and builds on successful ideas in sampled softmax and RS-KD, and we observe superior efficiency and strong accuracy relative to baselines, our results do not yet fully match full KD at equal wall-clock.
+We attribute the remaining gap primarily to the limited training budgets (only 1M and 4M FineWeb-Edu tokens) and predominantly zero-shot evaluation, together with (i) scale and quantization effects, (ii) specific optimization techniques  (e.g., softmax elimination), and (iv) implementation details.
 
 \subsection{Future work}
 Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD: 
