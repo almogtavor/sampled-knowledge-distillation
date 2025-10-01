@@ -81,6 +81,10 @@ class TrainingConfig(BaseModel):
     rs_vocab_beta: float = Field(default=1.0, description="Proposal exponent for RS-KD over vocab: q ∝ p^beta")
     # Entropy cache policy (always stored): True => uint8, False => fp16
     H_hat_u8: bool = Field(default=True, description="Store Ĥ as uint8 (True) or fp16 (False)")
+
+    # Sampled softmax elimination (only active when using offline cache within cached path)
+    elimiate_softmax: bool = Field(default=False, description="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
+    sampled_softmax_negatives: int = Field(default=1024, description="Number of uniform negative samples per position when elimiate_softmax=True")
     
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")

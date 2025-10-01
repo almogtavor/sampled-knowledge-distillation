@@ -12,6 +12,7 @@ from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from ekd.config import TrainingConfig
+from ekd.utils import _bnb_triton_available
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
 from ekd.training.distiller import Distiller
@@ -56,7 +57,31 @@ def load_teacher_with_fallback(
     if not teacher_gpus:
         raise RuntimeError("No GPUs available for teacher after excluding the student GPU.")
 
-    # ===== 1) Single-GPU FP16 (best performance if it fits) =====
+    # ===== 1) 8-bit quantization on single GPU =====
+    try:
+        if not _bnb_triton_available():
+            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
+        from transformers import BitsAndBytesConfig
+        q8 = BitsAndBytesConfig(load_in_8bit=True)
+        one = teacher_gpus[0]
+        print(f"[teacher] Trying 8-bit quantization fallback on cuda:{one}", flush=True)
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map={"": one},
+            quantization_config=q8,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        print("[teacher] Loaded 8-bit.", flush=True)
+        return teacher, tok, torch.device(f"cuda:{one}")
+    except Exception as e:
+        print(f"[teacher] 8-bit failed: {e}", flush=True)
+
+
+    # ===== 2) Single-GPU FP16 (best performance if it fits) =====
     try:
         one = teacher_gpus[0]
         print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
@@ -79,7 +104,7 @@ def load_teacher_with_fallback(
         else:
             print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
 
-    # ===== 2) Multi-GPU sharding with Accelerate =====
+    # ===== 3) Multi-GPU sharding with Accelerate =====
     if len(teacher_gpus) >= 2:
         try:
             print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
@@ -115,29 +140,6 @@ def load_teacher_with_fallback(
         except Exception as e:
             print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
 
-    # Helper: check if BitsAndBytes + Triton backend are usable in this env
-    def _bnb_triton_available() -> bool:
-        try:
-            # transformers integration class
-            from transformers import BitsAndBytesConfig  # noqa: F401
-        except Exception:
-            return False
-        try:
-            import bitsandbytes as bnb  # noqa: F401
-        except Exception:
-            return False
-        try:
-            import triton  # noqa: F401
-        except Exception:
-            return False
-        # Some bnb builds require triton.ops; probe a representative module
-        try:
-            import importlib
-            importlib.import_module("bitsandbytes.triton.int8_matmul_mixed_dequantize")
-        except Exception:
-            return False
-        return True
-
     # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
     try:
         import importlib
@@ -155,29 +157,6 @@ def load_teacher_with_fallback(
         print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
     except Exception:
         pass
-
-    # ===== 3) 8-bit quantization on single GPU =====
-    try:
-        if not _bnb_triton_available():
-            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
-        from transformers import BitsAndBytesConfig
-        q8 = BitsAndBytesConfig(load_in_8bit=True)
-        one = teacher_gpus[0]
-        print(f"[teacher] Trying 8-bit quantization fallback on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            quantization_config=q8,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded 8-bit.", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except Exception as e:
-        print(f"[teacher] 8-bit failed: {e}", flush=True)
 
     # ===== 4) 4-bit quantization on single GPU (last resort) =====
     try:
@@ -332,6 +311,11 @@ def parse_args_to_config() -> TrainingConfig:
                         help="How many vocab tokens to sample per position for RS-KD. 36 bytes per position")
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
+    # Sampled softmax elimination (only in cached RS-KD path)
+    parser.add_argument("--elimiate_softmax", action="store_true", default=True,
+                        help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=256,
+                        help="Number of uniform negative samples per position when --elimiate_softmax is set")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
     default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))

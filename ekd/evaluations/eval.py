@@ -355,6 +355,7 @@ TASK_TIMEOUTS = {
     "squadv2": 1200,
     "hotpotqa": 3600,
     "nq_open": 3600,
+    # "ifeval": 10
 }
 
 # Summarization (Lighteval)

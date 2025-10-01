@@ -301,6 +301,19 @@ class Distiller:
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
         return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
 
+    # === Sampled softmax helpers (used only in cached RS-KD path when elimiate_softmax=True) ===
+def _proposal_sample_negatives(self, V: int, M: int, device: torch.device) -> torch.Tensor:
+    """Draw M uniform 'negatives' from [0, V). Overlap with U/avoid is allowed."""
+    if M <= 0 or V <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.randint(low=0, high=V, size=(M,), device=device, dtype=torch.long)
+
+    def _student_log_probs_sampled(self, z_sel: torch.Tensor, q_sel: torch.Tensor, T: float) -> torch.Tensor:
+        """Return log softmax over the sampled set S with importance correction: log s(i) ∝ z_i/T - log q(i)."""
+        z_corr = z_sel / T - torch.log(q_sel.clamp_min(1e-12))
+        logZ = torch.logsumexp(z_corr, dim=-1, keepdim=False)
+        return z_corr - logZ
+
     def _compute_kd_loss(
         self,
         t_pred: torch.Tensor,
@@ -610,7 +623,9 @@ class Distiller:
         # Align to next-token prediction
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
-        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)  # [B, L-1, V]
+        # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
+        do_elim_softmax = bool(getattr(self.config, "elimiate_softmax", False))
+        s_log_probs = None  # set to log_softmax on-demand when needed
 
         # Decide whether we need full teacher logits now
         cached_items = None
@@ -656,6 +671,8 @@ class Distiller:
         # then replace vocab-sum with RS-KD estimator when enabled.
         extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
+            if s_log_probs is None: # compute softmax if cache not rs-kd
+                s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
             kd_loss, kd_extra = self._compute_kd_loss(
                 t_pred,
                 t_log_probs,
@@ -674,7 +691,10 @@ class Distiller:
             # 2) no cache: build samples online in a fully batched, vectorized way across all valid positions
             if cached_items is not None:
                 kd_terms = []
-                B = s_log_probs.size(0)
+                sampled_ce_terms = []  # only used if elimiate_softmax=True and CE enabled
+                B = s_pred.size(0)
+                do_elim = do_elim_softmax
+
                 for i in range(B):
                     valid_i = valid_next[i]
                     if valid_i.sum() == 0:
@@ -693,13 +713,59 @@ class Distiller:
 
                     pos_indices = torch.nonzero(valid_i, as_tuple=False).squeeze(-1)
                     for pos in pos_indices.tolist():
-                        ids, probs = get_pos_slice(pos)
-                        if ids.numel() == 0:
+                        ids_U, probs_U = get_pos_slice(pos)
+                        if ids_U.numel() == 0:
                             continue
-                        loss_pos = -(probs * s_log_probs[i, pos].index_select(0, ids)).sum()
+
+                        if not do_elim:
+                            if s_log_probs is None:
+                                s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                            loss_pos = -(probs_U * s_log_probs[i, pos].index_select(0, ids_U)).sum()
+                            kd_terms.append(loss_pos)
+                            continue
+
+                        # --- eliminate full-vocab softmax ---
+                        V = int(s_pred.size(-1))
+                        M_neg = int(getattr(self.config, "sampled_softmax_negatives", 1024))
+                        ids_M = self._proposal_sample_negatives(V=V, M=M_neg, device=self.student_device)
+
+                        # build S_t = U_t ∪ M_t
+                        ids_S = torch.cat([ids_U, ids_M], dim=0)  # [U+M]
+                        # proposal q over S_t:
+                        q_U = probs_U
+                        q_M = torch.full((ids_M.numel(),), 1.0 / max(1, V), device=self.student_device)
+                        q_sel = torch.cat([q_U, q_M], dim=0)
+                        q_sel = q_sel / q_sel.sum().clamp_min(1e-12)
+
+                        # gather student logits only on S_t, then importance-corrected sampled softmax
+                        z_sel = s_pred[i, pos].index_select(0, ids_S)  # [U+M]
+                        s_logp_S = self._student_log_probs_sampled(z_sel=z_sel, q_sel=q_sel, T=T)  # [U+M]
+
+                        # KD uses only the cached teacher subset U_t with teacher probs probs_U
+                        s_logp_on_U = s_logp_S[:ids_U.numel()]
+                        loss_pos = -(probs_U * s_logp_on_U).sum()
                         kd_terms.append(loss_pos)
 
+                        # sampled CE (if enabled): gold + same negatives M_t, no correction on gold
+                        if self.config.enable_ce:
+                            y_t = int(input_ids[i, pos + 1].item())
+                            if ids_M.numel() > 0 and (ids_M == y_t).any():
+                                ids_M = ids_M[ids_M != y_t]
+                            # build tilde z: gold uses z/T; negatives use z/T - log q(i)
+                            z_y = s_pred[i, pos, y_t] / T
+                            if ids_M.numel() > 0:
+                                z_M = s_pred[i, pos].index_select(0, ids_M) / T - torch.log(torch.full((ids_M.numel(),), 1.0 / max(1, V), device=self.student_device).clamp_min(1e-12))
+                                z_all = torch.cat([z_y.view(1), z_M], dim=0)
+                            else:
+                                z_all = z_y.view(1)
+                            logZ_ce = torch.logsumexp(z_all, dim=0, keepdim=False)
+                            ce_loss_pos = -(z_y - logZ_ce)
+                            sampled_ce_terms.append(ce_loss_pos)
+
                 kd_loss = torch.stack(kd_terms).mean() if kd_terms else s_pred.sum() * 0.0
+                ce_loss_override = None
+                if do_elim and self.config.enable_ce:
+                    ce_loss_override = torch.stack(sampled_ce_terms).mean() if sampled_ce_terms else s_pred.sum() * 0.0
             else:
                 # Vectorized online RS-KD over vocabulary: flatten all valid positions across the batch
                 assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"
@@ -715,6 +781,8 @@ class Distiller:
                 else:
                     # Gather all valid rows once: [P_total, V]
                     p_rows = p_Tkd[mask]
+                    if s_log_probs is None:
+                        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
                     s_rows = s_log_probs[mask]
                     t1_rows = t_logp_T1[mask]
 
@@ -752,16 +820,18 @@ class Distiller:
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
-            targets = input_ids_s[:, 1:]  # [B, L-1]
-            targets = targets.masked_fill(~valid_next, -100)
-
-            # Reuse the existing student log-probs (no extra softmax)
-            V = s_log_probs.size(-1)
-            flat_log_probs = s_log_probs.reshape(-1, V)
-            flat_targets = targets.reshape(-1)
-
-            # Use NLL with ignore_index for masked positions
-            ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
+            # if sampled CE was computed in the cached path with elimiate_softmax=True, use it
+            if 'ce_loss_override' in locals() and ce_loss_override is not None:
+                ce_loss = ce_loss_override
+            else:
+                targets = input_ids_s[:, 1:]  # [B, L-1]
+                targets = targets.masked_fill(~valid_next, -100)
+                if s_log_probs is None:
+                    s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                V = s_log_probs.size(-1)
+                flat_log_probs = s_log_probs.reshape(-1, V)
+                flat_targets = targets.reshape(-1)
+                ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
             total = (1.0 - self.config.alpha_ce) * kd_loss + self.config.alpha_ce * ce_loss
         else:
             ce_loss = torch.tensor(0.0, device=self.student_device)
