@@ -101,7 +101,7 @@ Motivated by this insight, we study knowledge distillation (KD), a standard appr
 	\begin{flushright}
 		\includegraphics[width=\linewidth]{kd_intuition.png}
 	\end{flushright}
-	\caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme.}
+	\caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme. The orange bar can be interpreted as the student's logits and blue bars as the teacher's logits, illustrated as KD's KL divergence process.}
 	\label{fig:kd_intuition}
 \end{figure}
 
@@ -174,43 +174,30 @@ We evaluate five policies per sequence (uniform random is a baseline):
 	\item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
 	\item \textbf{Uniform random.} Sample $K_{\text{pos}}$ positions uniformly (baseline).
 \end{enumerate}
-All policies can be run with \textbf{GLS} (Global-level Selection): instead of relying solely on the current batch, we track running ranks over a global FIFO queue to approximate a global threshold (originally proposed for CE in \citet{wang2021selectivekd}); here we apply the same idea to entropy or the composite score.
+All policies can be run with \textbf{GLS} (Global-level Selection): instead of relying solely on the current batch, track entropy thresholds for selection over a global FIFO queue to approximate a global threshold (originally proposed for CE in \citet{wang2021selectivekd}).
+Additionally, we have implemented a combined score that mixes entropy, CE, and KL, in order to emphasize tokens where the teacher disagrees with the student the most.
 
 \subsubsection{Loss computation (common to all policies)}
 For each selected position $t$:
 \begin{enumerate}
-	\item \textbf{Reconstruct teacher target on cached support.} Decode the cached subset $\mathcal{S}_t$ and renormalize the stored q7 counts \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
-	\item \textbf{Define the proposal (for sampled softmax).} If softmax elimination is enabled, augment with $M$ shared uniform negatives $\mathcal{N}_M$ and define the proposal $q_t$ \emph{over} $\mathcal{S}_t\cup\mathcal{N}_M$; normalize across this union. The teacher target $\tilde p_t$ remains supported only on $\mathcal{S}_t$.
+	\item \textbf{Reconstruct teacher target on cached support.} Decode the cached teacher sampled subset of classes $\mathcal{S}_t$ and renormalize the stored $q7$ empirical probabilities \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
+	\item \textbf{Define the proposal (for sampled softmax).} If softmax elimination is enabled, augment with $M$ shared uniform negatives $\mathcal{N}_M$ and define the proposal $q_t$ over $\mathcal{S}_t\cup\mathcal{N}_M$; normalize across this union. The teacher target $\tilde p_t$ remains supported only on $\mathcal{S}_t$.
 	\item \textbf{Importance-corrected student logits.} Form
 	      \[
 		      \log s_t(i)\;\propto\; z_i/T \;-\; \log q_t(i).
 	      \]
+	so that rare classes are up-weighted and frequent ones down-weighted,
+	ensuring the expectation matches the full-vocabulary softmax.
 	\item \textbf{Sampled KD term.} Compute
 	      \[
 		      \mathrm{KD}_t \;=\; -\!\sum_{i\in\mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
 	      \]
 \end{enumerate}
-Aggregate over positions and combine with CE:
-\begin{align*}
-	\mathcal{L} =
-	 & T^2 \cdot
-	\begin{cases}
-		\overbrace{\sum_{t\in S} w_t\, \mathrm{KD}_t}^\text{(RS-KD with Hájek weights)} \\[2pt]
-		\underbrace{\operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big]}_\text{(top-$k$, bucket, bandit, random)}
-	\end{cases} \\
-	 & +
-	\alpha_{\text{ce}}\cdot \text{CE}(\text{gold},\, s).
-\end{align*}
-When softmax elimination is \emph{off}, CE and KD use the full-vocabulary softmax. When elimination is \emph{on}, KD uses the sampled objective above and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens, except under the bucket/random policies where we restrict CE to the selected positions to match their compute budget.
-
-\subsection{Theoretical justification}
-For a fixed position $t$, importance correction in the class-sampled softmax targets the full-vocabulary KD at temperature $T$; positional weighting ensures the aggregation recovers the uniform mean across positions. In practice we use self-normalized importance sampling and a probability floor $q_{\min}$, introducing a small bias that reduces variance and stabilizes training. Top-$k$-plus-tail provides entropy (or the composite score) at $\mathcal{O}(m)$, so both selection and class-sampling avoid any full-$V$ passes. The resulting complexity per sequence is reduced from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$, with $K_{\text{voc}}=|\mathcal{S}_t|{+}M$. As in standard KD, we scale the KD term by $T^2$.
+KD uses a sampled objective and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens.
 
 
-\subsection{Complexity and knobs}
+\subsection{Complexity}
 Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
-
-\subsubsection{Defaults} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
 
 \section{"Fork" Tokens Selection Variants}
 \subsection{Position-Selective Distillation (RS-KD over Positions)}
