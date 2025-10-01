@@ -54,7 +54,7 @@
 %
 % and set <dim> to something 5cm or larger.
 
-\title{SampledKD: Extreme Sampling, Full Distillation Accuracy}
+\title{SampledKD: Extreme Sampling, Near Full Distillation Accuracy}
 % \title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
 % \title{SampledKD: How Efficient Could Distillation Get While Match Accuracy?}
 % \title{SampledKD: Could Distillation be So Much More Efficient?}
@@ -113,24 +113,24 @@ Storing more logits improves quality but erodes the efficiency goal.
 
 We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs.
 Our thesis is that the KD budget should be spent selectively at the token level (where the teacher can add the most information) while keeping unbiased class-level supervision when it is applied.
-Concretely, we:
-
+Concretely, we present two variants:
 \begin{itemize}
-	\item Introduce token selective KD to allocate supervision to informative tokens using teacher entropy, teacher--student KL, or student CE. We explore various scoring functions.
-	\item Use an offline teacher pass to build compact caches, then apply unbiased class sampling (RS-KD) with importance weights, matching full-KD gradients while storing only a few logits.
-	\item Retain cross-entropy on all tokens for calibration and stability.
-	\item Add simple curricula (increasing KD coverage) and optional EMA self-distillation.
+	\item token-selective KD: focus distillation on a subset of informative tokens, selected by teacher entropy, teacher--student KL, or student CE. This reduces compute along the sequence axis without altering the teacher distribution itself.
+	\item SampledKD: extend token-selective KD by also applying Random-Sampling KD (RS-KD) at the class level. We build compact offline caches of teacher samples, then apply importance-weighted updates so that the expected gradient matches full KD while storing only a few logits.
 \end{itemize}
 
-Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, and (d) full Random-Sampling KD at every step \citep{anshumann2025sparse}.
+Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, (d) token-selective KD, and (e) SampledKD.
 Our main experiments apply token selection by teacher entropy---testing top $k\%$ thresholds across a broad sweep ($k \in \{1,2,5,10,20,\ldots,90,100\}$), as well as bucketed ranges (e.g.\ 5--15\%).
 We also evaluate Top-$m$+Tail entropy approximations to reduce the computational cost of full softmax when scoring, and use the Gumbel-Max trick to sample directly from cached logits, eliminating the need to compute softmax normalization during teacher forwards.
 Beyond entropy, we score tokens by alternative signals (student CE, teacher--student KL, mixtures thereof) and test curriculum schedules.
 To assess robustness, we include instruction-following benchmarks.
 Finally, we ablate variants such as annealed temperature, disabling CE, and an optional second phase of on-policy KD.
-Our results show that token-selective, unbiased KD achieves the best accuracy--efficiency Pareto frontier while maintaining calibration.
+Our results show that token-selective KD achieve the best accuracy--efficiency Pareto frontier, while SampledKD improved efficiency further, but had an accuracy gap compared to full KD.
 
-\subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
+\subsection{Contributions}
+(1) A unified framework for token-level selection KD with an extension to class-level distillation (SampledKD);
+(2) practical scoring and bandit variants for allocating KD budget;
+(3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
 
 \section{Methodology - Two-Axis Selection (SampledKD)}
@@ -169,7 +169,8 @@ At each update we (i) select a subset $S$ of token positions, then (ii) compute 
 \subsubsection{Position-selection policies}
 We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
-	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by a score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
+	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by entropy.
+	\item \textbf{2-axis Top-$k$.} Select the top $K_{\text{pos}}$ positions by a entropy/ score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
 	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
 	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
 	      \[
