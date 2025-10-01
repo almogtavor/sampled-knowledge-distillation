@@ -57,13 +57,11 @@ for r, row in enumerate(y_labels):
             bg = light_blue
         if (row in two_axis_rows) and (col in rskd_cols_per_row[row]):
             bg = strong_blue
-        rb = R - 1 - r
-        ax.add_patch(Rectangle((c, rb), 1, 1, facecolor=bg, edgecolor="black", linewidth=1))
+        ax.add_patch(Rectangle((c, r), 1, 1, facecolor=bg, edgecolor="black", linewidth=1))
 
 # Numbers
 for r, row in enumerate(y_labels):
     for c, col in enumerate(x_labels):
-        rb = R - 1 - r
         val = base_logits[r, c]
         in_rskd = (col in rskd_cols_per_row[row])
         in_ours = (row in two_axis_rows) and in_rskd
@@ -73,10 +71,10 @@ for r, row in enumerate(y_labels):
             color = "black"
         else:
             color = light_num
-        ax.text(c+0.5, rb+0.5, f"{val:+.2f}", ha="center", va="center", fontsize=10.5, color=color)
+        ax.text(c+0.5, r+0.5, f"{val:+.2f}", ha="center", va="center", fontsize=10.5, color=color)
 
 # Ticks
-ax.set_xlim(0, C); ax.set_ylim(0, R)
+ax.set_xlim(0, C); ax.set_ylim(R, 0)
 ax.set_xticks([i+0.5 for i in range(C)]); ax.set_yticks([i+0.5 for i in range(R)])
 ax.set_xticklabels(x_labels, rotation=30, ha="right")
 ax.set_yticklabels(y_labels)
@@ -93,4 +91,5 @@ for s in ax.spines.values():
 plt.tight_layout()
 
 plt.savefig("rskd_grid.pgf", bbox_inches="tight", pad_inches=0)
+plt.savefig("rskd_grid.png", dpi=400, bbox_inches="tight", pad_inches=0)
 plt.close()

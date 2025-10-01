@@ -88,8 +88,9 @@
 \let\thefootnote\relax
 \footnotemark
 \footnotetext{* Equal contribution.}
+\footnotetext{\url{https://github.com/almogtavor/sampled-knowledge-distillation}}
 \begin{abstract}
-	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. We enable efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
+	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. Aiming to perform distillation more efficiently, we propose 2 selective methods for KD. The first is a simple token-selective distillation method that leverages teacher entropy and other uncertainty measures to skip distillation time steps and focus supervision on informative tokens, while maintaining unbiased class-level guidance. The second method, called SampledKD, enables additional efficiency by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ logits truncation and other sparse KD methods. We release code for reproduction.
 \end{abstract}
 
 \section{Introduction}
@@ -452,20 +453,21 @@ Token-selective KD (random $25\%$)    & 20.0 & --- & 1.0 & --- & 26.0 & --- & 36
 No KD baseline (untrained student)    & \multicolumn{2}{c}{48.0} & \multicolumn{2}{c}{6.0} & \multicolumn{2}{c}{32.0} & \multicolumn{2}{c}{62.0} \\
 \bottomrule
 \end{tabular}
-\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy. Bold indicates the best per column.
-Where token selective KD doesn't apply softmax elimination nor offline cache.
+\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy.
+Token selective KD \& Full KD are regular distillations that do not apply softmax elimination nor offline cache.
 }
 \label{tab:main-reasoning}
 \end{table*}
 
 \subsection{Discussion}
 \label{sec:discussion}
-We ablated multiple amount of $k$ values: \(\{0,1,2,5,10,12,15,20,\ldots,100\}\) we got fairly noisy results.
-We have got results that in most cases, degrade the performance of the Qwen3-0.6B student model without any additional distillation.
-These are results that would have suggest distillation in general is not an effective method, which is known to be untrue.
+We ablated a wide range of position-selection settings for a 0.6B student, varying the number of supervised positions $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$ and comparing top-$k$, percentile buckets, and RS-KD sampling with $\alpha\!\in\!\{0,0.5,1,2\}$, with and without GLS.
+We also tested RS temperature $\tau{\in}\{1,2\}$, negatives $M{\in}\{256,512,1024\}$), as well as KD temperature $T$.  
 
-(i) \emph{position selection}: top-$k$ vs.\ percentile bucket vs.\ RS-KD sampling ($\alpha\!\in\!\{0,0.5,1,2\}$) with/without GLS; and (ii) \emph{class sampling}: $U\!\in\!\{6,12,24\}$ cached uniques, RS temperature $\tau\!\in\!\{1,2\}$, and student negatives $M\!\in\!\{256,512,1024\}$ when softmax elimination is enabled. We also swept KD temperature $T\!\in\!\{1,2,3\}$, CE mixing $\alpha_{\text{ce}}\!\in\!\{0,0.1,0.2\}$, and composite scoring weights (entropy/CE/KL).
-Overall, \emph{token-selective KD} consistently improved efficiency while retaining accuracy across datasets; \emph{SampledKD} further reduced compute but lagged full KD in final perplexity/accuracy when $M$ was small and the student was aggressively quantized. Increasing $M$ and $U$ narrowed the gap but weakened the speedup, echoing known sampled-softmax trade-offs.
+Results were often noisy, and in most cases the distilled student underperformed the Qwen3-0.6B baseline.
+This stems from: (i) bias from limited supervision, since KD used only a single dataset of math-style tasks and just a partial subset of it, giving the student a narrow view of the teacher distribution; (ii) variance from sampled objectives, as small $U$ and $M$ under softmax elimination led to noisy gradients and instability; (iii) limited scale, with just 1M-4M tokens and a small 0.6B student, the capacity was insufficient to exploit KD; and (iv) evaluation mismatch, as most evaluations were zero-shot despite training distribution shifts.  
+
+Training on the GSM8K \emph{train split} and evaluating on its test set gave better results, suggesting that the weak zero-shot outcomes reflect supervision bias, variance, and scale limits rather than a flaw in distillation itself.
 
 \section{Related Work}
 
