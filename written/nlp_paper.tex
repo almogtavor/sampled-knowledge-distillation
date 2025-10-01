@@ -165,43 +165,43 @@ At each update we (i) select a subset $S$ of token positions, then (ii) compute 
 \paragraph{Position-selection policies.}
 We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
-  \item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by a score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
-  \item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
-  \item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
-	\[
-	w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})}, \sum_{t\in S}w_t=1,
-	\]
-	so that rarely sampled tokens count more and frequent ones count less.
-  \item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
-  \item \textbf{Uniform random.} Sample $K_{\text{pos}}$ positions uniformly (baseline).
+	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by a score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
+	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
+	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
+	      \[
+		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})}, \sum_{t\in S}w_t=1,
+	      \]
+	      so that rarely sampled tokens count more and frequent ones count less.
+	\item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
+	\item \textbf{Uniform random.} Sample $K_{\text{pos}}$ positions uniformly (baseline).
 \end{enumerate}
 All policies can be run with \textbf{GLS} (Global-level Selection): instead of relying solely on the current batch, we track running ranks over a global FIFO queue to approximate a global threshold (originally proposed for CE in \citet{wang2021selectivekd}); here we apply the same idea to entropy or the composite score.
 
 \paragraph{Loss computation (common to all policies).}
 For each selected position $t$:
 \begin{enumerate}
-  \item \textbf{Reconstruct teacher target on cached support.} Decode the cached subset $\mathcal{S}_t$ and renormalize the stored q7 counts \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
-  \item \textbf{Define the proposal (for sampled softmax).} If softmax elimination is enabled, augment with $M$ shared uniform negatives $\mathcal{N}_M$ and define the proposal $q_t$ \emph{over} $\mathcal{S}_t\cup\mathcal{N}_M$; normalize across this union. The teacher target $\tilde p_t$ remains supported only on $\mathcal{S}_t$.
-  \item \textbf{Importance-corrected student logits.} Form
-  \[
-  \log s_t(i)\;\propto\; z_i/T \;-\; \log q_t(i).
-  \]
-  \item \textbf{Sampled KD term.} Compute
-  \[
-  \mathrm{KD}_t \;=\; -\!\sum_{i\in\mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
-  \]
+	\item \textbf{Reconstruct teacher target on cached support.} Decode the cached subset $\mathcal{S}_t$ and renormalize the stored q7 counts \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
+	\item \textbf{Define the proposal (for sampled softmax).} If softmax elimination is enabled, augment with $M$ shared uniform negatives $\mathcal{N}_M$ and define the proposal $q_t$ \emph{over} $\mathcal{S}_t\cup\mathcal{N}_M$; normalize across this union. The teacher target $\tilde p_t$ remains supported only on $\mathcal{S}_t$.
+	\item \textbf{Importance-corrected student logits.} Form
+	      \[
+		      \log s_t(i)\;\propto\; z_i/T \;-\; \log q_t(i).
+	      \]
+	\item \textbf{Sampled KD term.} Compute
+	      \[
+		      \mathrm{KD}_t \;=\; -\!\sum_{i\in\mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
+	      \]
 \end{enumerate}
 Aggregate over positions and combine with CE:
 \[
-\mathcal{L}
-\;=\;
-T^2 \cdot
-\begin{cases}
-\sum_{t\in S} w_t\, \mathrm{KD}_t & \text{(RS-KD with Hájek weights)}\\[2pt]
-\operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big] & \text{(top-$k$, bucket, bandit, random)}
-\end{cases}
-\;+\;
-\alpha_{\text{ce}}\cdot \text{CE}(\text{gold},\, s).
+	\mathcal{L}
+	\;=\;
+	T^2 \cdot
+	\begin{cases}
+		\sum_{t\in S} w_t\, \mathrm{KD}_t                     & \text{(RS-KD with Hájek weights)}        \\[2pt]
+		\operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big] & \text{(top-$k$, bucket, bandit, random)}
+	\end{cases}
+	\;+\;
+	\alpha_{\text{ce}}\cdot \text{CE}(\text{gold},\, s).
 \]
 When softmax elimination is \emph{off}, CE and KD use the full-vocabulary softmax. When elimination is \emph{on}, KD uses the sampled objective above and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens, except under the bucket/random policies where we restrict CE to the selected positions to match their compute budget.
 
