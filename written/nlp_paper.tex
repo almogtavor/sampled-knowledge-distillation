@@ -19,6 +19,8 @@
 % For Vietnamese characters
 % \usepackage[T5]{fontenc}
 % See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
+\usepackage{graphicx} % Added for figures
+\graphicspath{{../graphs/}{graphs/}} % Search in repo graphs/ from paper dir
 
 % This assumes your files are encoded as UTF8
 \usepackage[utf8]{inputenc}
@@ -147,6 +149,12 @@ $\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally 
 
 \section{Two-Axis Offline Sampling with Entropy Proxies (SampledKD)}
 \label{sec:twoaxis}
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{rskd_grid_two_axis_blue.png}
+  \caption{Two-axis SampledKD: position-selective KD along the sequence axis (Y) and RS-KD over classes (X). Offline we cache $U$ class samples and an entropy proxy per position; online we select $K_{\text{pos}}$ positions and compute KD only over cached classes.}
+  \label{fig:two-axis}
+\end{figure}
 
 We combine (i) \emph{position-selective} KD (Y axis) with (ii) \emph{RS-KD over classes} (X axis) and (iii) a lightweight \emph{entropy approximation} to build an efficient, unbiased estimator we call \textbf{SampledKD}.
 Crucially, we separate \emph{offline} teacher processing from \emph{online} student training.
@@ -195,11 +203,13 @@ Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; stor
 \label{sec:softmax_elimination}
 In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
 With this change---and after batching across all valid positions with shared negatives---we improved throughput from ${\sim}2.3\text{s}/\text{step}$ to ${\sim}0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
+It is important to mention a high degradance in perplexity, dependent on hyperparameter settings.
 
 \subsection{Student KD (importance-corrected sampled softmax)}
 \label{sec:sampled_softmax}
 We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
 At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
+Lower choices of $M_t$ have caused high perplexity degradance.
 Let $S_t = U_t \cup M_t$.
 
 For the student, we normalize its logits $z_i$ only over $S_t$ while correcting for the sampling distribution:
