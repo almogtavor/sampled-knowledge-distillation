@@ -281,7 +281,7 @@ echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
   echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
-  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
+  sbatch --dependency=afterok:${SLURM_JOB_ID} --gpus=3 evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
   echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
 else
   echo "No eval suite provided → skipping eval submission."
