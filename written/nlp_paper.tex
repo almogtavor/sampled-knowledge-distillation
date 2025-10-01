@@ -95,7 +95,7 @@ Our thesis is that the KD budget should be spent selectively at the token level 
 Concretely, we:
 
 \begin{itemize}
-	\item Introduce token selective KD to allocate supervision to informative tokens using teacher entropy, teacher--student KL, or student CE. We explore various scroring functions.
+	\item Introduce token selective KD to allocate supervision to informative tokens using teacher entropy, teacher--student KL, or student CE. We explore various scoring functions.
 	\item Use an offline teacher pass to build compact caches, then apply unbiased class sampling (RS-KD) with importance weights, matching full-KD gradients while storing only a few logits.
 	\item Retain cross-entropy on all tokens for calibration and stability.
 	\item Add simple curricula (increasing KD coverage) and optional EMA self-distillation.
@@ -155,8 +155,8 @@ Crucially, we separate \emph{offline} teacher processing from \emph{online} stud
 For each training sequence and position $t$:
 \begin{enumerate}
 	\item Compute a top-$m$ entropy proxy $H_t$ via TkT-LB (\S\ref{sec:entropy}) to drive position selection.
-	\item Draw $R$ samples with replacement via Gumbel-Max over $p_t^\tau$ (temperature $\tau{=}1$ by default), compute unique ids and counts, and retain the top-$U$ unique classes by count. Convert empirical frequencies to 7-bit q7 with a residual correction to preserve normalization; pad to $U$ using a sentinel id ($=V$).
-	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{id,q7\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the q7s.
+	\item Draw $R$ samples with replacement via Gumbel-Max over $p_t^\tau$ (temperature $\tau{=}1$ by default), compute unique IDs and counts, and retain the top-$U$ unique classes by count. Convert empirical frequencies to 7-bit q7 with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
+	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{ID, q7\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the q7s.
 \end{enumerate}
 Only the packed samples and scalar $H_t$ are stored (no full logits).
 
@@ -187,7 +187,7 @@ We use self-normalized importance sampling (SNIS), trading a small bias for lowe
 We follow standard KD scaling by multiplying the KD loss by $T^2$. While self-normalization and probability floors introduce a small bias, we find they substantially reduce variance and improve stability without affecting downstream accuracy.
 
 \subsection{Complexity and knobs}
-Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (ids+q7 plus 1-byte $\hat H$).
+Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
 
 \subsubsection{Defaults} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
 
@@ -268,7 +268,7 @@ achieved by merging all tail mass into a single bin (coarse-graining; see \citep
 
 \subsection{Gumbel-Max sampling for RS-KD}
 For RS-KD we require draws from the teacher distribution.
-Therefore we sample exactly from $\operatorname{softmax}(u/\tau)$ using the Gumbel-Max trick: add i.i.d.\ Gumbel noise to logits and take $\arg\max$, avoiding computation of $Z$.
+Therefore, we sample exactly from $\operatorname{softmax}(u/\tau)$ using the Gumbel-Max trick: add i.i.d.\ Gumbel noise to logits and take $\arg\max$, avoiding computation of $Z$.
 
 \subsection{Choice of estimator and $m$}
 For position ranking, $\widehat{H}_{\text{mid}}$ with $m{=}12$ gave the best accuracy-efficiency trade-off (Table~\ref{tab:entropy-ablation}).
@@ -302,10 +302,10 @@ During training the teacher is out of the loop, and all KD terms scale only as $
 \vspace{-0.75em}
 
 \subsection{Storage accounting}
-For each selected position we store $U$ sampled classes in a 24-bit word (17-bit id, 7-bit quantized probability), plus a 1-byte entropy proxy $\hat H$ (uint8 scaled by $\ln V$).
+For each selected position we store $U$ sampled classes in a 24-bit word (17-bit ID, 7-bit quantized probability), plus a 1-byte entropy proxy $\hat H$ (uint8 scaled by $\ln V$).
 This is $3U+1$ bytes per valid position; with $U{=}12$ this is $37$~B/token.
 \[
-	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token}.
+	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token},
 \]
 which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
 \[
