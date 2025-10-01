@@ -83,11 +83,11 @@
 \end{abstract}
 
 \begin{figure}[t]
-  \begin{flushright}
-    \includegraphics[width=\linewidth]{kd_intuition.png}
-  \end{flushright}
-  \caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme.}
-  \label{fig:kd_intuition}
+	\begin{flushright}
+		\includegraphics[width=\linewidth]{kd_intuition.png}
+	\end{flushright}
+	\caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme.}
+	\label{fig:kd_intuition}
 \end{figure}
 
 
@@ -142,37 +142,43 @@ For each training sequence and position $t$:
 \begin{enumerate}
 	\item Compute a top-$m$ entropy proxy $H_t$ via Top-k-plus-tail (\S\ref{sec:entropy}) to drive position selection.
 	\item Per position, perform RS-KD: draw $R$ samples with replacement (we optimize it via Gumbel-Max over $p_t^\tau$, where $\tau$ is temperature), compute unique IDs and counts, and retain the top-$U$ unique classes by count.
-	Convert empirical frequencies to 7-bit quantized probability $q7$.
-	%  with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
+	      Convert empirical frequencies to 7-bit quantized probability $q7$.
+	      %  with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
 	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{ID, $q7$\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the $q7$s.
 \end{enumerate}
 Only the packed samples and scalar $H_t$ are stored (no full logits).
 
 \subsection{Online stage (student, many epochs)}
-We sample positions without replacement using $q_{\text{pos}}(t)\propto H_t^\alpha$ with Hájek weights ($\sum w_t=1$).
-For each selected $t$, we reconstruct $\tilde p_t$ from q7, form self-normalized importance weights $w \propto p_T/q$ over the cached classes, and compute the sampled KD term. We multiply by $T^2$ (standard KD) and add CE on all tokens with weight $\alpha_{\text{ce}}$.
-\begin{enumerate}
-	\item For each sequence, sample a subset $S$ of positions using $q_{\text{pos}}(t)\!\propto\!H_t^\alpha$ (without replacement, $|S|{=}K_{\text{pos}}$) and weights $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S}w_t{=}1$.
-	\item For each $t \in S$, compute the \emph{sampled} KD term only on the cached subset:
-	      \begin{align*}
-		      \mathrm{KL}\!\left(\tilde p_t \,\middle\|\, s_t(\cdot\,;\,\mathcal{S}_t)\right)
-		      \; & =\; \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log \tilde p_t(i) \\
-		         & \quad - \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
-	      \end{align*}
-	\item Aggregate over positions with the positional weights and add CE on all tokens:
-	      \begin{align*}
-		      \mathcal{L} \; & =\; \sum_{t\in S} w_t\, \mathrm{KL}\!\left(\tilde p_t \,\|\, s_t\right) \\
-		                     & \quad + \alpha_{\text{ce}} \cdot \text{CE}(\text{gold}, s).
-	      \end{align*}
-\end{enumerate}
+For each sequence we select a subset $S$ of token positions using one of several policies:
+top-$k$ by score, a percentile ``bucket,'' positional RS-KD sampling with $q_{\text{pos}}(t)\propto\big(\text{base}_t\big)^{\alpha}$, or a LinUCB bandit. Uniform random serves as a baseline.
+Here $\text{base}_t=H_t$ (entropy) by default, but we have tested a composite score combining entropy, student CE, and KL (to emphasize importance of tokens where teacher disagrees with the student the most).
+We also support applying these policies with GLS (Global-level Selection), which tracks entropy (CE in previous works) ranks over a sliding global FIFO queue across all tokens to approximate a global entropy threshold as opposed to relying only on the current batch \citep{wang2021selectivekd}.
 
-\subsection{Theoretical Justification}
-RS-KD's importance weighting ensures that, for fixed $t$, the expectation of the class-sampled KD equals full KD at $t$; positional importance weighting targets the uniform mean over positions.
-TkT-LB supplies $H_t$ at $\mathcal{O}(m)$ cost, so both sampling decisions avoid any full-$V$ passes.
-Together, SampledKD reduces cost from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence while matching full-KD gradients in expectation.
+For each selected $t$, we reconstruct the cached teacher distribution over a fixed set of teacher empirically predicted classes $\mathcal{S}_t$.
+We renormalize across the retained classes (logits), and augmenting with $M$ shared uniform negatives in the purpose of optimizing performance (explained later).
+When negatives are added, we define the proposal \(q_t\) over \(\mathcal{S}_t \cup \mathcal{N}_M\) and normalize across this union.
+We form importance-corrected student logits
+\[
+\log s_t(i)\;\propto\; z_i/T - \log q_t(i).
+\]
+The sampled KD term on cached classes is
+\[
+\mathrm{KD}_t \;=\; -\!\sum_{i\in\mathcal{S}_t} \tilde p_t(i)\,\log s_t(i),
+\]
+and the overall loss is
+\[
+\mathcal{L}
+\;=\;
+T^2\cdot \operatorname{mean}_{t\in S}\!\big[\mathrm{KD}_t\big]
+\;+\;
+\alpha_{\text{ce}}\cdot \text{CE}(\text{gold},\, s),
+\]
+where CE is exact with the full softmax (when the elimination path is off) and a sampled-softmax proxy otherwise. When sampling-based policies are applied, the aggregation implicitly accounts for the selection probabilities.
 
-We use self-normalized importance sampling (SNIS), trading a small bias for lower variance; a floor on $q$ distribution improves stability.
-We follow standard KD scaling by multiplying the KD loss by $T^2$. While self-normalization and probability floors introduce a small bias, we find they substantially reduce variance and improve stability without affecting downstream accuracy.
+
+\subsection{Theoretical justification}
+For a fixed position $t$, importance correction in the class-sampled softmax targets the full-vocabulary KD at temperature $T$; positional weighting ensures the aggregation recovers the uniform mean across positions. In practice we use self-normalized importance sampling and a probability floor $q_{\min}$, introducing a small bias that reduces variance and stabilizes training. Top-$k$-plus-tail provides entropy (or the composite score) at $\mathcal{O}(m)$, so both selection and class-sampling avoid any full-$V$ passes. The resulting complexity per sequence is reduced from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$, with $K_{\text{voc}}=|\mathcal{S}_t|{+}M$. As in standard KD, we scale the KD term by $T^2$.
+
 
 \subsection{Complexity and knobs}
 Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
@@ -194,7 +200,7 @@ $q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the esti
 
 \subsection{Sampling rule}
 We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
-(e.g., the TkT-LB lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
+(e.g., the Top-$k$-plus-tail lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
 \[
 	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
 	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
