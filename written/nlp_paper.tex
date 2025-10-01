@@ -19,6 +19,10 @@
 % For Vietnamese characters
 % \usepackage[T5]{fontenc}
 % See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
+\usepackage{graphicx} % Added for figures
+\usepackage{wrapfig}
+
+\graphicspath{{../graphs/}{graphs/}} % Search in repo graphs/ from paper dir
 
 % This assumes your files are encoded as UTF8
 \usepackage[utf8]{inputenc}
@@ -34,6 +38,15 @@
 \usepackage{inconsolata}
 \usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{mathtools}
+\usepackage{parskip}
+\usepackage{pgfplots}
+\usepackage{placeins}
+\usepackage{layouts}
+
 
 % If the title and author information does not fit in the area allocated, uncomment the following
 %
@@ -41,7 +54,7 @@
 %
 % and set <dim> to something 5cm or larger.
 
-\title{SampledKD: Extreme Sampling, Full Distillation Accuracy}
+\title{SampledKD: Extreme Sampling, Near Full Distillation Accuracy}
 % \title{SampledKD: How Extreme Can Sampling Be While Matching Accuracy?}
 % \title{SampledKD: How Efficient Could Distillation Get While Match Accuracy?}
 % \title{SampledKD: Could Distillation be So Much More Efficient?}
@@ -75,12 +88,24 @@
 \footnotemark
 \footnotetext{* Equal contribution.}
 \begin{abstract}
-	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose Entropy Knowledge Distillation (EKD), a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. EKD enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
+	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. We enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
 \end{abstract}
 
 \section{Introduction}
 
-Large language models (LLMs) deliver state-of-the-art performance but are costly to serve and adapt. Knowledge distillation (KD) amortizes these costs by training a compact student to imitate a larger teacher \citep{hinton2015distillation}. While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) \textbf{train-inference mismatch} in sequence generation, and (ii) \textbf{efficiency limits} from storing or querying full teacher logits.
+Large language models (LLMs) achieve state-of-the-art results across diverse tasks, but their size makes them expensive to serve and difficult to adapt.
+Recent work shows that a small fraction of high-entropy "forking" tokens disproportionately drives learning in reinforcement learning from reasoning tasks \citep{wang2025highentropy}, suggesting that selective supervision may yield better efficiency-accuracy trade-offs.
+Motivated by this insight, we study knowledge distillation (KD), a standard approach that compresses LLMs by training a smaller student model to imitate a larger teacher \citep{hinton2015distillation}, and ask whether focusing KD on these high-entropy tokens can deliver more efficient distillation without sacrificing performance.
+
+\begin{figure}[t!]
+	\begin{flushright}
+		\resizebox{\columnwidth}{!}{\input{../graphs/kd_intuition.pgf}}
+	\end{flushright}
+	\caption{KL footprint across positions under FullKD, RS-KD, and our 2-axis scheme. The orange bar can be interpreted as the student's logits and blue bars as the teacher's logits, illustrated as KD's KL divergence process.}
+	\label{fig:kd_intuition}
+\end{figure}
+
+While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) train-inference mismatch in sequence generation, and (ii) efficiency limits from storing or querying full teacher logits.
 
 To address (i), recent work proposes on-policy distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd} or replacing them if uninformative (SKD) \citep{xu2024speculative}.
 To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
@@ -88,28 +113,99 @@ Storing more logits improves quality but erodes the efficiency goal.
 
 We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs.
 Our thesis is that the KD budget should be spent selectively at the token level (where the teacher can add the most information) while keeping unbiased class-level supervision when it is applied.
-Concretely, we:
-
+Concretely, we present two variants:
 \begin{itemize}
-	\item Introduce token selective KD to allocate supervision to informative tokens using teacher entropy, teacher--student KL, or student CE. We explore various scroring functions.
-	\item Use an offline teacher pass to build compact caches, then apply unbiased class sampling (RS-KD) with importance weights, matching full-KD gradients while storing only a few logits.
-	\item Retain cross-entropy on all tokens for calibration and stability.
-	\item Add simple curricula (increasing KD coverage) and optional EMA self-distillation.
+	\item token-selective KD: focus distillation on a subset of informative tokens, selected by teacher entropy, teacher--student KL, or student CE. This reduces compute along the sequence axis without altering the teacher distribution itself.
+	\item SampledKD: extend token-selective KD by also applying Random-Sampling KD (RS-KD) at the class level. We build compact offline caches of teacher samples, then apply importance-weighted updates so that the expected gradient matches full KD while storing only a few logits.
 \end{itemize}
 
-Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, and (d) full Random-Sampling KD at every step \citep{anshumann2025sparse}.
-Our main experiments apply token selection by teacher entropy---testing top $k\%$ thresholds across a broad sweep ($k \in \{100,90,80,\dots,5,2,1\}$), as well as bucketed ranges (e.g.\ 5--15\%).
+Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, (d) token-selective KD, and (e) SampledKD.
+Our main experiments apply token selection by teacher entropy---testing top $k\%$ thresholds across a broad sweep ($k \in \{1,2,5,10,20,\ldots,90,100\}$), as well as bucketed ranges (e.g.\ 5--15\%).
 We also evaluate Top-$m$+Tail entropy approximations to reduce the computational cost of full softmax when scoring, and use the Gumbel-Max trick to sample directly from cached logits, eliminating the need to compute softmax normalization during teacher forwards.
 Beyond entropy, we score tokens by alternative signals (student CE, teacher--student KL, mixtures thereof) and test curriculum schedules.
 To assess robustness, we include instruction-following benchmarks.
 Finally, we ablate variants such as annealed temperature, disabling CE, and an optional second phase of on-policy KD.
-Our results show that token-selective, unbiased KD achieves the best accuracy--efficiency Pareto frontier while maintaining calibration.
+Our results show that token-selective KD achieve the best accuracy--efficiency Pareto frontier, while SampledKD improved efficiency further, but had an accuracy gap compared to full KD.
 
-\subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
+\subsection{Contributions}
+(1) A unified framework for token-level selection KD with an extension to class-level distillation (SampledKD);
+(2) practical scoring and bandit variants for allocating KD budget;
+(3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
 
-\section{Methodology}
+\section{Methodology - Two-Axis Selection (SampledKD)}
 
+\FloatBarrier
+
+\label{sec:twoaxis}
+\begin{figure}[h!]
+	\centering
+	% \includegraphics[width=\linewidth]{rskd_grid_two_axis_blue.png}
+	\resizebox{\columnwidth}{!}{\input{../graphs/rskd_grid.pgf}}
+	\resizebox{\columnwidth}{!}{\input{../graphs/rskd_legend.pgf}}
+	\caption{Two-axis SampledKD: position-selective KD along the sequence axis (Y) and RS-KD over classes (X). Offline we cache $U$ class samples and an entropy proxy per position; online we select $K_{\text{pos}}$ positions and compute KD only over cached classes.}
+	\label{fig:two-axis}
+\end{figure}
+
+\FloatBarrier
+
+We combine (i) position-selective KD (Y axis) with (ii) RS-KD over classes (X axis) and (iii) an optimizations stack to build an efficient, unbiased estimator we call SampledKD.
+Crucially, we keep the property of separating the teacher processing from student training during distillation through offline teacher cache creation.
+
+\subsection{Offline stage (teacher forward pass, once)}
+For each training sequence and position $t$:
+\begin{enumerate}
+	\item Compute a top-$m$ entropy proxy $H_t$ via Top-k-plus-tail (\S\ref{sec:entropy}) to drive position selection.
+	\item Per position, perform RS-KD: draw $R$ samples with replacement (we optimize it via Gumbel-Max over $p_t^\tau$, where $\tau$ is temperature), compute unique IDs and counts, and retain the top-$U$ unique classes by count.
+	      Convert empirical frequencies to 7-bit quantized probability $q7$.
+	      %  with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
+	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{ID, $q7$\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the $q7$s.
+\end{enumerate}
+Only the packed samples and scalar $H_t$ are stored (no full logits).
+
+\subsection{Online stage (student, many epochs)}
+At each update we (i) select a subset $S$ of token positions, then (ii) compute a sampled KD loss (with optional softmax elimination) and combine it with CE.
+
+\subsubsection{Position-selection policies}
+We evaluate five policies per sequence (uniform random is a baseline):
+\begin{enumerate}
+	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by entropy.
+	\item \textbf{2-axis Top-$k$.} Select the top $K_{\text{pos}}$ positions by a entropy/ score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
+	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
+	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
+	      \[
+		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})},\quad \sum_{t\in S}w_t=1,
+	      \]
+	      so that rarely sampled tokens count more and frequent ones count less.
+	\item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
+	\item \textbf{Uniform random.} Sample $K_{\text{pos}}$ positions uniformly (baseline).
+\end{enumerate}
+All policies can be run with \textbf{GLS} (Global-level Selection): instead of relying solely on the current batch, track entropy thresholds for selection over a global FIFO queue to approximate a global threshold (originally proposed for CE in \citet{wang2021selectivekd}).
+Additionally, we have implemented a combined score that mixes entropy, CE, and KL, in order to emphasize tokens where the teacher disagrees with the student the most.
+
+\subsubsection{Loss computation (common to all policies)}
+For each selected position $t$:
+\begin{enumerate}
+	\item \textbf{Reconstruct teacher target on cached support.} Decode the cached teacher sampled subset of classes $\mathcal{S}_t$ and renormalize the stored $q7$ empirical probabilities \emph{over $\mathcal{S}_t$} to obtain $\tilde p_t$.
+	\item \textbf{Define the proposal (for sampled softmax).} If softmax elimination is enabled, augment with $M$ shared uniform negatives $\mathcal{N}_M$ and define the proposal $q_t$ over $\mathcal{S}_t\cup\mathcal{N}_M$; normalize across this union. The teacher target $\tilde p_t$ remains supported only on $\mathcal{S}_t$.
+	\item \textbf{Importance-corrected student logits.} Form
+	      \[
+		      \log s_t(i)\;\propto\; z_i/T \;-\; \log q_t(i).
+	      \]
+	      so that rare classes are up-weighted and frequent ones down-weighted,
+	      ensuring the expectation matches the full-vocabulary softmax.
+	\item \textbf{Sampled KD term.} Compute
+	      \[
+		      \mathrm{KD}_t \;=\; -\!\sum_{i\in\mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
+	      \]
+\end{enumerate}
+KD uses a sampled objective and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens.
+
+
+\subsection{Complexity}
+Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
+
+\section{"Fork" Tokens Selection Variants}
 \subsection{Position-Selective Distillation (RS-KD over Positions)}
 \label{sec:posrs}
 
@@ -119,12 +215,12 @@ The KD objective for an autoregressive step is a mean over positions:
 	\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
 \]
 where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
-Full KD evaluates all positions; we instead \emph{sample positions} using a proposal
+Full KD evaluates all positions; we instead sample positions using a proposal
 $q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
 
 \subsection{Sampling rule}
 We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
-(e.g., the TkT-LB lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
+(e.g., the Top-$k$-plus-tail lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
 \[
 	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
 	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
@@ -137,60 +233,50 @@ A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
 This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
 We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
 
-\vspace{0.5em}
-\noindent\textbf{Defaults.}
+\subsubsection{Defaults}
 $\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally anneal $\alpha$ upward during training to shift from exploration to focused supervision.
 
+\section{Softmax Elimination Optimizations}
+\label{sec:softmax_elimination}
+In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
+With this change---and after batching across all valid positions with shared negatives---we improved throughput from ${\sim}2.4\text{s}/\text{step}$ to ${\sim}0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
+It is important to mention a high degradation in perplexity, dependent on hyperparameter settings.
 
-\section{Two-Axis Offline Sampling with Entropy Proxies (SampledKD)}
-\label{sec:twoaxis}
+\subsection{Student KD (importance-corrected sampled softmax)}
+\label{sec:sampled_softmax}
+We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
+At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
+Lower choices of $M_t$ have caused high perplexity degradation.
+Let $S_t = U_t \cup M_t$.
 
-We combine (i) \emph{position-selective} KD (Y axis) with (ii) \emph{RS-KD over classes} (X axis) and (iii) a lightweight \emph{entropy approximation} to build an efficient, unbiased estimator we call \textbf{SampledKD}.
-Crucially, we separate \emph{offline} teacher processing from \emph{online} student training.
+For the student, we normalize its logits $z_i$ only over $S_t$ while correcting for the sampling distribution:
+\[
+	\hat s_t(i) = \frac{\exp(z_i/T - \log q(i))}{\sum_{j \in S_t} \exp(z_j/T - \log q(j))},
+\]
+where $T$ is the KD temperature.
+The KD loss uses these $\hat s_t(i)$ on the cached teacher subset $U_t$. This replaces a full $\mathcal{O}(V)$ softmax with $\mathcal{O}(|S_t|)$.
+The $-\log q(i)$ term yields an importance-sampling estimator whose expectation matches the full softmax \citep{jean2015large}.
 
-\subsection{Offline stage (teacher, once)}
-For each training sequence and position $t$:
-\begin{enumerate}
-	\item Compute a top-$m$ entropy proxy $H_t$ via TkT-LB (\S\ref{sec:entropy}) to drive position selection.
-	\item Draw $R$ samples with replacement via Gumbel-Max over $p_t^\tau$ (temperature $\tau{=}1$ by default), compute unique ids and counts, and retain the top-$U$ unique classes by count. Convert empirical frequencies to 7-bit q7 with a residual correction to preserve normalization; pad to $U$ using a sentinel id ($=V$).
-	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{id,q7\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the q7s.
-\end{enumerate}
-Only the packed samples and scalar $H_t$ are stored (no full logits).
+\subsection{Sampled CE}
+Define $\tilde z_i = z_i/T - \log q(i)$ for negatives and $\tilde z_{y_t}=z_{y_t}/T$ for the gold token (no importance correction).
+Where $y_t$ is gold next-token ID at position $t$, and $i$ indexes token classes ($i\in S_t$ for KD; $i\in\{y_t\}\cup M_t$ for CE).
 
-\subsection{Online stage (student, many epochs)}
-We sample positions without replacement using $q_{\text{pos}}(t)\propto H_t^\alpha$ with Hájek weights ($\sum w_t=1$).
-For each selected $t$, we reconstruct $\tilde p_t$ from q7, form self-normalized importance weights $w \propto p_T/q$ over the cached classes, and compute the sampled KD term. We multiply by $T^2$ (standard KD) and add CE on all tokens with weight $\alpha_{\text{ce}}$.
-\begin{enumerate}
-	\item For each sequence, sample a subset $S$ of positions using $q_{\text{pos}}(t)\!\propto\!H_t^\alpha$ (without replacement, $|S|{=}K_{\text{pos}}$) and weights $w_t \propto 1/q_{\text{pos}}(t)$, $\sum_{t\in S}w_t{=}1$.
-	\item For each $t \in S$, compute the \emph{sampled} KD term only on the cached subset:
-	      \begin{align*}
-		      \mathrm{KL}\!\left(\tilde p_t \,\middle\|\, s_t(\cdot\,;\,\mathcal{S}_t)\right)
-		      \; & =\; \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log \tilde p_t(i) \\
-		         & \quad - \sum_{i \in \mathcal{S}_t} \tilde p_t(i)\,\log s_t(i).
-	      \end{align*}
-	\item Aggregate over positions with the positional weights and add CE on all tokens:
-	      \begin{align*}
-		      \mathcal{L} \; & =\; \sum_{t\in S} w_t\, \mathrm{KL}\!\left(\tilde p_t \,\|\, s_t\right) \\
-		                     & \quad + \alpha_{\text{ce}} \cdot \text{CE}(\text{gold}, s).
-	      \end{align*}
-\end{enumerate}
+For the cross-entropy, we include the gold token $y_t$ and negatives $M_t$ (reused from the sampled softmax \S\ref{sec:sampled_softmax}):
+\begin{align*}
+	\hat s^{\text{CE}}_t(i) = \frac{\exp(\tilde z_i)}{\sum_{j \in \{y_t\}\cup M_t} \exp(\tilde z_j)},
+\end{align*}
+Which results
+\(
+\widehat{\text{CE}}_t = -\log \hat s^{\text{CE}}_t(y_t),
+\)
+as the sampled CE loss.
+This yields an unbiased approximation to full softmax CE with cost proportional to $|M_t|$.
+Prior empirical studies show that $~1k$ negatives suffice for good convergence \citep{blanc2018adaptive}.
 
-\subsection{Why it works}
-RS-KD's importance weighting ensures that, for fixed $t$, the expectation of the class-sampled KD equals full KD at $t$; positional importance weighting targets the uniform mean over positions.
-TkT-LB supplies $H_t$ at $\mathcal{O}(m)$ cost, so both sampling decisions avoid any full-$V$ passes.
-Together, SampledKD reduces cost from $\mathcal{O}(N_{\text{pos}}V)$ to $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence while matching full-KD gradients in expectation.
-
-We use self-normalized importance sampling (SNIS), trading a small bias for lower variance; a floor on $q$ distribution improves stability.
-We follow standard KD scaling by multiplying the KD loss by $T^2$. While self-normalization and probability floors introduce a small bias, we find they substantially reduce variance and improve stability without affecting downstream accuracy.
-
-\subsection{Complexity and knobs}
-Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (ids+q7 plus 1-byte $\hat H$).
-
-\noindent\textbf{Defaults.} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
-
-\section{Entropy Approximation and Gumbel Trick}
+% \section{Entropy Approximation and Gumbel Trick}
+\subsection{Entropy Approximation}
 \label{sec:entropy}
-We estimate token uncertainty via a Top-$k$-plus-tail construction, and draw teacher samples for RS-KD via the Gumbel-Max trick—so no full softmax normalization is required during teacher forwards.
+We estimate token uncertainty via a Top-$k$-plus-tail construction, and draw teacher samples for RS-KD via the Gumbel-Max trick---so no full softmax normalization is required during teacher forwards.
 Let $u \in \mathbb{R}^V$ be teacher logits over a vocabulary of size $V$, and let
 $
 	p_i=\frac{e^{u_i}}{Z},\quad Z=\sum_{j=1}^V e^{u_j}
@@ -201,7 +287,7 @@ We compute entropy in nats (natural logarithm) and 8-bit quantization.
 Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits.
 Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},           \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},            \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -216,7 +302,7 @@ A valid lower bound on entropy $H(p)=-\sum_i p_i\log p_i$ is
 \[
 	H_{\text{lb}}=-\sum_{j\le m} p^{\min}_{(j)}\log p^{\min}_{(j)}\;-\;\tau_{\max}\log\tau_{\max},
 \]
-achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep{kaltchenko2025entropyheatmap}, Sec.~3.6, for a self-contained proof and LLM application). A corresponding upper estimate is
+achieved by merging all tail mass into a single bin (coarse-graining; see \citep{cover2006elements} for background and \citep[\S3.6]{kaltchenko2025entropyheatmap} for a self-contained proof and LLM application). A corresponding upper estimate is
 \[
 	H_{\text{ub}}=H_{\text{lb}}+\tau_{\max}\log(V-m),
 \]
@@ -227,11 +313,11 @@ achieved by merging all tail mass into a single bin (coarse-graining; see \citep
 	                         & \quad +\; \tfrac12\,\tau_{\max}\log(V-m).
 \end{align*}
 
-\paragraph{Gumbel-Max sampling for RS-KD.}
+\subsection{Gumbel-Max sampling for RS-KD}
 For RS-KD we require draws from the teacher distribution.
-Therefore we sample exactly from $\operatorname{softmax}(u/\tau)$ using the Gumbel-Max trick: add i.i.d.\ Gumbel noise to logits and take $\arg\max$, avoiding computation of $Z$.
+Therefore, we sample exactly from $\operatorname{softmax}(u/\tau)$ using the Gumbel-Max trick: add i.i.d.\ Gumbel noise to logits and take $\arg\max$, avoiding computation of $Z$.
 
-\paragraph{Choice of estimator and $m$.}
+\subsection{Choice of estimator and $m$}
 For position ranking, $\widehat{H}_{\text{mid}}$ with $m{=}12$ gave the best accuracy-efficiency trade-off (Table~\ref{tab:entropy-ablation}).
 On \texttt{GSM8K} (7{,}473 sequences; 613K tokens; 438K valid), we compared midpoint to lower/upper bounds and IS/CV-IS tail estimators (Appendix~\ref{app:tail-IS}).
 Midpoint yields the best top-$k$ position overlap with exact entropy at substantially lower $m$; IS/CV-IS give the best numeric correlation, which is less relevant for selection.
@@ -263,10 +349,10 @@ During training the teacher is out of the loop, and all KD terms scale only as $
 \vspace{-0.75em}
 
 \subsection{Storage accounting}
-For each selected position we store $U$ sampled classes in a 24-bit word (17-bit id, 7-bit quantized probability), plus a 1-byte entropy proxy $\hat H$ (uint8 scaled by $\ln V$).
+For each selected position we store $U$ sampled classes in a 24-bit word (17-bit ID, 7-bit quantized probability), plus a 1-byte entropy proxy $\hat H$ (uint8 scaled by $\ln V$).
 This is $3U+1$ bytes per valid position; with $U{=}12$ this is $37$~B/token.
 \[
-	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token}.
+	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token},
 \]
 which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
 \[
@@ -276,9 +362,9 @@ which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-
 
 If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
-	\text{B/token} \; & =\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3                                                \\
-	\;                & =\; 9~\text{B/token} \ \Longrightarrow\ 0.9~\text{TB}.
+	\text{B}/\text{token} \; & =\; k \cdot U \cdot 3
+	\;=\; 0.25 \cdot 12 \cdot 3                                                               \\
+	\;                       & =\; 9~\text{B}/\text{token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
 Table~\ref{tab:storage} summarizes the storage requirements across different methods.
@@ -307,30 +393,39 @@ Table~\ref{tab:storage} summarizes the storage requirements across different met
 \section{Evaluation}
 \label{sec:evaluation}
 
-We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach. Models are pretrained on FineWeb-Edu for 1M tokens and evaluated zero-shot. All evaluations report pass@1 accuracy as the primary metric.
+We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach.
+Models are pretrained on FineWeb-Edu for 1M and 4M tokens and evaluated zero-shot.
+All evaluations report pass@1 accuracy as the primary metric.
+
 \subsection{Datasets}
 
-\paragraph{Mathematical reasoning.}
-\textbf{GSM8K} \citep{cobbe2021gsm8k} contains grade-school math word problems with natural language solutions. We use the standard train/test split for distillation training and evaluation.
-\textbf{SVAMP} \citep{patel2021svamp} provides single-step arithmetic reasoning problems with algebraic variations. We leverage the available train/test split for consistent evaluation.
+\subsubsection{Mathematical reasoning}
+\paragraph{GSM8K} \citep{cobbe2021gsm8k} contains grade-school math word problems with natural language solutions. We use the standard train/test split for distillation training and evaluation.
+\paragraph{SVAMP} \citep{patel2021svamp} provides single-step arithmetic reasoning problems with algebraic variations. We leverage the available train/test split for consistent evaluation.
 
-\paragraph{Reading comprehension and commonsense reasoning.}
-\textbf{LAMBADA (OpenAI)} \citep{paperno2016lambada} tests language models' ability to predict the final word of passages requiring broad context. Since this benchmark provides only a test set without an official training split, we use it exclusively for zero-shot evaluation.
-\textbf{HellaSwag} \citep{zellers2019hellaswag} requires selecting the most plausible continuation of everyday scenarios. We use the standard train/validation/test split.
-\textbf{PIQA} \citep{bisk2019piqa} evaluates physical commonsense reasoning through questions about everyday situations. Evaluation follows the train/validation/test split.
+\subsubsection{Reading comprehension and commonsense reasoning}
+\paragraph{LAMBADA (OpenAI)} \citep{paperno2016lambada} tests language models' ability to predict the final word of passages requiring broad context. Since this benchmark provides only a test set without an official training split, we use it exclusively for zero-shot evaluation.
+\paragraph{HellaSwag} \citep{zellers2019hellaswag} requires selecting the most plausible continuation of everyday scenarios. We use the standard train/validation/test split.
+\paragraph{PIQA} \citep{bisk2019piqa} evaluates physical commonsense reasoning through questions about everyday situations. Evaluation follows the train/validation/test split.
 
-\paragraph{Science and knowledge.}
-\textbf{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
+\subsubsection{Science and knowledge}
+\paragraph{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
 
-\paragraph{Competition-level benchmarks.}
-\textbf{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination.
-\textbf{IFEval} \citep{zhou2023ifeval} assesses instruction following through verifiable constraints.
+\subsubsection{Competition-level benchmarks}
+\paragraph{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination.
+\paragraph{IFEval} \citep{zhou2023ifeval} assesses instruction following through verifiable constraints.
 
 \subsection{Experimental setup}
 
 For benchmarks with available training splits (GSM8K, SVAMP, ARC-Challenge, ARC-Easy, HellaSwag, PIQA), we apply SampledKD during student training and evaluate on the respective test sets. For evaluation-only benchmarks (LAMBADA, AIME'25, IFEval), we assess the distilled models in a zero-shot setting to measure knowledge transfer effectiveness.
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
+
+\section{Ablations}
+\label{sec:ablations}
+We ablated the main knobs along both axes:
+(i) \emph{position selection}: top-$k$ vs.\ percentile bucket vs.\ RS-KD sampling ($\alpha\!\in\!\{0,0.5,1,2\}$) with/without GLS; and (ii) \emph{class sampling}: $U\!\in\!\{6,12,24\}$ cached uniques, RS temperature $\tau\!\in\!\{1,2\}$, and student negatives $M\!\in\!\{256,512,1024\}$ when softmax elimination is enabled. We also swept KD temperature $T\!\in\!\{1,2,3\}$, CE mixing $\alpha_{\text{ce}}\!\in\!\{0,0.1,0.2\}$, and composite scoring weights (entropy/CE/KL).
+Overall, \emph{token-selective KD} consistently improved efficiency while retaining accuracy across datasets; \emph{SampledKD} further reduced compute but lagged full KD in final perplexity/accuracy when $M$ was small and the student was aggressively quantized. Increasing $M$ and $U$ narrowed the gap but weakened the speedup, echoing known sampled-softmax trade-offs.
 
 \section{Related Work}
 
@@ -351,11 +446,28 @@ Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top
 
 \subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}. Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2024perplexedperplexityperplexitybaseddata} and surveys consolidate techniques \citep{datasel2024survey}. Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. EKD is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
-\subsection{Self-distillation and EMA teachers} Self-distillation regularizes students via a teacher derived from the student itself, e.g., Born-Again Networks \citep{furlanello2018ban} and Mean Teacher (EMA) consistency \citep{tarvainen2017meanteacher}. We adopt an optional EMA self-distill term as a light regularizer complementary to external-teacher KD.
+\section{Limitations and Future Work}
+\label{sec:limits}
+\paragraph{Scale and quantization}
+Our primary teacher-student pair (Qwen3-8B $\rightarrow$ Qwen3-0.6B) and the use of 8-bit quantization during training likely amplify variance in the sampled objectives and partly explain the residual gap we observe for SampledKD.
+We expect different behavior at larger teacher/student scales and without low-precision constraints.
 
-\subsection{Evaluation under shift} We report in-distribution and distribution-shift results following ShiftKD \citep{zhang2023shiftkd}, which benchmarks KD methods under diversity and correlation shifts.
+\subsection{SampledKD underperformance}
+While SampledKD is principled and builds on successful ideas in sampled softmax and RS-KD, and we observe superior efficiency and strong accuracy relative to baselines, our results do not yet fully match full KD at equal wall-clock.
+We attribute the remaining gap primarily to the limited training budgets (only 1M and 4M FineWeb-Edu tokens) and predominantly zero-shot evaluation, together with (i) scale and quantization effects, (ii) specific optimization techniques  (e.g., softmax elimination), and (iv) implementation details.
 
-\subsection{Summary} Prior work either improves the \emph{where} (token/word/sample selection, curricula) or the \emph{how} (on-policy, reverse-KL, cross-tokenizer, sparse logits) of KD. We unify both: allocate KD budget to high-value tokens and deliver unbiased supervision there via Random-Sampling KD.
+\subsection{Future work}
+Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD: 
+(1) Curriculum learning based knowledge distillation for and stability, so that the model can gradually adapt to more challenging tasks, implemented according to token entropy; (2) a short speculative on-policy distillation phase after off-policy SampledKD---to re-balance calibration once accuracy has improved, leveraging SKD/GKD-style teacher feedback on student prefixes \citep{xu2024speculative}.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We introduced token-selective KD and its SampledKD extension that adds class-level RS-KD, separating where we distill (positions) from how we approximate the teacher distribution (classes).
+Token-selective KD achieves strong efficiency-accuracy trade-offs on our benchmarks.
+SampledKD achieves a much superior performance but, in our current small-scale, low-precision setting, shows an accuracy gap to full KD.
+Given its principled foundations and prior successes of sampled softmax and RS-KD, we view SampledKD as promising, especially at larger scales and without aggressive quantization.
+We release code to facilitate reproduction and follow-up work to close the remaining gap.
+
 
 \bibliography{anthology, custom}
 \bibliographystyle{acl_natbib}
@@ -367,16 +479,16 @@ Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)
 \[
 	H_T \;=\; -\sum_{v\in T} p_v \log p_v \;=\; -P_T\,\underset{v\sim q}{\mathbb{E}}\,[\log p_v].
 \]
-\textbf{Top-$m$ + naive IS.} With $s$ samples $v_i\!\sim q$,
+\paragraph{Top-$m$ + naive IS} With $s$ samples $v_i\!\sim q$,
 \[
 	\widehat{H}_T^{\text{IS}}
 	= -P_T \cdot \frac{1}{s}\sum_{i=1}^s \log p_{v_i}.
 \]
-\textbf{Top-$m$ + control-variated IS (uniform baseline).}
+\paragraph{Top-$m$ + control-variated IS (uniform baseline)}
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	 & = -P_T\log\!\frac{P_T}{V-m}                                              \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
 	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
@@ -388,7 +500,7 @@ Thus, the entropy tail is
 with unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.

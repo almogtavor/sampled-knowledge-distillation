@@ -891,6 +891,7 @@ class Distiller:
                                     vec = combined[mask_i].float()
                                 else:
                                     vec = ent_for_bucket[i][mask_i].float()
+                                    
                                 low = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
                                 high = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
                                 rel = torch.where(mask_i)[0]

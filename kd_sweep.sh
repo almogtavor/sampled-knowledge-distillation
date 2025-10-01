@@ -44,9 +44,9 @@ elif [[ "$MODE" == "coarse_k" ]]; then
   # Submit with EPOCHS=1 to override train.slurm default
   for K in "${K_LIST[@]}"; do
     if [[ "$K" -eq 100 ]]; then
-      sbatch --export=ALL,EPOCHS=1 train.slurm vanilla "$K" "$KD_SWEEP_TAG"
+      sbatch --export=ALL,EPOCHS=1 train.slurm vanilla "$K" light "$KD_SWEEP_TAG"
     else
-      sbatch --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K" "$KD_SWEEP_TAG"
+      sbatch --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K" light "$KD_SWEEP_TAG"
     fi
   done
 
@@ -54,13 +54,13 @@ elif [[ "$MODE" == "coarse_k" ]]; then
 elif [[ "$MODE" == "compare_methods" ]]; then
   # Run all three methods at fixed k
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
-    sbatch train.slurm "$METHOD" "$K_FIXED" "$KD_SWEEP_TAG"
+    sbatch --wait --export=ALL,EPOCHS=1 train.slurm "$METHOD" "$K_FIXED" light "$KD_SWEEP_TAG"
   done
 
 elif [[ "$MODE" == "anneal_compare_methods" ]]; then
   # Run all methods with temperature annealing enabled
   for METHOD in vanilla top-k-tok random pos-rs-kd; do
-    sbatch train.slurm "$METHOD" "$K_FIXED" "$KD_SWEEP_TAG" anneal
+    sbatch train.slurm "$METHOD" "$K_FIXED" light "$KD_SWEEP_TAG" anneal
   done
 
 elif [[ "$MODE" == "anneal_method" ]]; then
@@ -68,7 +68,7 @@ elif [[ "$MODE" == "anneal_method" ]]; then
   [[ $# -lt 3 ]] && usage && exit 1
   METHOD="$2"
   K_ARG="$3"
-  sbatch train.slurm "$METHOD" "$K_ARG" "$KD_SWEEP_TAG" anneal
+  sbatch train.slurm "$METHOD" "$K_ARG" light "$KD_SWEEP_TAG" anneal
 
 elif [[ "$MODE" == "score_weights" ]]; then
   # Sweep score-based top-k weighting combinations at fixed K
@@ -76,20 +76,23 @@ elif [[ "$MODE" == "score_weights" ]]; then
   K_SCORE="${2:-25}"
   METHOD="top-k-tok"
   SCORE_NORM_DEFAULT="${SCORE_NORMALIZE_OVERRIDE:-z}"
-  read -r -d '' SCORE_COMBOS <<'EOF'
-e_only 1.0 0.0 0.0
-balanced 1.0 1.0 1.0
-entropy_kl 1.0 0.0 1.0
-ce_heavy 0.5 1.5 0.0
-kl_heavy 0.5 0.0 1.5
-kl_tilt 0.0 0.5 1.5
-moderate 0.8 0.8 0.4
-EOF
-  while read -r LABEL W_ENT W_CE W_KL; do
-    [[ -z "$LABEL" ]] && continue
+  
+  # Define weight combinations: label ent_weight ce_weight kl_weight
+  declare -a SCORE_CONFIGS=(
+    "e_only:1.0:0.0:0.0"
+    "balanced:1.0:1.0:1.0"
+    "entropy_kl:1.0:0.0:1.0"
+    # "ce_heavy:0.5:1.5:0.0"
+    # "kl_heavy:0.5:0.0:1.5"
+    # "kl_tilt:0.0:0.5:1.5"
+    # "moderate:0.8:0.8:0.4"
+  )
+  
+  for CONFIG in "${SCORE_CONFIGS[@]}"; do
+    IFS=':' read -r LABEL W_ENT W_CE W_KL <<< "$CONFIG"
     echo "[score_weights] Submitting $LABEL weights (ent=$W_ENT ce=$W_CE kl=$W_KL)"
-    sbatch --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "" "$KD_SWEEP_TAG"
-  done <<< "$SCORE_COMBOS"
+    sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "light" "$KD_SWEEP_TAG"
+  done
 
 else
   usage; exit 1
