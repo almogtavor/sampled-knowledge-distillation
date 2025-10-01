@@ -125,40 +125,7 @@ Our results show that token-selective, unbiased KD achieves the best accuracy--e
 \subsection{Contributions} (1) A unified framework for \emph{token-level} selection with unbiased class-level distillation; (2) practical scoring, curriculum, and bandit variants for allocating KD budget; (3) comprehensive evaluation vs. state-of-the-art sparse KD and selection baselines, including calibration and shift robustness.
 
 
-\section{Methodology}
-
-\subsection{Position-Selective Distillation (RS-KD over Positions)}
-\label{sec:posrs}
-
-The KD objective for an autoregressive step is a mean over positions:
-\[
-	\mathcal{L}_{\text{KD}} \;=\; \frac{1}{N_{\text{pos}}} \sum_{t=1}^{N_{\text{pos}}}
-	\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
-\]
-where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
-Full KD evaluates all positions; we instead \emph{sample positions} using a proposal
-$q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
-
-\subsection{Sampling rule}
-We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
-(e.g., the TkT-LB lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
-\[
-	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
-	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
-	\frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
-\]
-which is unbiased for the uniform positional mean. We sample positions without replacement and use Hájek weights, $w_t \propto 1/q_{\text{pos}}(t)$ with $\sum_{t\in S} w_t = 1$, which yields an approximately unbiased estimate of the uniform positional mean with reduced variance.
-A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
-
-\subsection{Discussion}
-This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
-We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
-
-\subsubsection{Defaults}
-$\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally anneal $\alpha$ upward during training to shift from exploration to focused supervision.
-
-
-\section{Two-Axis Offline Sampling with Entropy Proxies (SampledKD)}
+\section{Methodology - Two-Axis Selection (SampledKD)}
 \label{sec:twoaxis}
 \begin{figure}[t]
 	\centering
@@ -167,15 +134,17 @@ $\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally 
 	\label{fig:two-axis}
 \end{figure}
 
-We combine (i) \emph{position-selective} KD (Y axis) with (ii) \emph{RS-KD over classes} (X axis) and (iii) a lightweight \emph{entropy approximation} to build an efficient, unbiased estimator we call \textbf{SampledKD}.
-Crucially, we separate \emph{offline} teacher processing from \emph{online} student training.
+We combine (i) position-selective KD (Y axis) with (ii) RS-KD over classes (X axis) and (iii) an optimizations stack to build an efficient, unbiased estimator we call SampledKD.
+Crucially, we keep the property of separating the teacher processing from student training during distillation through offline teacher cache creation.
 
-\subsection{Offline stage (teacher, once)}
+\subsection{Offline stage (teacher forward pass, once)}
 For each training sequence and position $t$:
 \begin{enumerate}
-	\item Compute a top-$m$ entropy proxy $H_t$ via TkT-LB (\S\ref{sec:entropy}) to drive position selection.
-	\item Draw $R$ samples with replacement via Gumbel-Max over $p_t^\tau$ (temperature $\tau{=}1$ by default), compute unique IDs and counts, and retain the top-$U$ unique classes by count. Convert empirical frequencies to 7-bit q7 with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
-	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{ID, q7\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the q7s.
+	\item Compute a top-$m$ entropy proxy $H_t$ via Top-k-plus-tail (\S\ref{sec:entropy}) to drive position selection.
+	\item Per position, perform RS-KD: draw $R$ samples with replacement (we optimize it via Gumbel-Max over $p_t^\tau$, where $\tau$ is temperature), compute unique IDs and counts, and retain the top-$U$ unique classes by count.
+	Convert empirical frequencies to 7-bit quantized probability $q7$.
+	%  with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
+	\item Store $(\mathcal{S}_t,\tilde p_t)$ implicitly as packed \{ID, $q7$\} pairs; $\tilde p_t$ is reconstructed at train time by normalizing the $q7$s.
 \end{enumerate}
 Only the packed samples and scalar $H_t$ are stored (no full logits).
 
@@ -209,6 +178,37 @@ We follow standard KD scaling by multiplying the KD loss by $T^2$. While self-no
 Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
 
 \subsubsection{Defaults} $U{=}12$ packed classes per position (from $R{=}50$ Gumbel draws), KD temperature $T{=}2.0$ with standard $T^2$ scaling and optional annealing, $K_{\text{pos}}\!\in\![8,32]$, $\alpha{=}1$, CE mixing $\alpha_{\text{ce}}{=}0.1$, probability floor $10^{-6}$.
+
+\section{"Fork" Tokens Selection Variants}
+\subsection{Position-Selective Distillation (RS-KD over Positions)}
+\label{sec:posrs}
+
+The KD objective for an autoregressive step is a mean over positions:
+\[
+	\mathcal{L}_{\text{KD}} \;=\; \frac{1}{N_{\text{pos}}} \sum_{t=1}^{N_{\text{pos}}}
+	\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
+Full KD evaluates all positions; we instead sample positions using a proposal
+$q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
+
+\subsection{Sampling rule}
+We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
+(e.g., the TkT-LB lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
+\[
+	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
+	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
+	\frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+which is unbiased for the uniform positional mean. We sample positions without replacement and use Hájek weights, $w_t \propto 1/q_{\text{pos}}(t)$ with $\sum_{t\in S} w_t = 1$, which yields an approximately unbiased estimate of the uniform positional mean with reduced variance.
+A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
+
+\subsection{Discussion}
+This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
+We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
+
+\subsubsection{Defaults}
+$\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally anneal $\alpha$ upward during training to shift from exploration to focused supervision.
 
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
