@@ -84,7 +84,7 @@ ax.set_yticklabels(y_labels)
 
 legend_elements = [
     Patch(facecolor=light_blue, edgecolor="black", label="RS-KD"),
-    Patch(facecolor=strong_blue, edgecolor="black", label="Our (2-axis RS-KD)"),
+    Patch(facecolor=strong_blue, edgecolor="black", label="Ours (2-axis RS-KD)"),
     Patch(facecolor=reg_gray_bg, edgecolor="black", label="Regular Distillation"),
 ]
 # the legend should be inside the plot area on the right side:
