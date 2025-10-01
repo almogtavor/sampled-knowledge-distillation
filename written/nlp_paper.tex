@@ -38,6 +38,15 @@
 \usepackage{inconsolata}
 \usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{mathtools}
+\usepackage{parskip}
+\usepackage{pgfplots}
+\usepackage{placeins}
+\usepackage{layouts}
+
 
 % If the title and author information does not fit in the area allocated, uncomment the following
 %
@@ -134,6 +143,8 @@ Our results show that token-selective, unbiased KD achieves the best accuracy--e
 	\label{fig:two-axis}
 \end{figure}
 
+\FloatBarrier
+
 We combine (i) position-selective KD (Y axis) with (ii) RS-KD over classes (X axis) and (iii) an optimizations stack to build an efficient, unbiased estimator we call SampledKD.
 Crucially, we keep the property of separating the teacher processing from student training during distillation through offline teacher cache creation.
 
@@ -220,13 +231,13 @@ $\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally 
 \label{sec:softmax_elimination}
 In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
 With this change---and after batching across all valid positions with shared negatives---we improved throughput from ${\sim}2.3\text{s}/\text{step}$ to ${\sim}0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
-It is important to mention a high degradance in perplexity, dependent on hyperparameter settings.
+It is important to mention a high degradation in perplexity, dependent on hyperparameter settings.
 
 \subsection{Student KD (importance-corrected sampled softmax)}
 \label{sec:sampled_softmax}
 We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
 At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
-Lower choices of $M_t$ have caused high perplexity degradance.
+Lower choices of $M_t$ have caused high perplexity degradation.
 Let $S_t = U_t \cup M_t$.
 
 For the student, we normalize its logits $z_i$ only over $S_t$ while correcting for the sampling distribution:
