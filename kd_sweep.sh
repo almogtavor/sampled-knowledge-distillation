@@ -154,7 +154,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
   # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
   # sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
-  # sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
+  sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_4m] Training runs (4M tokens each)"
   # 1) FullKD Qwen8B->0.6B on 4M tokens Basline

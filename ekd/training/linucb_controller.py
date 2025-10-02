@@ -184,14 +184,17 @@ class LinUCBBanditController:
             if contexts.size(0) == 0:
                 continue
 
-            contexts_cpu = contexts.detach().cpu()
+            # Keep contexts on their current device; the bandit will internally
+            # move them to its own device and return outputs on the same device
+            # as the provided contexts (see LinUCBBandit.select).
+            contexts_clean = contexts.detach()
             mask, scores = self.bandit.select(
-                contexts_cpu,
+                contexts_clean,
                 threshold=self.config.bandit_threshold,
                 max_actions=max_actions,
             )
 
-            n_valid = contexts_cpu.size(0)
+            n_valid = contexts_clean.size(0)
             eff_min = max(1, min(self.config.bandit_min_tokens, n_valid))
             if max_actions is not None:
                 eff_min = min(eff_min, max_actions)
@@ -224,7 +227,8 @@ class LinUCBBanditController:
                     BanditTokenRecord(
                         example_idx=idx,
                         position=abs_pos,
-                        context=contexts_cpu[rel_idx].clone().float(),
+                        # Store a CPU copy for the later bandit update to avoid holding GPU tensors
+                        context=contexts_clean[rel_idx].detach().to("cpu").float(),
                         kl_before=float(kl_pos[idx, abs_pos].item()),
                     )
                 )

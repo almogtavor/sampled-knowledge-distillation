@@ -1282,6 +1282,11 @@ class Distiller:
             pos = (update_idx - hold_u) / tail
             return T0 + (T1 - T0) * pos
 
+        # Track consecutive OOM failures across all batches
+        consecutive_oom_failures = 0
+        max_consecutive_ooms = 10
+        oom_failure_sleep_s = 100
+        
         for epoch in range(epochs):
             step_start = time.time()
             running = {"loss": 0.0, "kl": 0.0, "ce": 0.0}
@@ -1291,40 +1296,43 @@ class Distiller:
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
             for step, batch in enumerate(self.dataloader):
-                # Per-batch forward/backward with CUDA OOM retries
-                oom_retries = 6
-                oom_sleep_s = 10
-                attempt = 0
-                while True:
+                # Per-batch forward/backward with CUDA OOM handling
+                try:
+                    loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
+                    # Scale loss by gradient accumulation steps
+                    loss = loss / self.config.gradient_accumulation_steps
+                    loss.backward()
+                    # Reset consecutive OOM counter on success
+                    consecutive_oom_failures = 0
+                except torch.cuda.OutOfMemoryError:
+                    consecutive_oom_failures += 1
+                    # Clear partial grads and GPU caches
                     try:
-                        loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
-                        # Scale loss by gradient accumulation steps
-                        loss = loss / self.config.gradient_accumulation_steps
-                        loss.backward()
-                        break  # success
-                    except torch.cuda.OutOfMemoryError:
-                        attempt += 1
-                        # Clear partial grads and GPU caches before retrying
-                        try:
-                            self.opt.zero_grad(set_to_none=True)
-                        except Exception:
-                            pass
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                        try:
-                            import gc
-                            gc.collect()
-                        except Exception:
-                            pass
-                        if attempt <= oom_retries:
-                            print(f"[OOM] CUDA out of memory at step {step + 1}, attempt {attempt}/{oom_retries}. Sleeping {oom_sleep_s}s then retrying...")
-                            time.sleep(oom_sleep_s)
-                            continue
-                        else:
-                            print(f"[OOM] Exhausted retries ({oom_retries}) at step {step + 1}. Aborting.")
-                            raise
+                        self.opt.zero_grad(set_to_none=True)
+                    except Exception:
+                        pass
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    try:
+                        import gc
+                        gc.collect()
+                    except Exception:
+                        pass
+                    
+                    print(f"[OOM] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
+                          f"Consecutive OOM failures: {consecutive_oom_failures}/{max_consecutive_ooms}. "
+                          f"Skipping this batch and continuing...")
+                    
+                    if consecutive_oom_failures >= max_consecutive_ooms:
+                        print(f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures. "
+                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
+                        time.sleep(oom_failure_sleep_s)
+                        raise RuntimeError(f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures.")
+                    
+                    # Skip this batch and continue to the next one
+                    continue
                 
                 # Only update weights after accumulation steps
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
