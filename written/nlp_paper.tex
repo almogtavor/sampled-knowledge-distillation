@@ -46,6 +46,7 @@
 \usepackage{pgfplots}
 \usepackage{placeins}
 \usepackage{layouts}
+\usepackage{multirow}
 
 
 % If the title and author information does not fit in the area allocated, uncomment the following
@@ -87,8 +88,9 @@
 \let\thefootnote\relax
 \footnotemark
 \footnotetext{* Equal contribution.}
+\footnotetext{\url{https://github.com/almogtavor/sampled-knowledge-distillation}}
 \begin{abstract}
-	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. We propose a token-selective distillation framework that leverages teacher entropy and other uncertainty measures to focus supervision on informative tokens, while maintaining unbiased class-level guidance. We enables efficient student training by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ truncation and other sparse KD methods. Experiments on standard language modeling benchmarks demonstrate that EKD achieves superior compression-accuracy trade-offs, paving the way for more practical deployment of compact LLMs.
+	Large language models (LLMs) achieve impressive results but are challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often suffer from efficiency-accuracy trade-offs, especially when applied to autoregressive models. Aiming to perform distillation more efficiently, we propose 2 selective methods for KD. The first is a simple token-selective distillation method that leverages teacher entropy and other uncertainty measures to skip distillation time steps and focus supervision on informative tokens, while maintaining unbiased class-level guidance. The second method, called SampledKD, enables additional efficiency by reducing the need to store or query full teacher logits, and improves calibration and performance compared to top-$K$ logits truncation and other sparse KD methods. We release code for reproduction.
 \end{abstract}
 
 \section{Introduction}
@@ -171,7 +173,7 @@ We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
 	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by entropy.
 	\item \textbf{2-axis Top-$k$.} Select the top $K_{\text{pos}}$ positions by a entropy/ score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
-	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens.
+	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens. Matching a thesis where extremely high-entropy tokens may be noisy or ambiguous, while extremely low-entropy tokens are uninformative.
 	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
 	      \[
 		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})},\quad \sum_{t\in S}w_t=1,
@@ -232,9 +234,6 @@ A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
 \subsection{Discussion}
 This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
 We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
-
-\subsubsection{Defaults}
-$\alpha{=}1$, $K_{\text{pos}}\!\in\![8,32]$, weight floor $10^{-6}$; optionally anneal $\alpha$ upward during training to shift from exploration to focused supervision.
 
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
@@ -401,19 +400,19 @@ All evaluations report pass@1 accuracy as the primary metric.
 
 \subsubsection{Mathematical reasoning}
 \paragraph{GSM8K} \citep{cobbe2021gsm8k} contains grade-school math word problems with natural language solutions. We use the standard train/test split for distillation training and evaluation.
+Due to resources constrains, our experiments on GSM8K included only $250$ randomly sampled (with a constant seed of 1337) test examples from the original $1.3K$ training examples.
+For all evaluations, we did zero shot evaluations, except a sepecific ablation where we distilled SampledKD on GSM8K.
 \paragraph{SVAMP} \citep{patel2021svamp} provides single-step arithmetic reasoning problems with algebraic variations. We leverage the available train/test split for consistent evaluation.
+For SVAMP, we sampled $250$ examples from $1.3K$ test examples.
 
 \subsubsection{Reading comprehension and commonsense reasoning}
 \paragraph{LAMBADA (OpenAI)} \citep{paperno2016lambada} tests language models' ability to predict the final word of passages requiring broad context. Since this benchmark provides only a test set without an official training split, we use it exclusively for zero-shot evaluation.
-\paragraph{HellaSwag} \citep{zellers2019hellaswag} requires selecting the most plausible continuation of everyday scenarios. We use the standard train/validation/test split.
-\paragraph{PIQA} \citep{bisk2019piqa} evaluates physical commonsense reasoning through questions about everyday situations. Evaluation follows the train/validation/test split.
 
 \subsubsection{Science and knowledge}
 \paragraph{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
 
 \subsubsection{Competition-level benchmarks}
 \paragraph{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination.
-\paragraph{IFEval} \citep{zhou2023ifeval} assesses instruction following through verifiable constraints.
 
 \subsection{Experimental setup}
 
@@ -421,11 +420,54 @@ For benchmarks with available training splits (GSM8K, SVAMP, ARC-Challenge, ARC-
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
 
-\section{Ablations}
-\label{sec:ablations}
-We ablated the main knobs along both axes:
-(i) \emph{position selection}: top-$k$ vs.\ percentile bucket vs.\ RS-KD sampling ($\alpha\!\in\!\{0,0.5,1,2\}$) with/without GLS; and (ii) \emph{class sampling}: $U\!\in\!\{6,12,24\}$ cached uniques, RS temperature $\tau\!\in\!\{1,2\}$, and student negatives $M\!\in\!\{256,512,1024\}$ when softmax elimination is enabled. We also swept KD temperature $T\!\in\!\{1,2,3\}$, CE mixing $\alpha_{\text{ce}}\!\in\!\{0,0.1,0.2\}$, and composite scoring weights (entropy/CE/KL).
-Overall, \emph{token-selective KD} consistently improved efficiency while retaining accuracy across datasets; \emph{SampledKD} further reduced compute but lagged full KD in final perplexity/accuracy when $M$ was small and the student was aggressively quantized. Increasing $M$ and $U$ narrowed the gap but weakened the speedup, echoing known sampled-softmax trade-offs.
+\section{Main Results}
+\label{sec:main-results}
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{lcccccccc}
+\toprule
+\multirow{2}{*}{Method} 
+& \multicolumn{2}{c}{GSM8K ($\uparrow$)} 
+& \multicolumn{2}{c}{SVAMP ($\uparrow$)} 
+& \multicolumn{2}{c}{ARC-Challenge (acc $\uparrow$)} 
+& \multicolumn{2}{c}{ARC-Easy (acc $\uparrow$)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+& 1M & 4M & 1M & 4M & 1M & 4M & 1M & 4M \\
+\midrule
+Full KD (all tokens, full softmax)    & 31.0 & --- & 4.0 & --- & 34.0 & --- & 38.0 & --- \\
+\textbf{Token-selective KD (entropy top-$30\%$)}  & 28.0 & --- & 4.0 & --- & 33.0 & --- & 40.0 & --- \\
+Token-selective KD (bucket of $5\%-30\%$)    & 25.0 & --- & 3.0 & --- & 30.0 & --- & 42.0 & --- \\
+Token-selective KD (random $25\%$)    & 20.0 & --- & 1.0 & --- & 26.0 & --- & 36.0 & --- \\
+\addlinespace[2pt]
+\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 32.0 & 26.0 & 2.0 & 4.0 & 30.0 & 32.0 & 34.0 & 34.0 \\
+\quad Top $k=75\%$ positions                      	& 40.0 & --- & 2.0 & --- & 40.0 & --- & 28.0 & --- \\
+\quad Top $k=30\%$ pos, GLS (global queue) 	    & 29.0 & --- & 2.0 & --- & 32.0 & --- & 39.0 & --- \\
+\quad Top $k=30\%$ pos, Score based Selection & 38.0 & --- & 1.0 & --- & 30.0 & --- & 36.0 & --- \\
+\quad Positional RS-KD $k=30\%$	(sampled)    	& 30.0 & --- & 2.0 & --- & 24.0 & --- & 27.0 & --- \\
+\quad $k=100\%$                       	& 40.0 & --- & 2.0 & --- & 26.0 & --- & 36.0 & --- \\
+\quad $k=30\%$, distilled on GSM8K train split   & \multicolumn{2}{c}{38.0} & --- & --- & --- & --- & --- \\
+\quad LinUCB model as selector        	& 11.0 & --- & 0.0 & --- & 15.0 & --- & 20.0 & --- \\
+\midrule
+No KD baseline (untrained student)    & \multicolumn{2}{c}{48.0} & \multicolumn{2}{c}{6.0} & \multicolumn{2}{c}{32.0} & \multicolumn{2}{c}{62.0} \\
+\bottomrule
+\end{tabular}
+\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy.
+Token selective KD \& Full KD are regular distillations that do not apply softmax elimination nor offline cache.
+}
+\label{tab:main-reasoning}
+\end{table*}
+
+\subsection{Discussion}
+\label{sec:discussion}
+We ablated a wide range of position-selection settings for a 0.6B student, varying the number of supervised positions $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$ and comparing top-$k$, percentile buckets, and RS-KD sampling with $\alpha\!\in\!\{0,0.5,1,2\}$, with and without GLS.
+We also tested RS temperature $\tau{\in}\{1,2\}$, negatives $M{\in}\{256,512,1024\}$), as well as KD temperature $T$.  
+
+Results were often noisy, and in most cases the distilled student underperformed the Qwen3-0.6B baseline.
+This stems from: (i) bias from limited supervision, since KD used only a single dataset of math-style tasks and just a partial subset of it, giving the student a narrow view of the teacher distribution; (ii) variance from sampled objectives, as small $U$ and $M$ under softmax elimination led to noisy gradients and instability; (iii) limited scale, with just 1M-4M tokens and a small 0.6B student, the capacity was insufficient to exploit KD; and (iv) evaluation mismatch, as most evaluations were zero-shot despite training distribution shifts.  
+
+Training on the GSM8K \emph{train split} and evaluating on its test set gave better results, suggesting that the weak zero-shot outcomes reflect supervision bias, variance, and scale limits rather than a flaw in distillation itself.
 
 \section{Related Work}
 

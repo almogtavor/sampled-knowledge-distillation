@@ -69,4 +69,5 @@ for i in range(5):
 # fig.text(0.01, 0.01, "Blue = teacher bars used in KL • Orange = student bars used in KL • Gray = bins/rows not distilled", fontsize=10)
 
 plt.savefig('kd_intuition.pgf', bbox_inches='tight', pad_inches=0)
+plt.savefig("kd_intuition.png", dpi=400, bbox_inches="tight", pad_inches=0)
 plt.close()

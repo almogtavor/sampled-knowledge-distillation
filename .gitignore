@@ -239,3 +239,4 @@ logits_caches/
 tex.code-snippets
 results/
 .github/copilot-instructions.md
+evals/
