@@ -91,5 +91,13 @@ for s in ax.spines.values():
 plt.tight_layout()
 
 plt.savefig("rskd_grid.pgf", bbox_inches="tight", pad_inches=0)
-plt.savefig("rskd_grid.png", dpi=400, bbox_inches="tight", pad_inches=0)
+legend_elements = [
+    Patch(facecolor=light_blue, edgecolor="black", label="RS-KD"),
+    Patch(facecolor=strong_blue, edgecolor="black", label="Ours (2-axis RS-KD)"),
+    Patch(facecolor=reg_gray_bg, edgecolor="black", label="Regular Distillation"),
+]
+# the legend should be inside the plot area on the right side:
+ax.legend(handles=legend_elements, loc="upper right",  frameon=True)
+
+plt.savefig("rskd_grid.png", dpi=400, bbox_inches="tight", pad_inches=0.1)
 plt.close()
