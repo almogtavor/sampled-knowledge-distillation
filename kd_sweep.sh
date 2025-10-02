@@ -7,7 +7,7 @@ usage() {
   echo "  bash kd_sweep.sh compare_methods <k_percent>"
   echo "  bash kd_sweep.sh anneal_compare_methods <k_percent>"
   echo "  bash kd_sweep.sh anneal_method <method> <k_percent>"
-  echo "  bash kd_sweep.sh run_all_10m [suite]   # Runs the full 10M-token pipeline in the exact requested order"
+  echo "  bash kd_sweep.sh run_all_4m [suite]   # Runs the full 4m-token pipeline in the exact requested order"
 }
 
 [[ $# -lt 1 ]] && usage && exit 1
@@ -143,17 +143,17 @@ elif [[ "$MODE" == "score_weights" ]]; then
     sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "light" "$KD_SWEEP_TAG"
   done
 
-elif [[ "$MODE" == "run_all_10m" ]]; then
+elif [[ "$MODE" == "run_all_4m" ]]; then
   # Full pipeline: evaluate baselines, then run the requested trainings in EXACT order.
   # Optional arg 2: suite for evals (default: light)
   SUITE="${2:-light}"
 
-  # Use 10M tokens for all FineWeb-Edu training runs
+  # Use 4m tokens for all FineWeb-Edu training runs
   export FINEWEB_TOKENS=4000000
 
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
   # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
-  sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
+  # sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
   # sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_4m] Training runs (4M tokens each)"
@@ -195,19 +195,19 @@ elif [[ "$MODE" == "run_all_10m" ]]; then
   # 13) SampledKD LinUCB k=25
   sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
-  echo "[run_all_10m] All jobs submitted and completed in sequence."
+  echo "[run_all_4m] All jobs submitted and completed in sequence."
 else
   usage; exit 1
 fi
   
 
 
-elif [[ "$MODE" == "run_sampledkd_10m" ]]; then
+elif [[ "$MODE" == "run_sampledkd_4m" ]]; then
   # Full pipeline: evaluate baselines, then run the requested trainings in EXACT order.
   # Optional arg 2: suite for evals (default: light)
   SUITE="${2:-light}"
 
-  # Use 10M tokens for all FineWeb-Edu training runs
+  # Use 4m tokens for all FineWeb-Edu training runs
   export FINEWEB_TOKENS=4000000
 
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
@@ -234,7 +234,7 @@ elif [[ "$MODE" == "run_sampledkd_10m" ]]; then
   # 13) SampledKD LinUCB k=25
   sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
-  echo "[run_all_10m] All jobs submitted and completed in sequence."
+  echo "[run_all_4m] All jobs submitted and completed in sequence."
 else
   usage; exit 1
 fi
