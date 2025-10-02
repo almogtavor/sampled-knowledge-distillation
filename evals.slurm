@@ -33,6 +33,8 @@ export EVALPLUS_TRUST_REMOTE_CODE=1
 export WANDB_MODE=${WANDB_MODE:-online}
 export WANDB_DISABLED=${WANDB_DISABLED:-false}
 export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
+# safe even if PYTHONPATH is unset
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Optional tiny extras in LIGHT suite (BoolQ, HumanEval) -> set LIGHT_EXTRAS=1 to enable
 # export LIGHT_EXTRAS=1
