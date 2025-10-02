@@ -1150,11 +1150,40 @@ class Distiller:
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
             for step, batch in enumerate(self.dataloader):
-                loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
-                
-                # Scale loss by gradient accumulation steps
-                loss = loss / self.config.gradient_accumulation_steps
-                loss.backward()
+                # Per-batch forward/backward with CUDA OOM retries
+                oom_retries = 6
+                oom_sleep_s = 10
+                attempt = 0
+                while True:
+                    try:
+                        loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
+                        # Scale loss by gradient accumulation steps
+                        loss = loss / self.config.gradient_accumulation_steps
+                        loss.backward()
+                        break  # success
+                    except torch.cuda.OutOfMemoryError:
+                        attempt += 1
+                        # Clear partial grads and GPU caches before retrying
+                        try:
+                            self.opt.zero_grad(set_to_none=True)
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        try:
+                            import gc
+                            gc.collect()
+                        except Exception:
+                            pass
+                        if attempt <= oom_retries:
+                            print(f"[OOM] CUDA out of memory at step {step + 1}, attempt {attempt}/{oom_retries}. Sleeping {oom_sleep_s}s then retrying...")
+                            time.sleep(oom_sleep_s)
+                            continue
+                        else:
+                            print(f"[OOM] Exhausted retries ({oom_retries}) at step {step + 1}. Aborting.")
+                            raise
                 
                 # Only update weights after accumulation steps
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:

@@ -113,6 +113,9 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
         "created_at": now,
         "last_update": now,
         "status": "started",
+        # Completion flags to disambiguate partial runs from finished ones
+        "completed_train": False,
+        "completed_eval": False,
         "runs": {
             "train": {
                 "experiment": experiment_name,
@@ -130,6 +133,9 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
         # Update minimal fields but keep existing evals/results
         items[idx]["params"] = norm_params
         items[idx]["last_update"] = now
+        # Ensure flags exist for backward compatibility
+        items[idx].setdefault("completed_train", False)
+        items[idx].setdefault("completed_eval", False)
         items[idx].setdefault("runs", {}).setdefault("train", {}).update({
             "experiment": experiment_name,
             "job_id": job_id,
@@ -149,6 +155,7 @@ def mark_trained(registry_path: Path, params_hash: str, *, model_output_dir: Opt
     if idx is None:
         return
     items[idx]["status"] = "trained"
+    items[idx]["completed_train"] = True
     items[idx]["last_update"] = _now_iso()
     if model_output_dir:
         items[idx].setdefault("runs", {}).setdefault("train", {}).update({"output_dir": model_output_dir})
@@ -174,6 +181,8 @@ def upsert_eval_results(
             "created_at": now,
             "last_update": now,
             "status": "evaluated",
+            "completed_train": False,
+            "completed_eval": True,
             "runs": {},
             "evals": {suite: {"results": results, "averages": averages, "task_status": task_status, "updated_at": now}},
         })
@@ -185,9 +194,18 @@ def upsert_eval_results(
             "updated_at": now,
         }
         items[idx]["status"] = "evaluated"
+        items[idx].setdefault("completed_train", False)
+        items[idx]["completed_eval"] = True
         items[idx]["last_update"] = now
     _save_registry(registry_path, items)
 
 
 def exists(registry_path: Path, params_hash: str) -> bool:
-    return find_entry(_load_registry(registry_path), params_hash) is not None
+    # Only treat as existing (to block a rerun) if the training for that params hash
+    # has completed successfully. Incomplete runs should not block a new run.
+    items = _load_registry(registry_path)
+    idx = find_entry(items, params_hash)
+    if idx is None:
+        return False
+    entry = items[idx]
+    return bool(entry.get("completed_train", False))

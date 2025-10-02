@@ -158,19 +158,19 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
 
   echo "[run_all_4m] Training runs (4M tokens each)"
   # 1) FullKD Qwen8B->0.6B on 4M tokens Basline
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX,NO_OFFLINE train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
+  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
 
   # 2) Token Selective KD k=25
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX,NO_OFFLINE train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 3) Token Selective KD k=75
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX,NO_OFFLINE train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
+  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
 
   # 4) Token Selective KD Bucket top 5% of the tokens to top 25%
-  sbatch --wait --export=ALL,BUCKET_LOWER_PERCENT=5,BUCKET_UPPER_PERCENT=25,NO_ELIMINATE_SOFTMAX,NO_OFFLINE train.slurm bucket 0 light "$KD_SWEEP_TAG"
+  sbatch --wait --export=ALL,BUCKET_LOWER_PERCENT=5,BUCKET_UPPER_PERCENT=25,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm bucket 0 light "$KD_SWEEP_TAG"
 
   # 6) Token Selective KD Random k=25 Baseline
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX,NO_OFFLINE train.slurm random 25 light "$KD_SWEEP_TAG"
+  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm random 25 light "$KD_SWEEP_TAG"
 
   # 7) SampledKD k=25 (top-k with cached elimination)
   sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
