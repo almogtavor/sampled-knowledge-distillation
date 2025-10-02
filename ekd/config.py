@@ -89,6 +89,11 @@ class TrainingConfig(BaseModel):
     eliminate_softmax: bool = Field(default=False, description="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     sampled_softmax_negatives: int = Field(default=1024, description="Number of uniform negative samples per position when eliminate_softmax=True")
     
+    # Global-Level Selection (GLS) over tokens — only affects top-k-tok when enabled
+    gls_enabled: bool = Field(default=False, description="Enable global-level selection FIFO queue (only impacts top-k-tok)")
+    gls_queue_size: int = Field(default=30000, description="Capacity of GLS FIFO queue for computing global threshold")
+    gls_log_threshold: bool = Field(default=False, description="Log the GLS threshold each time it's computed")
+    
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")
     keep_checkpoints: int = Field(default=3, description="Number of recent checkpoints to keep")

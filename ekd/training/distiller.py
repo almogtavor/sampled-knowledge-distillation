@@ -85,6 +85,12 @@ class Distiller:
         # Logging setup
         self.logger = logger
         self.global_step = 0
+
+        # GLS ring buffer state (inactive unless enabled)
+        self._gls_buf: Optional[torch.Tensor] = None
+        self._gls_cap: int = int(getattr(self.config, "gls_queue_size", 30000))
+        self._gls_count: int = 0
+        self._gls_head: int = 0
         
         # Checkpointing
         self.output_dir = Path(config.output_dir)
@@ -104,6 +110,49 @@ class Distiller:
                 teacher_device=self.teacher_device,
                 sanitize_logits_fn=self._sanitize_logits,
             )
+
+    # -------- GLS helpers (global-level selection queue) --------
+    def _gls_init_if_needed(self):
+        if not bool(getattr(self.config, "gls_enabled", False)):
+            return
+        if self._gls_buf is None:
+            self._gls_cap = max(1, int(getattr(self.config, "gls_queue_size", 30000)))
+            # CPU float32 buffer; we store only finite stats
+            self._gls_buf = torch.empty(self._gls_cap, dtype=torch.float32, device="cpu")
+            self._gls_count = 0
+            self._gls_head = 0
+
+    def _gls_push(self, values_1d: torch.Tensor):
+        # values_1d: 1D CPU float32 finite values; may be empty
+        if self._gls_buf is None:
+            return
+        if values_1d is None or values_1d.numel() == 0:
+            return
+        # ensure on CPU float32
+        vals = values_1d.detach().to("cpu", dtype=torch.float32)
+        if vals.numel() == 0:
+            return
+        n = int(vals.numel())
+        idx = 0
+        while idx < n:
+            take = min(self._gls_cap - self._gls_head, n - idx)
+            self._gls_buf[self._gls_head:self._gls_head + take] = vals[idx:idx + take]
+            self._gls_head = (self._gls_head + take) % self._gls_cap
+            self._gls_count = min(self._gls_cap, self._gls_count + take)
+            idx += take
+
+    def _gls_threshold(self, top_percent: float) -> Optional[float]:
+        # Compute percentile over history BEFORE current batch is pushed.
+        if self._gls_buf is None or self._gls_count == 0:
+            return None
+        # We want the threshold such that tokens with stat >= thr are in the top k_percent
+        q = max(0.0, min(1.0, 1.0 - (top_percent / 100.0)))
+        view = self._gls_buf if self._gls_count == self._gls_cap else self._gls_buf[:self._gls_count]
+        try:
+            thr = torch.quantile(view, q).item()
+        except Exception:
+            thr = float(view.min().item())
+        return float(thr)
 
     def save_checkpoint(self, epoch: int, step: int):
         """Save a training checkpoint."""
@@ -352,57 +401,102 @@ class Distiller:
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
         elif self.config.distill_type == "top-k-tok":
-            # top-k% tokens by entropy among valid positions only
+            # top-k% tokens among valid positions; optionally global threshold via GLS
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
-            ent = ent_raw.masked_fill(~valid_next, float('-inf'))  # ignore invalid
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
 
-            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))  # e.g. 0.2
-
-            # optional score-based selection context
+            # Build ranking statistic: default entropy; if score enabled, use combined score
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
             score_ctx = None
             if score_enabled:
                 kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
                 score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+            # stat initialized with -inf outside valid positions
+            stat = ent_raw.masked_fill(~valid_next, float('-inf'))
+            if score_enabled:
+                stat = torch.full_like(ent_raw, float('-inf'))
+                for i in range(valid_next.size(0)):
+                    mask_i = valid_next[i]
+                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                    if combined is not None:
+                        stat[i] = combined
+                stat = stat.masked_fill(~valid_next, float('-inf'))
 
-            # select positions first, then compute KL only on those
+            use_gls = bool(getattr(self.config, "gls_enabled", False))
             kd_terms = []
-            batch_size = valid_next.size(0)
-            for i in range(batch_size):
-                mask = valid_next[i]  # [L-1] - valid positions for sequence i
-                n_valid = int(mask.sum().item())
-                if n_valid < 3:
-                    continue
-                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
-
-                if score_enabled:
-                    combined = self._build_score_vector(score_ctx, i, mask)
-                    if combined is None:
+            sel_topk_count = 0
+            sel_gls_count = 0
+            if not use_gls:
+                # Per-example top-k (original behavior)
+                for i in range(valid_next.size(0)):
+                    mask = valid_next[i]
+                    n_valid = int(mask.sum().item())
+                    if n_valid < 3:
                         continue
-                    score_valid = combined[mask]
-                    if score_valid.numel() == 0:
+                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                    sel_topk_count += int(k)
+                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    scores = stat[i][mask]
+                    if scores.numel() == 0:
                         continue
-                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
-                    _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
-                    selected_topk_idx = valid_idx[rel_idx]  # [k]
-                else:
-                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)  # [n_valid]
-                    ent_valid_pos = ent[i][valid_idx] # [n_valid], entropy of valid positions
-                    _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
-                    # Convert relative indices back to absolute sequence positions
-                    selected_topk_idx = valid_idx[selected_topk_pos]  # [k]
-                # Compute KL only on selected positions (sum over vocab, so [k])
-                idx_t = selected_topk_idx.to(t_log_probs.device)
-                kl_sel = self._kl_loss(
-                    t_log_probs[i, idx_t, :].to(self.student_device),
-                    s_log_probs[i, selected_topk_idx, :]
-                )  # [k]
-                kd_terms.append(kl_sel.mean())
-
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
+                    _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
+                    sel = valid_idx[rel_idx]
+                    idx_t = sel.to(t_log_probs.device)
+                    kl_sel = self._kl_loss(
+                        t_log_probs[i, idx_t, :].to(self.student_device),
+                        s_log_probs[i, sel, :]
+                    )
+                    kd_terms.append(kl_sel.mean())
+                kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
             else:
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+                # GLS: global threshold over history with warm-up fallback
+                self._gls_init_if_needed()
+                thr = self._gls_threshold(top_percent=self.config.k_percent)
+                if thr is None:
+                    # Warm-up: fallback to per-example top-k
+                    for i in range(valid_next.size(0)):
+                        mask = valid_next[i]
+                        n_valid = int(mask.sum().item())
+                        if n_valid < 3:
+                            continue
+                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                        sel_topk_count += int(k)
+                        valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                        scores = stat[i][mask]
+                        if scores.numel() == 0:
+                            continue
+                        _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
+                        sel = valid_idx[rel_idx]
+                        idx_t = sel.to(t_log_probs.device)
+                        kl_sel = self._kl_loss(
+                            t_log_probs[i, idx_t, :].to(self.student_device),
+                            s_log_probs[i, sel, :]
+                        )
+                        kd_terms.append(kl_sel.mean())
+                    kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+                else:
+                    keep_mask = (stat >= thr) & valid_next
+                    sel_gls_count = int(keep_mask.sum().item())
+                    for i in range(valid_next.size(0)):
+                        keep_i = keep_mask[i]
+                        if keep_i.any():
+                            kd_terms.append(self._kl_loss(
+                                t_log_probs[i][keep_i].to(self.student_device),
+                                s_log_probs[i][keep_i]
+                            ).mean())
+                    kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+                # Push current batch stats and optionally log threshold
+                flat_vals = stat[valid_next].detach().float().to("cpu")
+                flat_vals = flat_vals[torch.isfinite(flat_vals)]
+                self._gls_push(flat_vals)
+                if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
+                    self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+            # Log selection counters (per batch)
+            if self.logger:
+                self.logger.log({
+                    "train/selected_tokens_topk": float(sel_topk_count),
+                    "train/selected_tokens_gls": float(sel_gls_count),
+                }, self.global_step)
 
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
@@ -806,29 +900,76 @@ class Distiller:
                             )
 
                         if distill == "top-k-tok":
-                            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-                            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
-                            for i in range(valid_next.size(0)):
-                                mask_i = valid_next[i]
-                                n_valid = int(mask_i.sum().item())
-                                if n_valid < 3:
-                                    continue
-                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                                valid_idx_i = torch.where(mask_i)[0]
-                                if score_enabled and score_ctx is not None:
+                            # Build ranking stat: default cached entropy; use combined score if enabled
+                            ent_cached = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
+                            if score_enabled and score_ctx is not None:
+                                stat_elim = torch.full_like(ent_cached, float('-inf'))
+                                for i in range(valid_next.size(0)):
+                                    mask_i = valid_next[i]
                                     combined = self._build_score_vector(score_ctx, i, mask_i)
-                                    if combined is None:
+                                    if combined is not None:
+                                        stat_elim[i] = combined
+                                stat_elim = stat_elim.masked_fill(~valid_next, float('-inf'))
+                            else:
+                                stat_elim = ent_cached.masked_fill(~valid_next, float('-inf'))
+
+                            use_gls = bool(getattr(self.config, "gls_enabled", False))
+                            sel_topk_count = 0
+                            sel_gls_count = 0
+                            if not use_gls:
+                                # Original per-example top-k
+                                pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                                for i in range(valid_next.size(0)):
+                                    mask_i = valid_next[i]
+                                    n_valid = int(mask_i.sum().item())
+                                    if n_valid < 3:
                                         continue
-                                    scores = combined[mask_i]
+                                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                    sel_topk_count += int(k)
+                                    valid_idx_i = torch.where(mask_i)[0]
+                                    scores = stat_elim[i][mask_i].float()
+                                    if scores.numel() == 0:
+                                        continue
+                                    _, rel = torch.topk(scores, k=k, largest=True, sorted=False)
+                                    sel_abs = valid_idx_i[rel]
+                                    keep_mask[i, sel_abs] = True
+                            else:
+                                # GLS threshold with warm-up fallback
+                                self._gls_init_if_needed()
+                                thr = self._gls_threshold(top_percent=self.config.k_percent)
+                                if thr is None:
+                                    pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                    keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                                    for i in range(valid_next.size(0)):
+                                        mask_i = valid_next[i]
+                                        n_valid = int(mask_i.sum().item())
+                                        if n_valid < 3:
+                                            continue
+                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        sel_topk_count += int(k)
+                                        valid_idx_i = torch.where(mask_i)[0]
+                                        scores = stat_elim[i][mask_i].float()
+                                        if scores.numel() == 0:
+                                            continue
+                                        _, rel = torch.topk(scores, k=k, largest=True, sorted=False)
+                                        sel_abs = valid_idx_i[rel]
+                                        keep_mask[i, sel_abs] = True
                                 else:
-                                    # fallback: use cached entropy
-                                    ent_i = self._entropy_for_selection(input_ids, t_pred=None)[i]
-                                    scores = ent_i[mask_i]
-                                if scores.numel() == 0:
-                                    continue
-                                _, top_rel = torch.topk(scores, k=k, largest=True, sorted=False)
-                                sel_abs = valid_idx_i[top_rel]
-                                keep_mask[i, sel_abs] = True
+                                    keep_mask = (stat_elim >= thr) & valid_next
+                                    sel_gls_count = int(keep_mask.sum().item())
+                                # After selection, push this batch's stats and optionally log threshold
+                                vals = stat_elim[valid_next].detach().float().to("cpu")
+                                vals = vals[torch.isfinite(vals)]
+                                self._gls_push(vals)
+                                if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
+                                    self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+                            # Log selection counters (per batch, elimination path)
+                            if self.logger:
+                                self.logger.log({
+                                    "train/selected_tokens_topk": float(sel_topk_count),
+                                    "train/selected_tokens_gls": float(sel_gls_count),
+                                }, self.global_step)
 
                         elif distill == "bucket":
                             keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)

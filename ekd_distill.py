@@ -335,6 +335,13 @@ def parse_args_to_config() -> TrainingConfig:
 
     parser.add_argument("--sampled_softmax_negatives", type=int, default=1024,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
+    # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
+    parser.add_argument("--gls_enabled", action="store_true", default=False,
+                        help="Enable global-level selection FIFO queue (only impacts top-k-tok)")
+    parser.add_argument("--gls_queue_size", type=int, default=30000,
+                        help="Capacity of GLS FIFO queue for computing global threshold")
+    parser.add_argument("--gls_log_threshold", action="store_true", default=False,
+                        help="Log the GLS threshold each time it's computed")
     # Unified upsert registry controls
     parser.add_argument("--runs_registry", type=str, default="results/runs.json",
                         help="Path to the unified runs JSON registry (a JSON list).")
