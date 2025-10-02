@@ -231,7 +231,6 @@ def parse_args_to_config() -> TrainingConfig:
         "bucket",
         "pos-rs-kd",
         "linucb",
-        "entropy-top-k-with-softmax",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
@@ -415,7 +414,7 @@ def main():
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
     experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random" or config.distill_type == "entropy-top-k-with-softmax":
+    if config.distill_type == "top-k-tok" or config.distill_type == "random":
         experiment_name += f"_k={config.k_percent}"
     elif config.distill_type == "bucket":
         experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
@@ -533,19 +532,7 @@ def main():
                 })
             dataset = examples
 
-    # Optional: for entropy-top-k-with-softmax, subsample to 1/20 of the dataset size
-    if getattr(config, "distill_type", "") == "entropy-top-k-with-softmax":
-        try:
-            from torch.utils.data import Subset
-            total_len = len(dataset)  # works for list or dataset-like
-            sub_len = max(1, total_len // 10)
-            if isinstance(dataset, list):
-                dataset = dataset[:sub_len]
-            else:
-                dataset = Subset(dataset, list(range(sub_len)))
-            print(f"[entropy-top-k-with-softmax] Using a 1/10 subset: {sub_len} / {total_len} examples")
-        except Exception as e:
-            print(f"[entropy-top-k-with-softmax] Failed to create 1/20 subset ({e}); proceeding with full dataset.")
+    # (Removed) special-case subsampling for deprecated 'entropy-top-k-with-softmax'
 
     collate = DistillCollator(tok, config.max_seq_len)
     # Seeded DataLoader generator for reproducible shuffling
