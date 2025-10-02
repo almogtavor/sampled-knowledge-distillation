@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import hashlib
+import time
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -419,7 +420,7 @@ def run_lmeval_suite(
     results_dir: Path,
     gpu_ids: List[int],
     suite: str,
-) -> Tuple[Optional[Path], Dict[str, str]]:
+) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
     """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
@@ -521,6 +522,7 @@ def run_lmeval_suite(
 
     # Parallel across physical GPUs (mask each process to one GPU)
     task_status: Dict[str, str] = {}
+    task_durations: Dict[str, float] = {}
     good_any = False
     i = 0
     while i < len(tasks_with_limits):
@@ -541,24 +543,27 @@ def run_lmeval_suite(
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             env.setdefault("EVAL_SEED", str(seed))
             cmd = _task_cmd(task, limit, "cuda:0")
+            start = time.time()
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
-            procs.append((task, p, timeout))
-        for task, p, to in procs:
+            procs.append((task, p, timeout, start))
+        for task, p, to, start in procs:
             rc, out = wait_with_timeout(p, timeout=to)
+            duration = max(0.0, time.time() - start)
             timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
-                print(f"[{timestamp}] ✅ Task {task} completed successfully")
+                print(f"[{timestamp}] ✅ Task {task} completed successfully in {duration:.1f}s")
                 task_status[task] = "ok"
                 good_any = True
             elif rc == 124:
-                print(f"[{timestamp}] ⏰ Task {task} timed out after {to} seconds")
+                print(f"[{timestamp}] ⏰ Task {task} timed out after {to} seconds (wall {duration:.1f}s)")
                 task_status[task] = "timeout"
             else:
-                print(f"[{timestamp}] ❌ Task {task} failed with code {rc}")
+                print(f"[{timestamp}] ❌ Task {task} failed with code {rc} in {duration:.1f}s")
                 task_status[task] = f"failed:{rc}"
+            task_durations[task] = duration
         i += len(gpu_ids)
-    return out_dir if good_any else None, task_status
+    return out_dir if good_any else None, task_status, task_durations
 
 # ---------- ECE (Expected Calibration Error) from LM-Eval samples ----------
 def _softmax(xs: List[float]) -> List[float]:
@@ -1187,43 +1192,58 @@ def main():
 
     all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
 
+    overall_start = time.time()
     for tag, model_dir in model_specs:
         print(f"\n=== Running benchmarks for {tag} (suite={args.suite}) ===")
 
         # LM-Eval (parallel across GPUs according to the chosen suite)
-        lmeval_root, task_status = run_lmeval_suite(
+        lmeval_start = time.time()
+        lmeval_root, task_status, task_durations = run_lmeval_suite(
             model_dir=model_dir,
             tag=tag,
             results_dir=results_dir,
             gpu_ids=gpu_pool,
             suite=args.suite,
         )
+        lmeval_wall = time.time() - lmeval_start
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
         # Derive ECE from sample logs when available and align its task keys
         raw_ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
         ece_metrics = _map_ece_to_existing_tasks(raw_ece_metrics, lmeval_metrics)
 
         # Summarization (HEAVY only)
+        lighteval_start = time.time()
         lighteval_file = run_lighteval(model_dir, tag, results_dir, suite=args.suite)
+        lighteval_wall = time.time() - lighteval_start if lighteval_file else 0.0
         lighteval_metrics = collect_lighteval_metrics(lighteval_file)
 
         # Code-gen (HEAVY only)
+        evalplus_start = time.time()
         evalplus_roots = run_evalplus(model_dir, tag, ["humaneval", "mbpp"], suite=args.suite)
+        evalplus_wall = time.time() - evalplus_start if evalplus_roots else 0.0
         he_metrics = collect_evalplus_metrics(evalplus_roots.get("humaneval"), "HumanEval+")
         mbpp_metrics = collect_evalplus_metrics(evalplus_roots.get("mbpp"), "MBPP+")
 
         # Instruction following (HEAVY only, if available)
+        ifeval_start = time.time()
         ifeval_dir = run_ifeval(model_dir, tag, results_dir, suite=args.suite)
+        ifeval_wall = time.time() - ifeval_start if ifeval_dir else 0.0
         ifeval_metrics = collect_simple_json(ifeval_dir, "IF-Eval", "results.json")
 
         # Instruction-following win-rate (HEAVY only, requires API key)
+        alpaca_start = time.time()
         alpaca_dir = run_alpacaeval(model_dir, tag, results_dir, suite=args.suite)
+        alpaca_wall = time.time() - alpaca_start if alpaca_dir else 0.0
         alpaca_metrics = collect_alpacaeval_metrics(alpaca_dir)
 
         # Safety (HEAVY only)
+        jbb_start = time.time()
         jbb_dir = run_jailbreakbench(model_dir, tag, results_dir, suite=args.suite)
+        jbb_wall = time.time() - jbb_start if jbb_dir else 0.0
         jbb_metrics = collect_simple_json(jbb_dir, "JailbreakBench", "jbb_results.json")
+        hb_start = time.time()
         hb_dir = run_harmbench(model_dir, tag, results_dir, suite=args.suite)
+        hb_wall = time.time() - hb_start if hb_dir else 0.0
         hb_metrics = collect_simple_json(hb_dir, "HarmBench", "harmbench_results.json")
 
         merged = merge_model_results([
@@ -1239,6 +1259,14 @@ def main():
         ])
         all_models_metrics[tag] = merged
 
+        # Timing summary
+        total_wall = time.time() - overall_start
+        print("\n=== Timing summary ===")
+        print(f"lm-eval total: {lmeval_wall:.1f}s")
+        if args.suite == "heavy":
+            print(f"lighteval: {lighteval_wall:.1f}s, evalplus: {evalplus_wall:.1f}s, ifeval: {ifeval_wall:.1f}s, alpaca: {alpaca_wall:.1f}s, jbb: {jbb_wall:.1f}s, harmbench: {hb_wall:.1f}s")
+        print(f"overall wall: {total_wall:.1f}s")
+
         # --- Save results to JSON for this model ---
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
@@ -1252,6 +1280,17 @@ def main():
             "avg_ece": averages.get("avg_ece"),
             "per_task_ece": per_task_ece,
         }
+        timings = {
+            "lm_eval_total_sec": lmeval_wall,
+            "lm_eval_task_sec": task_durations,
+            "lighteval_sec": lighteval_wall,
+            "evalplus_sec": evalplus_wall,
+            "ifeval_sec": ifeval_wall,
+            "alpaca_sec": alpaca_wall,
+            "jailbreakbench_sec": jbb_wall,
+            "harmbench_sec": hb_wall,
+            "overall_wall_sec": total_wall,
+        }
         payload = {
             "tag": tag,
             "suite": args.suite,
@@ -1259,6 +1298,7 @@ def main():
             "averages": averages,
             "task_status": task_status,
             "calibration": calibration,
+            "timings": timings,
         }
         save_json(payload, json_result_file)
 
