@@ -77,10 +77,55 @@ class Distiller:
         self.tok = tokenizer
         self.dataloader = dataloader
         self.config = config
-        self.opt = AdamW(self.student.parameters(), lr=config.lr)
+        
+        # ===== OOM Reduction: 8-bit optimizer to save ~2-3x memory =====
+        try:
+            from bitsandbytes.optim import Adam8bit
+            self.opt = Adam8bit(self.student.parameters(), lr=config.lr)
+            print("[OOM-opt] Using 8-bit Adam optimizer to reduce memory.")
+        except Exception:
+            self.opt = AdamW(self.student.parameters(), lr=config.lr)
+            print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
+        
         self.teacher_device = teacher_device
         self.student_device = student_device
         self._printed_cache_info = False
+        
+        # ===== OOM Reduction: Enable gradient checkpointing on student =====
+        if hasattr(self.student, "gradient_checkpointing_enable"):
+            try:
+                self.student.gradient_checkpointing_enable()
+                print("[OOM-opt] Enabled gradient checkpointing on student model.")
+            except Exception as e:
+                print(f"[OOM-opt] Could not enable gradient checkpointing: {e}")
+        
+        # ===== OOM Reduction: Enable memory-efficient attention =====
+        try:
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(True)
+            print("[OOM-opt] Enabled memory-efficient SDPA backends.")
+        except Exception:
+            pass
+        
+        # Try Flash Attention 2 on student if supported
+        if hasattr(self.student, "config") and hasattr(self.student.config, "use_flash_attention_2"):
+            try:
+                self.student.config.use_flash_attention_2 = True
+                print("[OOM-opt] Enabled Flash Attention 2 on student model.")
+            except Exception:
+                pass
+        
+        # ===== OOM Reduction: Mixed precision (AMP) setup =====
+        # Initialize GradScaler for fp16 AMP (disabled for bfloat16 which doesn't need scaling)
+        self._amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self._use_amp = True
+        if self._amp_dtype == torch.float16:
+            from torch.cuda.amp import GradScaler
+            self._scaler = GradScaler(enabled=True)
+            print(f"[OOM-opt] Using AMP with {self._amp_dtype} and GradScaler.")
+        else:
+            self._scaler = None
+            print(f"[OOM-opt] Using AMP with {self._amp_dtype} (no scaler needed).")
         
         # Logging setup
         self.logger = logger
@@ -715,8 +760,14 @@ class Distiller:
         T = float(getattr(self.config, "kd_temperature", 1.0))
         T2 = T * T
 
+        # ===== OOM Reduction: AMP context for mixed precision =====
+        from torch.cuda.amp import autocast
+        amp_enabled = getattr(self, "_use_amp", False)
+        amp_dtype = getattr(self, "_amp_dtype", torch.float32)
+        
         # --- student forward (always) ---
-        s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
+        with autocast(enabled=amp_enabled, dtype=amp_dtype):
+            s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
         s_logits = self._sanitize_logits(s_logits, "student")
 
         # Align to next-token prediction
@@ -738,7 +789,8 @@ class Distiller:
             input_ids_t = input_ids.to(self.teacher_device)
             attn_t = attn_mask.to(self.teacher_device)
             with torch.no_grad():
-                t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
                 t_logits = self._sanitize_logits(t_logits, "teacher")  # [B, L, V]
             t_pred = t_logits[:, :-1, :]
             t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
@@ -1283,10 +1335,13 @@ class Distiller:
             pos = (update_idx - hold_u) / tail
             return T0 + (T1 - T0) * pos
 
-        # Track consecutive OOM failures across all batches
+        # Track OOM failures: consecutive and total
         consecutive_oom_failures = 0
+        total_oom_failures = 0
         max_consecutive_ooms = 10
+        max_total_oom_percent = 50  # Abort if >50% of batches OOM
         oom_failure_sleep_s = 100
+        batches_attempted = 0
         
         for epoch in range(epochs):
             step_start = time.time()
@@ -1296,17 +1351,30 @@ class Distiller:
             last_reward_metrics: Optional[Dict[str, float]] = None
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
             
-            for step, batch in enumerate(self.dataloader):
+            step = 0  # Manual step counter that only increments on success
+            for batch in self.dataloader:
+                batches_attempted += 1
                 # Per-batch forward/backward with CUDA OOM handling
                 try:
                     loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
                     # Scale loss by gradient accumulation steps
                     loss = loss / self.config.gradient_accumulation_steps
-                    loss.backward()
+                    
+                    # ===== OOM Reduction: AMP backward pass =====
+                    scaler = getattr(self, "_scaler", None)
+                    if scaler is not None:
+                        # fp16: use scaler
+                        scaler.scale(loss).backward()
+                    else:
+                        # bfloat16 or no AMP: standard backward
+                        loss.backward()
+                    
                     # Reset consecutive OOM counter on success
                     consecutive_oom_failures = 0
+                    step += 1  # Only increment step on successful batch
                 except torch.cuda.OutOfMemoryError:
                     consecutive_oom_failures += 1
+                    total_oom_failures += 1
                     # Clear partial grads and GPU caches
                     try:
                         self.opt.zero_grad(set_to_none=True)
@@ -1322,23 +1390,44 @@ class Distiller:
                     except Exception:
                         pass
                     
+                    oom_rate = (total_oom_failures / batches_attempted) * 100
                     print(f"[OOM] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
-                          f"Consecutive OOM failures: {consecutive_oom_failures}/{max_consecutive_ooms}. "
-                          f"Skipping this batch and continuing...")
+                          f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
+                          f"Total: {total_oom_failures}/{batches_attempted} ({oom_rate:.1f}%). "
+                          f"Skipping batch...")
                     
+                    # Exit if too many consecutive OOMs
                     if consecutive_oom_failures >= max_consecutive_ooms:
                         print(f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures. "
                               f"Sleeping {oom_failure_sleep_s}s before exiting...")
                         time.sleep(oom_failure_sleep_s)
                         raise RuntimeError(f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures.")
                     
-                    # Skip this batch and continue to the next one
+                    # Exit if OOM rate is too high (only check after seeing enough batches)
+                    if batches_attempted >= 20 and oom_rate > max_total_oom_percent:
+                        print(f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
+                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
+                        time.sleep(oom_failure_sleep_s)
+                        raise RuntimeError(f"Training aborted: {total_oom_failures}/{batches_attempted} batches failed with OOM ({oom_rate:.1f}%).")
+                    
+                    # Skip this batch and continue to the next one (step counter doesn't increment)
                     continue
                 
                 # Only update weights after accumulation steps
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
-                    self.opt.step()
+                    # ===== OOM Reduction: AMP optimizer step =====
+                    scaler = getattr(self, "_scaler", None)
+                    if scaler is not None:
+                        # fp16: unscale, clip, step, update scaler
+                        scaler.unscale_(self.opt)
+                        torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                        scaler.step(self.opt)
+                        scaler.update()
+                    else:
+                        # bfloat16 or no AMP: standard step
+                        torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                        self.opt.step()
+                    
                     self.opt.zero_grad(set_to_none=True)
                     self.global_step += 1
                     # Update KD temperature per schedule if enabled

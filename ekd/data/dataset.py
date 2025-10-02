@@ -35,7 +35,11 @@ class AIMEJsonl(Dataset):
 
 
 class DistillCollator:
-    """Collates batches for distillation training."""
+    """Collates batches for distillation training.
+    
+    Uses dynamic padding (padding=True) to pad each batch to its longest sequence,
+    minimizing wasted computation and memory. This is optimal for OOM reduction.
+    """
 
     def __init__(self, tokenizer, max_len: int):
         self.tok = tokenizer
@@ -43,7 +47,8 @@ class DistillCollator:
 
     def __call__(self, batch):
         prompts = [ex["prompt"] for ex in batch]
-        # The batch encoder is a dictionary holding tensors of the tokenized prompt text & mask.
+        # Dynamic padding: pads to max length in THIS batch, not global max_len
+        # This significantly reduces memory usage compared to always padding to max_len
         enc = self.tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=self.max_len)
         return {
             "input_ids": enc["input_ids"],

@@ -314,6 +314,15 @@ def create_training_logger(config, experiment_name: Optional[str] = None) -> Wan
         tags.append(f"bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}")
     elif config.distill_type == "vanilla":
         tags.append("all-tokens")
+    
+    # Add softmax elimination tag
+    if getattr(config, 'eliminate_softmax', False):
+        tags.append("softmax")
+    
+    # Add offline cache tag
+    if getattr(config, 'offline_cache', False):
+        tags.append("cache")
+    
     # Optional tag to surface FineWeb token budget in the UI
     try:
         if isinstance(getattr(config, 'datasets', None), list) and 'fineweb' in config.datasets:

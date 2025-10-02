@@ -268,10 +268,8 @@ unset PYTHONPATH PYTHONHOME
   --fineweb_tokens "${FINEWEB_TOKENS:-4000000}" \
   --epochs "$EPOCHS" \
   --batch_size 1 \
-  --gradient_accumulation_steps 16 \
-  --checkpoint_steps 250 \
-  --keep_checkpoints 3 \
-  --max_seq_len 384 \
+  --gradient_accumulation_steps 32  \
+  --max_seq_len 230 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \

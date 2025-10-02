@@ -287,7 +287,7 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Absolute clip value applied to KL improvement rewards before LinUCB updates")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
-    parser.add_argument("--alpha_ce", type=float, default=0.1,
+    parser.add_argument("--alpha_ce", type=float, default=0.3,
                         help="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
@@ -333,7 +333,7 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--no_eliminate_softmax", dest="eliminate_softmax", action="store_false",
                         help="Disable softmax elimination (force full-vocab softmax).")
 
-    parser.add_argument("--sampled_softmax_negatives", type=int, default=1024,
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=1500,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
     # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
     parser.add_argument("--gls_enabled", action="store_true", default=False,
@@ -362,6 +362,20 @@ def parse_args_to_config() -> TrainingConfig:
 def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
+    
+    # Print all CLI parameters at startup
+    print("=" * 80)
+    print("TRAINING CONFIGURATION")
+    print("=" * 80)
+    try:
+        params_dict = config.model_dump()
+    except Exception:
+        params_dict = vars(config)
+    
+    for key, value in sorted(params_dict.items()):
+        print(f"  {key:30s} = {value}")
+    print("=" * 80)
+    print()
 
     # global seeding
     random.seed(config.seed)

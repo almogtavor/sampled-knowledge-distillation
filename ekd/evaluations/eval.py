@@ -344,13 +344,13 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
     ("hellaswag", None),
-    ("gsm8k", 250),
-    ("svamp", 250),
+    ("piqa", None),
+    ("gsm8k", None),
+    # ("svamp", 250),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
-    ("arc_challenge", None),
-    ("arc_easy", None),
-    # ("piqa", 500),
+    # ("arc_challenge", None),
+    # ("arc_easy", None),
     # exact-match
     # ("aime25", None),
     # ("ifeval", None)
@@ -1114,6 +1114,16 @@ def main():
     parser.add_argument("--from_hf", action="store_true", help="Interpret 'model' as a HF hub ID even if it is not a local path.")
     # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
+    
+    # Print all CLI parameters at startup
+    print("=" * 80)
+    print("EVALUATION CONFIGURATION")
+    print("=" * 80)
+    args_dict = vars(args)
+    for key, value in sorted(args_dict.items()):
+        print(f"  {key:30s} = {value}")
+    print("=" * 80)
+    print()
 
     work_dir = Path(args.work_dir)
     exports_dir = work_dir / "exports"
@@ -1305,6 +1315,9 @@ def main():
         # Upsert into unified registry keyed by params hash
         try:
             params_blob: Optional[Dict[str, Any]] = None
+            # Prepare model_path for registry (use string representation)
+            model_path_str = str(model_dir) if not args.from_hf else base_model_dir
+            
             if args.params_json and Path(args.params_json).exists():
                 with open(args.params_json, "r", encoding="utf-8") as f:
                     params_candidate = json.load(f)
@@ -1312,7 +1325,7 @@ def main():
                     params_blob = params_candidate.get("params") or params_candidate
                     if isinstance(params_candidate.get("id"), str):
                         params_hash = params_candidate["id"]
-                        upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+                        upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
                         raise StopIteration
             else:
                 # Preferred: run_params.json saved by training
@@ -1325,7 +1338,7 @@ def main():
                             # If file already contains id, prefer to trust it
                             if isinstance(rp_blob.get("id"), str):
                                 params_hash = rp_blob["id"]
-                                upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+                                upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
                                 raise StopIteration  # already upserted; skip remainder
                     except Exception:
                         pass
@@ -1360,7 +1373,7 @@ def main():
                 # As a last resort, attach an empty dict so the call still produces a stable id from empty params
                 params_blob = {}
             params_hash = compute_params_hash(params_blob)
-            upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+            upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
         except StopIteration:
             pass
         except Exception as e:

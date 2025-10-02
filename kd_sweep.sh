@@ -143,6 +143,18 @@ elif [[ "$MODE" == "score_weights" ]]; then
     sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=$SCORE_NORM_DEFAULT,SCORE_ENTROPY_WEIGHT=$W_ENT,SCORE_CE_WEIGHT=$W_CE,SCORE_KL_WEIGHT=$W_KL,WANDB_GROUP=${KD_SWEEP_NAME:-$KD_SWEEP_TAG}-score-$LABEL train.slurm "$METHOD" "$K_SCORE" "light" "$KD_SWEEP_TAG"
   done
 
+
+elif [[ "$MODE" == "eval_qwens" ]]; then
+  SUITE="${2:-light}"
+
+  export FINEWEB_TOKENS=4000000
+
+  echo "[eval_qwens] Evaluating baselines (suite=$SUITE)"
+  sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
+  sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
+
+  echo "[eval_qwens] All jobs submitted and completed in sequence."
+
 elif [[ "$MODE" == "run_all_4m" ]]; then
   # Full pipeline: evaluate baselines, then run the requested trainings in EXACT order.
   # Optional arg 2: suite for evals (default: light)
@@ -154,7 +166,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
   # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
   # sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
-  sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
+  # sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_4m] Training runs (4M tokens each)"
   # 1) FullKD Qwen8B->0.6B on 4M tokens Basline
@@ -172,28 +184,28 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   # 6) Token Selective KD Random k=25 Baseline
   sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm random 25 light "$KD_SWEEP_TAG"
 
-  # 7) SampledKD k=25 (top-k with cached elimination)
-  sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # # 7) SampledKD k=25 (top-k with cached elimination)
+  # sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
-  # 8) SampledKD k=25 with softmax (no cache/no elim)
-  sbatch --wait train.slurm entropy-top-k-with-softmax 25 light "$KD_SWEEP_TAG"
+  # # 8) SampledKD k=25 with softmax (no cache/no elim)
+  # sbatch --wait train.slurm entropy-top-k-with-softmax 25 light "$KD_SWEEP_TAG"
 
-  # 9) SampledKD k=75
-  sbatch --wait train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
+  # # 9) SampledKD k=75
+  # sbatch --wait train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
 
-  # 10) SampledKD Score k=25 (enable score-based selection)
-  sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # # 10) SampledKD Score k=25 (enable score-based selection)
+  # sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
-  # 11) SampledKD Pos RS-KD k=25
-  sbatch --wait train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
+  # # 11) SampledKD Pos RS-KD k=25
+  # sbatch --wait train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
 
-  # 12) SampledKD Trained also on GSM8K k=25 (GSM8K-only run)
-  # Note: train.slurm supports DATASETS / DATASET_CONFIG / PROMPT_COL / ANSWER_COL overrides
-  sbatch --wait --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
-    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # # 12) SampledKD Trained also on GSM8K k=25 (GSM8K-only run)
+  # # Note: train.slurm supports DATASETS / DATASET_CONFIG / PROMPT_COL / ANSWER_COL overrides
+  # sbatch --wait --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
+  #   train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
-  # 13) SampledKD LinUCB k=25
-  sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
+  # # 13) SampledKD LinUCB k=25
+  # sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
   echo "[run_all_4m] All jobs submitted and completed in sequence."
 
@@ -207,11 +219,14 @@ elif [[ "$MODE" == "run_sampledkd_4m" ]]; then
   export FINEWEB_TOKENS=4000000
 
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
-  # 7) SampledKD k=25 (top-k with cached elimination)
-  sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # 7) SampledKD k=100 (top-k with cached elimination)
+  sbatch --wait train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
 
-  # 8) SampledKD k=25 with softmax (no cache/no elim)
-  sbatch --wait train.slurm entropy-top-k-with-softmax 25 light "$KD_SWEEP_TAG"
+  # 8) SampledKD k=100 with softmax (no cache/no elim)
+  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
+  
+  # 9) SampledKD k=25
+  sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 9) SampledKD k=75
   sbatch --wait train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"

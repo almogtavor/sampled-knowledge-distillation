@@ -95,8 +95,6 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
     {
       id: <hash>,
       params: <filtered params>,
-      created_at: <iso>,
-      last_update: <iso>,
       status: "started"|"trained"|"evaluated"|"skipped",
       runs: { train: {...} },
       evals: { light: {...}, heavy: {...} }
@@ -106,12 +104,9 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
     norm_params = normalize_params(params)
     h = compute_params_hash(params)
     idx = find_entry(items, h)
-    now = _now_iso()
     base = {
         "id": h,
         "params": norm_params,
-        "created_at": now,
-        "last_update": now,
         "status": "started",
         # Completion flags to disambiguate partial runs from finished ones
         "completed_train": False,
@@ -121,7 +116,6 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                 "experiment": experiment_name,
                 "job_id": job_id,
                 "output_dir": model_output_dir,
-                "started_at": now,
             }
         },
         "evals": {},
@@ -132,7 +126,6 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
     else:
         # Update minimal fields but keep existing evals/results
         items[idx]["params"] = norm_params
-        items[idx]["last_update"] = now
         # Ensure flags exist for backward compatibility
         items[idx].setdefault("completed_train", False)
         items[idx].setdefault("completed_eval", False)
@@ -140,7 +133,6 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
             "experiment": experiment_name,
             "job_id": job_id,
             "output_dir": model_output_dir,
-            "started_at": items[idx]["runs"]["train"].get("started_at", now),
         })
         items[idx].setdefault("evals", {})
         # Do not override status here; caller can change later
@@ -156,7 +148,6 @@ def mark_trained(registry_path: Path, params_hash: str, *, model_output_dir: Opt
         return
     items[idx]["status"] = "trained"
     items[idx]["completed_train"] = True
-    items[idx]["last_update"] = _now_iso()
     if model_output_dir:
         items[idx].setdefault("runs", {}).setdefault("train", {}).update({"output_dir": model_output_dir})
     _save_registry(registry_path, items)
@@ -169,34 +160,40 @@ def upsert_eval_results(
     results: Dict[str, Dict[str, float]],
     averages: Dict[str, float],
     task_status: Dict[str, str],
+    model_path: Optional[str] = None,
 ) -> None:
     items = _load_registry(registry_path)
     idx = find_entry(items, params_hash)
-    now = _now_iso()
     if idx is None:
         # Create a minimal stub if training didn't register
+        eval_entry = {
+            "results": results,
+            "averages": averages,
+            "task_status": task_status,
+        }
+        if model_path:
+            eval_entry["model_evaluated"] = model_path
         items.append({
             "id": params_hash,
             "params": {},
-            "created_at": now,
-            "last_update": now,
             "status": "evaluated",
             "completed_train": False,
             "completed_eval": True,
             "runs": {},
-            "evals": {suite: {"results": results, "averages": averages, "task_status": task_status, "updated_at": now}},
+            "evals": {suite: eval_entry},
         })
     else:
-        items[idx].setdefault("evals", {})[suite] = {
+        eval_entry = {
             "results": results,
             "averages": averages,
             "task_status": task_status,
-            "updated_at": now,
         }
+        if model_path:
+            eval_entry["model_evaluated"] = model_path
+        items[idx].setdefault("evals", {})[suite] = eval_entry
         items[idx]["status"] = "evaluated"
         items[idx].setdefault("completed_train", False)
         items[idx]["completed_eval"] = True
-        items[idx]["last_update"] = now
     _save_registry(registry_path, items)
 
 
