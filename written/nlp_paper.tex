@@ -172,13 +172,13 @@ At each update we (i) select a subset $S$ of token positions, then (ii) compute 
 We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
 	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by entropy.
-	\item \textbf{2-axis Top-$k$.} Select the top $K_{\text{pos}}$ positions by a entropy/ score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
+	\item \textbf{2-axis Top-$k$.} Select the top $K_{\text{pos}}$ positions by entropy/score; by default the score is entropy $H_t$, and we also support a composite score that linearly combines entropy, student CE, and teacher-student KL with per-example normalization.
 	\item \textbf{Percentile bucket.} Keep positions whose score lies between two percentiles (e.g., 70th-80th), filtering out both very low and very high-uncertainty tokens. Matching a thesis where extremely high-entropy tokens may be noisy or ambiguous, while extremely low-entropy tokens are uninformative.
 	\item \textbf{Positional RS-KD.} Instead of picking the highest-entropy positions deterministically, we sample unique positions according to a probability distribution $q_{\text{pos}}(t)\propto \big(\text{base}_t\big)^{\alpha}$. To avoid bias, each selected position is reweighted as
 	      \[
 		      w_t \propto  \tfrac{1}{\max(q_{\text{pos}}(t),q_{\min})},\quad \sum_{t\in S}w_t=1,
 	      \]
-	      so that rarely sampled tokens count more and frequent ones count less.
+	      so that rarely sampled tokens count more, and frequent ones count less.
 	\item \textbf{LinUCB bandit.} A contextual bandit model selects positions using a UCB score over per-position features (entropy, CE, KL), with a threshold and optional min/max tokens. The model is updated online with immediate rewards from distillation loss reduction.
 	\item \textbf{Uniform random.} Sample $K_{\text{pos}}$ positions uniformly (baseline).
 \end{enumerate}
@@ -462,7 +462,7 @@ Token selective KD \& Full KD are regular distillations that do not apply softma
 \subsection{Discussion}
 \label{sec:discussion}
 We ablated a wide range of position-selection settings for a 0.6B student, varying the number of supervised positions $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$ and comparing top-$k$, percentile buckets, and RS-KD sampling with $\alpha\!\in\!\{0,0.5,1,2\}$, with and without GLS.
-We also tested RS temperature $\tau{\in}\{1,2\}$, negatives $M{\in}\{256,512,1024\}$), as well as KD temperature $T$.  
+We also tested RS temperature $\tau{\in}\{1,2\}$, negatives $M{\in}\{256,512,1024\}$, as well as KD temperature $T$.  
 
 Results were often noisy, and in most cases the distilled student underperformed the Qwen3-0.6B baseline.
 This stems from: (i) bias from limited supervision, since KD used only a single dataset of math-style tasks and just a partial subset of it, giving the student a narrow view of the teacher distribution; (ii) variance from sampled objectives, as small $U$ and $M$ under softmax elimination led to noisy gradients and instability; (iii) limited scale, with just 1M-4M tokens and a small 0.6B student, the capacity was insufficient to exploit KD; and (iv) evaluation mismatch, as most evaluations were zero-shot despite training distribution shifts.  
