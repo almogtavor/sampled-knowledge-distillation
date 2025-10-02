@@ -188,12 +188,14 @@ def load_teacher_with_fallback(
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
-def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337):
+def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
     """
     Stream FineWeb-Edu and take ~max_tokens worth of text, reproducibly.
+    Filters out documents that exceed max_seq_len tokens.
     Returns a list of {prompt, answer} examples.
     """
     print(f"[fineweb] Streaming HuggingFaceFW/fineweb-edu with token budget={max_tokens:,}, seed={seed}")
+    print(f"[fineweb] Filtering docs to max_seq_len={max_seq_len} tokens")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
 
     # Shuffle with fixed seed for reproducibility (uses a buffer)
@@ -201,19 +203,31 @@ def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337):
 
     total_tokens = 0
     examples = []
+    docs_seen = 0
+    docs_filtered = 0
+    
     for ex in ds:
+        docs_seen += 1
         txt = ex.get("text", None)
         if not txt:
             continue
         # Tokenize with the same tokenizer used for training
-        ids = tokenizer(txt)["input_ids"]
+        ids = tokenizer(txt, add_special_tokens=False)["input_ids"]
         n_tokens = len(ids)
+        
+        # Filter out documents that exceed max_seq_len
+        if n_tokens > max_seq_len:
+            docs_filtered += 1
+            continue
+        
         if total_tokens + n_tokens > max_tokens:
             break
         examples.append({"prompt": txt, "answer": ""})
         total_tokens += n_tokens
 
-    print(f"[fineweb] Sampled ~{len(examples)} docs, {total_tokens:,} tokens")
+    filter_pct = (docs_filtered / docs_seen * 100) if docs_seen > 0 else 0.0
+    print(f"[fineweb] Sampled {len(examples)} docs, {total_tokens:,} tokens")
+    print(f"[fineweb] Filtered {docs_filtered}/{docs_seen} docs ({filter_pct:.1f}%) exceeding {max_seq_len} tokens")
     return examples
 
 
@@ -538,7 +552,7 @@ def main():
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
-            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed)
+            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
         else:
             # Load from Hugging Face dataset if user passes HF dataset name
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")

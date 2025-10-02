@@ -8,6 +8,7 @@ usage() {
   echo "  bash kd_sweep.sh anneal_compare_methods <k_percent>"
   echo "  bash kd_sweep.sh anneal_method <method> <k_percent>"
   echo "  bash kd_sweep.sh run_all_4m [suite]   # Runs the full 4m-token pipeline in the exact requested order"
+  echo "  bash kd_sweep.sh run_gls_4m [suite]   # Runs GLS experiments with balanced scoring at k=25"
 }
 
 [[ $# -lt 1 ]] && usage && exit 1
@@ -232,7 +233,7 @@ elif [[ "$MODE" == "run_sampledkd_4m" ]]; then
   sbatch --wait train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
 
   # 10) SampledKD Score k=25 (enable score-based selection)
-  sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 11) SampledKD Pos RS-KD k=25
   sbatch --wait train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
@@ -246,6 +247,28 @@ elif [[ "$MODE" == "run_sampledkd_4m" ]]; then
   sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
   echo "[run_all_4m] All jobs submitted and completed in sequence."
+
+elif [[ "$MODE" == "run_gls_4m" ]]; then
+  # GLS (Global-Level Selection) experiments with balanced scoring
+  # Optional arg 2: suite for evals (default: light)
+  SUITE="${2:-light}"
+
+  # Use 4m tokens for all FineWeb-Edu training runs
+  export FINEWEB_TOKENS=4000000
+
+  echo "[run_gls_4m] Running GLS experiments with balanced scoring (4M tokens each, suite=$SUITE)"
+  
+  # 1) GLS top-k-tok k=25 with balanced score-based selection (entropy:1.0, ce:1.0, kl:1.0)
+  echo "[run_gls_4m] 1) GLS top-k-tok k=25 with balanced scoring"
+  sbatch --wait --export=ALL,GLS_ENABLED=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+
+  # 2) Standard (per-example) top-k-tok k=25 with balanced score-based selection for comparison
+  echo "[run_gls_4m] 2) Standard top-k-tok k=25 with balanced scoring (no GLS)"
+  sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=z,SCORE_ENTROPY_WEIGHT=1.0,SCORE_CE_WEIGHT=1.0,SCORE_KL_WEIGHT=1.0 \
+    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+
+  echo "[run_gls_4m] All GLS jobs submitted and completed in sequence."
+
 else
   usage; exit 1
 fi

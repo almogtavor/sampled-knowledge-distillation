@@ -269,7 +269,7 @@ unset PYTHONPATH PYTHONHOME
   --epochs "$EPOCHS" \
   --batch_size 1 \
   --gradient_accumulation_steps 32  \
-  --max_seq_len 230 \
+  --max_seq_len 250 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \
