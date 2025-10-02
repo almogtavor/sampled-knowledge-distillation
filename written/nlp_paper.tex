@@ -36,9 +36,7 @@
 % However, it will improve the aesthetics of text in
 % the typewriter font.
 \usepackage{inconsolata}
-\usepackage{booktabs} % Added for \toprule, \midrule, and \bottomrule
 
-\usepackage{amsmath, amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{mathtools}
@@ -90,7 +88,7 @@
 \footnotetext{* Equal contribution.}
 \footnotetext{\url{https://github.com/almogtavor/sampled-knowledge-distillation}}
 \begin{abstract}
-	Large language models (LLMs) achieve impressive results but remain challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often yield only modest efficiency gains unless they sacrifice significant accuracy, particularly in autoregressive models. To improve efficiency, we propose two selective methods for KD. The first, token-selective KD (TSKD), leverages teacher entropy and other uncertainty measures to skip distillation steps and focus supervision on informative tokens, while maintaining unbiased class-level guidance. The second, SampledKD, further improves efficiency by reducing the need to store or query full teacher logits, and achieves better calibration and performance compared to top-$K$ truncation and other sparse KD methods. We release code to facilitate reproduction.
+	Large language models (LLMs) achieve impressive results but remain challenging to deploy due to their size and computational demands. Knowledge distillation (KD) is a popular approach for compressing LLMs, yet existing methods often yield only modest efficiency gains unless they sacrifice significant accuracy. To improve efficiency, we propose two selective methods for KD. The first, token-selective KD (TSKD), leverages teacher entropy and other uncertainty measures to skip distillation steps and focus supervision on informative tokens, while maintaining unbiased class-level guidance. The second, SampledKD, further improves efficiency by reducing the need to store or query full teacher logits, and achieves better calibration and performance compared to top-$K$ truncation and other sparse KD methods. We release code to facilitate reproduction.
 \end{abstract}
 
 \section{Introduction}
@@ -220,20 +218,25 @@ where $p_t$ and $s_t$ are teacher and student class distributions at position $t
 Full KD evaluates all positions; we instead sample positions using a proposal
 $q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
 
-\subsection{Sampling rule}
-We form $q_{\text{pos}}(t) \propto H_t^\alpha$ from a per-token uncertainty score $H_t$
-(e.g., the Top-$k$-plus-tail lower-bound entropy from \S\ref{sec:entropy}, with $m{=}20$) and exponent $\alpha\!\ge\!0$ (higher $\alpha$ concentrates on uncertain tokens). For a sample size $K_{\text{pos}}$, the with-replacement importance-sampling estimator is
-\[
-	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
-	\frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
-	\frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
-\]
-which is unbiased for the uniform positional mean. We sample positions without replacement and use Hájek weights, $w_t \propto 1/q_{\text{pos}}(t)$ with $\sum_{t\in S} w_t = 1$, which yields an approximately unbiased estimate of the uniform positional mean with reduced variance.
-A tiny probability floor (e.g., $10^{-6}$) stabilizes $1/q$.
+\subsection{Positional RS-KD Selection Policy}
+In one SampledKD variant, we sample positions by uncertainty, instead of deterministically picking the top $K_{\text{pos}}$.
+Let $H_t$ be token entropy / score, and set $q_{\text{pos}}(t)\propto H_t^{\alpha}$ with $\alpha\!\ge\!0$ controlling how we favor uncertain tokens, and \(
+q_{\text{pos}}(t)=\frac{\max(H_t,\epsilon)^{\alpha}}{\sum_j \max(H_j,\epsilon)^{\alpha}}.
+\)
 
-\subsection{Discussion}
-This \emph{position-selective} KD is orthogonal to RS-KD over classes: it reduces compute along the \emph{time/sequence} axis, not the vocabulary axis. It complements RS-KD (next section) and preserves coverage: low-uncertainty positions still contribute with nonzero probability (controlled by $\alpha$).
-We keep CE on all positions for stability, and treat the position-sampled KD as an additive term.
+For a with-replacement sample of size $K_{\text{pos}}$:
+\[
+    \widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
+    \frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
+    \frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+which is unbiased for the uniform mean over positions.
+
+In practice we draw without replacement and weight each chosen position by normalized inverse probability,
+$w_t \propto 1/\max(q_{\text{pos}}(t),q_{\min})$ with $\sum_{t\in S} w_t=1$ and $q_{\min}=10^{-6}$ to cap weights. This keeps the estimate close to the uniform mean and reduces variance.
+
+This acts along the sequence axis (orthogonal to class-level RS-KD). Low-uncertainty tokens still appear with nonzero probability (tuned by $\alpha$). We keep CE on all positions and add the position-sampled KD to the total loss.
+
 
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
@@ -508,13 +511,14 @@ This is because CE requires softmax over all tokens, which as we have seen by th
 SampledKD is one solution to this problem, but it is also possible to apply softmax elimination only on the CE term and keeping softmax for KLD, or alternatively dropping CE altogether.
 We have not explored these options yet, and leave them for future work.
 
+Normalizing selection tokens count in document lengths is another promising direction to explore.
+
 \section{Conclusion}
 \label{sec:conclusion}
 We introduced token-selective KD and its SampledKD extension that adds class-level RS-KD, separating where we distill (positions) from how we approximate the teacher distribution (classes).
 Token-selective KD achieves strong efficiency-accuracy trade-offs on our benchmarks.
 SampledKD achieves a much superior performance but, in our current small-scale, low-precision setting, shows an accuracy gap to full KD.
 Given its principled foundations and prior successes of sampled softmax and RS-KD, we view SampledKD as promising, especially at larger scales and without aggressive quantization.
-We release code to facilitate reproduction and follow-up work to close the remaining gap.
 
 
 \bibliography{anthology, custom}
