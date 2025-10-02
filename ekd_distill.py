@@ -223,7 +223,15 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--student_model", required=True)
     parser.add_argument("--student_quant_bits", type=int, choices=[4, 8], default=None,
                         help="Optionally quantize student for memory (not typical during training)")
-    parser.add_argument("--distill_type", choices=["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"], default="vanilla")
+    parser.add_argument("--distill_type", choices=[
+        "vanilla",
+        "top-k-tok",
+        "random",
+        "bucket",
+        "pos-rs-kd",
+        "linucb",
+        "entropy-top-k-with-softmax",
+    ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
     parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
@@ -322,7 +330,10 @@ def parse_args_to_config() -> TrainingConfig:
     # Sampled softmax elimination (only in cached RS-KD path)
     parser.add_argument("--eliminate_softmax", action="store_true", default=True,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
-    parser.add_argument("--sampled_softmax_negatives", type=int, default=750,
+    parser.add_argument("--no_eliminate_softmax", dest="eliminate_softmax", action="store_false",
+                        help="Disable softmax elimination (force full-vocab softmax).")
+
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=1024,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
@@ -472,6 +483,20 @@ def main():
                 })
             dataset = examples
 
+    # Optional: for entropy-top-k-with-softmax, subsample to 1/20 of the dataset size
+    if getattr(config, "distill_type", "") == "entropy-top-k-with-softmax":
+        try:
+            from torch.utils.data import Subset
+            total_len = len(dataset)  # works for list or dataset-like
+            sub_len = max(1, total_len // 10)
+            if isinstance(dataset, list):
+                dataset = dataset[:sub_len]
+            else:
+                dataset = Subset(dataset, list(range(sub_len)))
+            print(f"[entropy-top-k-with-softmax] Using a 1/10 subset: {sub_len} / {total_len} examples")
+        except Exception as e:
+            print(f"[entropy-top-k-with-softmax] Failed to create 1/20 subset ({e}); proceeding with full dataset.")
+
     collate = DistillCollator(tok, config.max_seq_len)
     # Seeded DataLoader generator for reproducible shuffling
     gen = torch.Generator()
@@ -497,7 +522,7 @@ def main():
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
     job_id = os.getenv("SLURM_JOB_ID", "local")
     experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random":
+    if config.distill_type == "top-k-tok" or config.distill_type == "random" or config.distill_type == "entropy-top-k-with-softmax":
         experiment_name += f"_k={config.k_percent}"
     elif config.distill_type == "bucket":
         experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"

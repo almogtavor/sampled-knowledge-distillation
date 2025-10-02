@@ -351,6 +351,51 @@ class Distiller:
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
             denom = valid_next.sum().clamp(min=1)
             kd_loss = (kl_pos * valid_next).sum() / denom
+        elif self.config.distill_type == "entropy-top-k-with-softmax":
+            # KD on top-k entropy tokens; CE will be applied to all tokens in outer scope.
+            # Selection identical to top-k-tok, but mode distinction controls CE behavior only.
+            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            ent = ent_raw.masked_fill(~valid_next, float('-inf'))
+            pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+
+            # Optional score-based selection (reuse same machinery as top-k)
+            score_enabled = bool(getattr(self.config, "score_token_selection", False))
+            score_ctx = None
+            if score_enabled:
+                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+
+            kd_terms = []
+            Bsz = valid_next.size(0)
+            for i in range(Bsz):
+                mask = valid_next[i]
+                n_valid = int(mask.sum().item())
+                if n_valid < 3:
+                    continue
+                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                if score_enabled:
+                    combined = self._build_score_vector(score_ctx, i, mask)
+                    if combined is None:
+                        continue
+                    score_valid = combined[mask]
+                    if score_valid.numel() == 0:
+                        continue
+                    _, rel_idx = torch.topk(score_valid, k=k, largest=True, sorted=False)
+                    selected_topk_idx = valid_idx[rel_idx]
+                else:
+                    ent_valid_pos = ent[i][valid_idx]
+                    _, selected_topk_pos = torch.topk(ent_valid_pos, k=k, largest=True, sorted=False)
+                    selected_topk_idx = valid_idx[selected_topk_pos]
+
+                idx_t = selected_topk_idx.to(t_log_probs.device)
+                kl_sel = self._kl_loss(
+                    t_log_probs[i, idx_t, :].to(self.student_device),
+                    s_log_probs[i, selected_topk_idx, :]
+                )  # [k]
+                kd_terms.append(kl_sel.mean())
+
+            kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens by entropy among valid positions only
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
@@ -1040,7 +1085,8 @@ class Distiller:
                     kd_loss = loss_rows.mean()
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
-        kd_loss = kd_loss * T2
+        if True:
+            kd_loss = kd_loss * T2
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
@@ -1049,6 +1095,7 @@ class Distiller:
                 ce_loss = ce_loss_override
             else:
                 targets = input_ids_s[:, 1:]  # [B, L-1]
+                # In the new mode, CE is on ALL valid tokens (standard masking)
                 targets = targets.masked_fill(~valid_next, -100)
                 if s_log_probs is None:
                     s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
