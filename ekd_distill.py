@@ -12,6 +12,7 @@ from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from ekd.config import TrainingConfig
+from ekd.run_registry import compute_params_hash, upsert_run_start, mark_trained, exists as registry_exists, normalize_params
 from ekd.utils import _bnb_triton_available
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
@@ -335,6 +336,11 @@ def parse_args_to_config() -> TrainingConfig:
 
     parser.add_argument("--sampled_softmax_negatives", type=int, default=1024,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
+    # Unified upsert registry controls
+    parser.add_argument("--runs_registry", type=str, default="results/runs.json",
+                        help="Path to the unified runs JSON registry (a JSON list).")
+    parser.add_argument("--override", action="store_true", default=False,
+                        help="If set, run even if an identical-params hash already exists in the registry.")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
     default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
@@ -390,6 +396,50 @@ def main():
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+
+    # ----------------- runs registry preflight -----------------
+    registry_path = Path(getattr(config, "runs_registry", "results/runs.json"))
+    # Build a stable hash over parameters (exclude dates/job ids)
+    try:
+        params_dict = config.model_dump()
+    except Exception:
+        # Fallback for older Pydantic versions
+        params_dict = vars(config)
+    params_hash = compute_params_hash(params_dict)
+
+    if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+        print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
+        return
+
+    # Create experiment name early (not part of the hash)
+    current_date = datetime.now().strftime("%Y%m%d_%H%M")
+    job_id = os.getenv("SLURM_JOB_ID", "local")
+    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+    if config.distill_type == "top-k-tok" or config.distill_type == "random" or config.distill_type == "entropy-top-k-with-softmax":
+        experiment_name += f"_k={config.k_percent}"
+    elif config.distill_type == "bucket":
+        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+
+    upsert_run_start(
+        registry_path,
+        params_dict,
+        experiment_name=experiment_name,
+        job_id=job_id,
+        model_output_dir=config.output_dir,
+    )
+
+    # Persist normalized params and hash alongside model outputs for downstream eval
+    try:
+        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+        params_out = Path(config.output_dir) / "run_params.json"
+        with open(params_out, "w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump({
+                "id": params_hash,
+                "params": normalize_params(params_dict),
+            }, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[registry] Warning: failed to write run_params.json: {e}")
 
     # ----------------- teacher / student device planning -----------------
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -518,14 +568,7 @@ def main():
         worker_init_fn=_seed_worker,
     )
 
-    # Initialize logging with experiment name
-    current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random" or config.distill_type == "entropy-top-k-with-softmax":
-        experiment_name += f"_k={config.k_percent}"
-    elif config.distill_type == "bucket":
-        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+    # Initialize logging with experiment name (built above)
     
     # Initialize combined logger (W&B + TensorBoard)
     combined_logger = create_training_combined_logger(
@@ -556,6 +599,12 @@ def main():
     print("Saving student to", config.output_dir)
     student.save_pretrained(config.output_dir)
     tok.save_pretrained(config.output_dir)
+
+    # Mark trained in registry
+    try:
+        mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
+    except Exception as e:
+        print(f"[registry] Failed to mark trained: {e}")
 
 
 if __name__ == "__main__":

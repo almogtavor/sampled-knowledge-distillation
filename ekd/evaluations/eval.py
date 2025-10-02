@@ -12,6 +12,7 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+from ekd.run_registry import compute_params_hash, upsert_eval_results
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -28,8 +29,13 @@ if "HF_DATASETS_CACHE" not in os.environ:
 
 # ---------- Logging imports ----------
 try:
-    from ekd.logging.wandb_utils import log_evaluation_to_wandb, log_evaluation_to_tensorboard
+    from ekd.logging.wandb_utils import (
+        WandBLogger,
+        log_evaluation_to_wandb,
+        log_evaluation_to_tensorboard,
+    )
 except ImportError:
+    WandBLogger = None  # type: ignore
     log_evaluation_to_wandb = log_evaluation_to_tensorboard = lambda *args, **kwargs: None
 
 # ---------- Pydantic Models for Configuration ----------
@@ -241,6 +247,14 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
     print(f"load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}")
     model.save_pretrained(export_dir)
     tok.save_pretrained(export_dir)
+    # If a run_params.json exists adjacent to the checkpoints directory, copy it for downstream registry linkage
+    try:
+        # Typical layout: <output_dir>/checkpoints/<ckpt>.pt, so parent of parent is output_dir
+        candidate = ckpt_path.parent.parent / "run_params.json"
+        if candidate.exists():
+            shutil.copy2(candidate, export_dir / "run_params.json")
+    except Exception:
+        pass
     meta = {
         "source_checkpoint": str(ckpt_path),
         "epoch": chk.get("epoch"),
@@ -294,8 +308,8 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
 # we fall back to the harness default (typically first-N) and print a warning.
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
-    ("gsm8k", 250),
-    ("svamp", 250),
+    ("gsm8k", None),
+    ("svamp", None),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     ("arc_challenge", None),
@@ -340,12 +354,13 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
 # Per-task timeouts (seconds).
 TASK_TIMEOUTS = {
     # light-ish baselines
+    "arc_challenge": 6000,
+    "arc_easy": 6000,
+    "gsm8k": 6000,
+    "svamp": 6000,
+    "aime25": 6000,
     "boolq": 600,
-    "arc_challenge": 1500,
     "hellaswag": 1200,
-    "svamp": 900,
-    "gsm8k": 2000,
-    "aime25": 2000,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,
@@ -1030,6 +1045,11 @@ def main():
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
     parser.add_argument("--output_dir", type=str, default="evaluation_json_results")
+    # Unified runs registry integration
+    parser.add_argument("--runs_registry", type=str, default="results/runs.json",
+                        help="Path to the unified runs JSON registry (shared with training).")
+    parser.add_argument("--params_json", type=str, default=None,
+                        help="Optional path to a JSON file containing the original training parameters. If not provided, attempts to infer from model dir (config.json).")
     # Logging configuration (default project updated per request)
     parser.add_argument("--wandb_project", type=str, default="selective-entropy-knowledge-distillation",
                         help="W&B project slug (e.g., 'selective-entropy-knowledge-distillation').")
@@ -1149,10 +1169,104 @@ def main():
         payload = {"tag": tag, "suite": args.suite, "results": merged, "averages": averages, "task_status": task_status}
         save_json(payload, json_result_file)
 
+        # Upsert into unified registry keyed by params hash
+        try:
+            params_blob: Optional[Dict[str, Any]] = None
+            if args.params_json and Path(args.params_json).exists():
+                params_blob = json.load(open(args.params_json))
+            else:
+                # Preferred: run_params.json saved by training
+                rp = model_dir / "run_params.json"
+                if rp.exists():
+                    try:
+                        rp_blob = json.load(open(rp))
+                        if isinstance(rp_blob, dict):
+                            params_blob = rp_blob.get("params") or rp_blob
+                            # If file already contains id, prefer to trust it
+                            if isinstance(rp_blob.get("id"), str):
+                                params_hash = rp_blob["id"]
+                                upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+                                raise StopIteration  # already upserted; skip remainder
+                    except Exception:
+                        pass
+                # Try to derive from the HF model directory (if present)
+                cfg_path = model_dir / "config.json"
+                if cfg_path.exists():
+                    try:
+                        cfg_blob = json.load(open(cfg_path))
+                        # We only need a stable mapping of training-related fields; many HF fields are irrelevant.
+                        # Try to pass through fields that might have been stored by training code.
+                        probable = {}
+                        for k in [
+                            "teacher_model", "student_model", "distill_type", "k_percent",
+                            "enable_ce", "alpha_ce", "kd_temperature", "entropy_approx_temperature",
+                            "anneal_kd_temperature", "kd_temperature_start", "kd_temperature_end", "kd_hold_frac",
+                            "rs_alpha", "rs_floor", "bucket_lower_percent", "bucket_upper_percent",
+                            "score_token_selection", "score_normalize", "score_entropy_weight", "score_ce_weight", "score_kl_weight",
+                            "bandit_alpha", "bandit_lambda", "bandit_threshold", "bandit_min_tokens", "bandit_max_tokens", "bandit_device", "bandit_reward_clip",
+                            "datasets", "prompt_col", "answer_col", "dataset_config", "fineweb_tokens",
+                            "epochs", "batch_size", "gradient_accumulation_steps", "max_seq_len", "lr",
+                            "seed", "deterministic",
+                            "offline_cache", "entropy_approx_m", "rs_vocab_samples", "rs_vocab_beta", "H_hat_u8",
+                            "eliminate_softmax", "sampled_softmax_negatives",
+                        ]:
+                            if k in cfg_blob:
+                                probable[k] = cfg_blob[k]
+                        if probable:
+                            params_blob = probable
+                    except Exception:
+                        pass
+            if params_blob is None:
+                # As a last resort, attach an empty dict so the call still produces a stable id from empty params
+                params_blob = {}
+            params_hash = compute_params_hash(params_blob)
+            upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+        except StopIteration:
+            pass
+        except Exception as e:
+            print(f"[registry] Failed to upsert eval results: {e}")
+
         # Log results to W&B and TensorBoard
         try:
             if not args.disable_wandb:
-                log_evaluation_to_wandb(tag, merged, args.wandb_project)
+                # Prefer robust WandBLogger if available
+                if WandBLogger is not None:
+                    eval_run = WandBLogger(
+                        project=args.wandb_project,
+                        entity=os.getenv("WANDB_ENTITY"),
+                        name=f"eval-{tag}",
+                        config={
+                            "suite": args.suite,
+                            "model": str(model_dir),
+                            "task_status": task_status,
+                        },
+                        tags=["evaluation", args.suite],
+                        group=os.getenv("WANDB_GROUP"),
+                        job_type="eval",
+                        notes=os.getenv("WANDB_NOTES"),
+                        resume=os.getenv("WANDB_RESUME", "allow"),
+                        run_id=os.getenv("WANDB_RUN_ID"),
+                    )
+                    if getattr(eval_run, "enabled", False):
+                        flat = {}
+                        for task, metrics in merged.items():
+                            if isinstance(metrics, dict):
+                                for k, v in metrics.items():
+                                    if isinstance(v, (int, float)):
+                                        flat[f"{task}/{k}"] = float(v)
+                        # Add averages as top-level summary
+                        for k, v in averages.items():
+                            if isinstance(v, (int, float)):
+                                flat[f"avg/{k}"] = float(v)
+                        # Add counts for visibility
+                        flat["meta/num_tasks"] = float(len(merged))
+                        eval_run.log(flat)
+                        eval_run.finish()
+                    else:
+                        # Fallback to legacy helper (respects env in hardened version)
+                        log_evaluation_to_wandb(tag, merged, args.wandb_project)
+                else:
+                    log_evaluation_to_wandb(tag, merged, args.wandb_project)
             if not args.disable_tensorboard:
                 log_evaluation_to_tensorboard(tag, merged, str(work_dir / "tb_logs"))
         except Exception as e:

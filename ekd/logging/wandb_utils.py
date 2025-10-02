@@ -394,19 +394,47 @@ def log_evaluation_results(logger: WandBLogger, model_tag: str, results: Dict[st
 
 # Standalone evaluation logging functions (for backward compatibility)
 def log_evaluation_to_wandb(tag: str, merged_metrics: Dict[str, Dict[str, float]], project: str) -> None:
-    """Log evaluation metrics to W&B."""
+    """Log evaluation metrics to W&B (backward-compatible helper).
+
+    This variant respects common env vars, uses a safe start method, and
+    flattens only numeric metrics. If W&B is unavailable or disabled via env,
+    it prints a diagnostic and returns.
+    """
     if not WANDB_AVAILABLE:
         print("W&B not available, skipping wandb logging")
         return
+    # Honor env-based disable/offline modes
+    offline = os.getenv("WANDB_MODE", "online") == "offline" or os.getenv("WANDB_DISABLED", "").lower() in ("true", "1")
+    if offline:
+        print("W&B disabled/offline in environment, skipping wandb logging")
+        return
     try:
-        wandb.init(project=project, name=f"eval-{tag}", reinit=True)
-        wandb_metrics = {}
+        settings = wandb.Settings(start_method=os.getenv("WANDB_START_METHOD", "thread"))
+        run = wandb.init(
+            project=os.getenv("WANDB_PROJECT", project),
+            entity=os.getenv("WANDB_ENTITY") or None,
+            name=f"eval-{tag}",
+            group=os.getenv("WANDB_GROUP"),
+            notes=os.getenv("WANDB_NOTES"),
+            resume=os.getenv("WANDB_RESUME", "allow"),
+            id=os.getenv("WANDB_RUN_ID"),
+            settings=settings,
+            reinit=True,
+        )
+        flat: Dict[str, float] = {}
         for task, metrics in merged_metrics.items():
+            if not isinstance(metrics, dict):
+                continue
             for metric, val in metrics.items():
-                wandb_metrics[f"{task}/{metric}"] = val
-        wandb.log(wandb_metrics)
-        wandb.finish()
-        print(f"✓ Logged {len(wandb_metrics)} metrics to W&B project '{project}'")
+                if isinstance(val, (int, float)):
+                    try:
+                        flat[f"{task}/{metric}"] = float(val)
+                    except Exception:
+                        continue
+        if flat:
+            run.log(flat)
+        run.finish()
+        print(f"✓ Logged {len(flat)} metrics to W&B project '{run.project}'")
     except Exception as e:
         print(f"Failed to log to W&B: {e}")
 

@@ -254,7 +254,7 @@ unset PYTHONPATH PYTHONHOME
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
-  --datasets "fineweb" \
+  --datasets "${DATASETS:-fineweb}" \
   --fineweb_tokens "${FINEWEB_TOKENS:-1000000}" \
   --epochs "$EPOCHS" \
   --batch_size 1 \
@@ -269,6 +269,9 @@ unset PYTHONPATH PYTHONHOME
   $(if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then echo "--no_offline_cache --no_eliminate_softmax"; fi) \
   $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
   $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi) \
+  $(if [[ -n "${DATASET_CONFIG:-}" ]]; then echo "--dataset_config ${DATASET_CONFIG}"; fi) \
+  $(if [[ -n "${PROMPT_COL:-}" ]]; then echo "--prompt_col ${PROMPT_COL}"; fi) \
+  $(if [[ -n "${ANSWER_COL:-}" ]]; then echo "--answer_col ${ANSWER_COL}"; fi) \
   "${EXTRA_ARGS[@]}"
 
 END_TIME=$(date -u)

@@ -29,6 +29,10 @@ export XDG_CACHE_HOME="$TMPDIR/xdg_cache";          mkdir -p "$XDG_CACHE_HOME"
 export WANDB_CACHE_DIR="$TMPDIR/wandb_cache";       mkdir -p "$WANDB_CACHE_DIR"  
 export WANDB_DIR="$TMPDIR/wandb";                   mkdir -p "$WANDB_DIR"
 export EVALPLUS_TRUST_REMOTE_CODE=1
+# W&B defaults for online eval logging (override at submission if needed)
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_DISABLED=${WANDB_DISABLED:-false}
+export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
 
 # Optional tiny extras in LIGHT suite (BoolQ, HumanEval) -> set LIGHT_EXTRAS=1 to enable
 # export LIGHT_EXTRAS=1
@@ -71,6 +75,13 @@ echo "================================"
 $PY - <<'PY'
 import torch
 print("CUDA available:", torch.cuda.is_available(), "| torch", torch.__version__, "| cuda", getattr(torch.version, "cuda", None))
+try:
+  import wandb, os
+  print("wandb ok, version=", getattr(wandb, "__version__", "?"))
+  print("WANDB_MODE=", os.getenv("WANDB_MODE"))
+  print("WANDB_DISABLED=", os.getenv("WANDB_DISABLED"))
+except Exception as e:
+  print("wandb import failed:", e)
 PY
 
 # ---------- install/upgrade eval deps (idempotent) ----------
