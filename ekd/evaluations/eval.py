@@ -221,6 +221,8 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
             h.update(b)
     return h.hexdigest()
 
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> None:
     """Export a HF-ready directory from base weights + checkpoint.
        Skips work if kd_export_meta.json matches the checkpoint hash.
@@ -228,6 +230,8 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
     export_dir.mkdir(parents=True, exist_ok=True)
     meta_path = export_dir / "kd_export_meta.json"
     ckpt_hash = sha256_file(ckpt_path)
+
+    # Skip if unchanged
     if meta_path.exists():
         try:
             old = json.load(open(meta_path))
@@ -236,25 +240,56 @@ def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> N
                 return
         except Exception:
             pass
+
     print(f"Exporting model from base '{base_model_dir}' with state_dict '{ckpt_path.name}' -> '{export_dir}'")
+
+    # Always load tokenizer
     tok = AutoTokenizer.from_pretrained(base_model_dir, use_fast=False, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(base_model_dir, from_pretrained=torch.float16, device_map=None, trust_remote_code=True)
+
+    # ---- Try 8-bit first, then fallback ----
+    model = None
+    try:
+        print("[export] Trying 8-bit quantized load...", flush=True)
+        q8 = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_dir,
+            quantization_config=q8,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        for p in model.parameters():
+            p.requires_grad_(False)
+        print("[export] Loaded model in 8-bit.", flush=True)
+    except Exception as e:
+        print(f"[export] 8-bit load failed ({e}); falling back to float16.", flush=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_dir,
+            torch_dtype=torch.float16,
+            device_map=None,
+            trust_remote_code=True,
+        )
+
+    # ---- Load checkpoint weights ----
     chk = torch.load(ckpt_path, map_location="cpu")
     state = chk.get("model_state_dict")
     if state is None:
         raise ValueError(f"No 'model_state_dict' in {ckpt_path}")
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}")
-    model.save_pretrained(export_dir)
+
+    # ---- Save final HF export ----
+    model.save_pretrained(export_dir, safe_serialization=True)
     tok.save_pretrained(export_dir)
-    # If a run_params.json exists adjacent to the checkpoints directory, copy it for downstream registry linkage
+
+    # Copy run_params.json if present
     try:
-        # Typical layout: <output_dir>/checkpoints/<ckpt>.pt, so parent of parent is output_dir
         candidate = ckpt_path.parent.parent / "run_params.json"
         if candidate.exists():
             shutil.copy2(candidate, export_dir / "run_params.json")
     except Exception:
         pass
+
     meta = {
         "source_checkpoint": str(ckpt_path),
         "epoch": chk.get("epoch"),
@@ -1037,7 +1072,7 @@ def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
 def main():
     parser = argparse.ArgumentParser()
     # Single input: trained student model path (either HF dir or .pt checkpoint). We'll auto-detect.
-    parser.add_argument("model", type=str, help="Path to trained student model: HF directory (preferred) or a .pt checkpoint.")
+    parser.add_argument("model", type=str, help="Path to trained student model: HF directory (preferred) or a .pt checkpoint. If --from_hf is set, this may be a HF hub ID (e.g., 'Qwen/Qwen3-8B').")
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
@@ -1058,6 +1093,8 @@ def main():
     # Suite selection
     parser.add_argument("--suite", type=str, choices=["light", "heavy"], default="light",
                         help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
+    # Source override: treat positional model arg as HF hub ID
+    parser.add_argument("--from_hf", action="store_true", help="Interpret 'model' as a HF hub ID even if it is not a local path.")
     # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
 
@@ -1079,30 +1116,39 @@ def main():
     print(f"[gpu] Using GPUs: {gpu_pool}" if gpu_pool else "[gpu] No GPUs detected/selected.")
 
     # Resolve the single model dir to evaluate
-    in_path = Path(args.model)
-    tag = in_path.stem if in_path.is_file() else in_path.name
     model_specs: List[Tuple[str, Path]] = []
-    if in_path.is_dir():
-        print(f"[models] Using HF model directory: {in_path}")
-        model_specs.append((tag, in_path))
-    elif in_path.is_file() and in_path.suffix == ".pt":
-        # Export HF dir based on base_model_dir recorded in checkpoint
-        try:
-            chk = torch.load(in_path, map_location="cpu")
-        except Exception as e:
-            print(f"Error loading checkpoint {in_path}: {e}")
-            sys.exit(2)
-        base_model_dir = chk.get("base_model_dir") or chk.get("base_model") or chk.get("student_model")
-        if not base_model_dir:
-            print("Error: checkpoint does not record base_model_dir. Re-train with newer code or evaluate a ready HF model directory.")
-            sys.exit(2)
-        export_dir = exports_dir / f"export_{in_path.stem}"
-        print(f"[export] Exporting HF model from base='{base_model_dir}' and ckpt='{in_path.name}' -> '{export_dir}'")
-        export_hf_model(base_model_dir, in_path, export_dir)
-        model_specs.append((tag, export_dir))
+    # If explicitly flagged as HF hub, skip local checks and create a temp export alias
+    if args.from_hf:
+        hub_id = args.model
+        # Sanitize tag for filenames/logs
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", hub_id)
+        # Use a pseudo-path that downstream tools accept (lm-eval accepts hub ids directly via --model_args)
+        # For consistency with the rest of the pipeline that expects a Path, use the hub id as-is
+        model_specs.append((tag, Path(hub_id)))
     else:
-        print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
-        sys.exit(2)
+        in_path = Path(args.model)
+        tag = in_path.stem if in_path.is_file() else in_path.name
+        if in_path.is_dir():
+            print(f"[models] Using HF model directory: {in_path}")
+            model_specs.append((tag, in_path))
+        elif in_path.is_file() and in_path.suffix == ".pt":
+            # Export HF dir based on base_model_dir recorded in checkpoint
+            try:
+                chk = torch.load(in_path, map_location="cpu")
+            except Exception as e:
+                print(f"Error loading checkpoint {in_path}: {e}")
+                sys.exit(2)
+            base_model_dir = chk.get("base_model_dir") or chk.get("base_model") or chk.get("student_model")
+            if not base_model_dir:
+                print("Error: checkpoint does not record base_model_dir. Re-train with newer code or evaluate a ready HF model directory.")
+                sys.exit(2)
+            export_dir = exports_dir / f"export_{in_path.stem}"
+            print(f"[export] Exporting HF model from base='{base_model_dir}' and ckpt='{in_path.name}' -> '{export_dir}'")
+            export_hf_model(base_model_dir, in_path, export_dir)
+            model_specs.append((tag, export_dir))
+        else:
+            print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
+            sys.exit(2)
 
     if not model_specs:
         print("No models exported. Exiting.")

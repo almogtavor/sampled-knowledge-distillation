@@ -152,8 +152,9 @@ elif [[ "$MODE" == "run_all_10m" ]]; then
   export FINEWEB_TOKENS=10000000
 
   echo "[run_all_10m] Evaluating baselines (suite=$SUITE)"
-  sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE"
-  sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE"
+  # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
+  sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
+  sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_10m] Training runs (10M tokens each)"
   # 1) FullKD Qwen8B->0.6B on 10M tokens
