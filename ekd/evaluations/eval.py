@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 import importlib
 
 load_dotenv()
@@ -221,7 +221,6 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
             h.update(b)
     return h.hexdigest()
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 def export_hf_model(base_model_dir: str, ckpt_path: Path, export_dir: Path) -> None:
     """Export a HF-ready directory from base weights + checkpoint.
@@ -1042,7 +1041,8 @@ def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
 
     - Excludes keys ending with '_stderr'.
     - Excludes obvious count-like fields such as 'ece_n'.
-    - Returns per-metric averages and 'avg_all' over the per-task combined means.
+    - Returns per-metric averages and a specialized 'avg_all' defined as the mean across tasks of the primary metric:
+      prefer 'exact_match,none' if present for the task; otherwise use 'acc,none'.
     """
     metric_values: Dict[str, List[float]] = {}
     # Accumulate values per metric key across tasks
@@ -1057,15 +1057,27 @@ def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
             if not math.isfinite(float(mv)):
                 continue
             metric_values.setdefault(mk, []).append(float(mv))
-    # Compute simple means
+    # Compute simple means for all metrics (still useful to report)
     averages: Dict[str, float] = {}
     for mk, vals in metric_values.items():
         if vals:
             averages[f"avg_{mk}"] = sum(vals) / len(vals)
-    # Overall average across metric means (if any)
-    per_metric_means = [v for k, v in averages.items()]
-    if per_metric_means:
-        averages["avg_all"] = sum(per_metric_means) / len(per_metric_means)
+
+    # Compute the specialized avg_all: one score per task -> average
+    primary_per_task: List[float] = []
+    for task, task_metrics in merged.items():
+        if not isinstance(task_metrics, dict):
+            continue
+        # Prefer exact_match,none if available; otherwise use acc,none
+        val: Optional[float] = None
+        if isinstance(task_metrics.get("exact_match,none"), (int, float)):
+            val = float(task_metrics["exact_match,none"])
+        elif isinstance(task_metrics.get("acc,none"), (int, float)):
+            val = float(task_metrics["acc,none"])
+        if val is not None and math.isfinite(val):
+            primary_per_task.append(val)
+    if primary_per_task:
+        averages["avg_all"] = sum(primary_per_task) / len(primary_per_task)
     return averages
 
 # ---------- Main pipeline ----------
@@ -1118,6 +1130,8 @@ def main():
     # Resolve the single model dir to evaluate
     model_specs: List[Tuple[str, Path]] = []
     # If explicitly flagged as HF hub, skip local checks and create a temp export alias
+    tag = None
+    base_model_dir = None
     if args.from_hf:
         hub_id = args.model
         # Sanitize tag for filenames/logs
@@ -1125,6 +1139,7 @@ def main():
         # Use a pseudo-path that downstream tools accept (lm-eval accepts hub ids directly via --model_args)
         # For consistency with the rest of the pipeline that expects a Path, use the hub id as-is
         model_specs.append((tag, Path(hub_id)))
+        base_model_dir = hub_id
     else:
         in_path = Path(args.model)
         tag = in_path.stem if in_path.is_file() else in_path.name
@@ -1149,6 +1164,22 @@ def main():
         else:
             print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
             sys.exit(2)
+    if WandBLogger is not None:
+        eval_run = WandBLogger(
+            project=args.wandb_project,
+            entity=os.getenv("WANDB_ENTITY"),
+            name=f"eval-{tag}",
+            config={
+                "suite": args.suite,
+                "model": str(base_model_dir),
+            },
+            tags=["evaluation", args.suite],
+            group=os.getenv("WANDB_GROUP"),
+            job_type="eval",
+            notes=os.getenv("WANDB_NOTES"),
+            resume=os.getenv("WANDB_RESUME", "allow"),
+            run_id=os.getenv("WANDB_RUN_ID"),
+        )
 
     if not model_specs:
         print("No models exported. Exiting.")
@@ -1212,14 +1243,37 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
         averages = compute_averages(merged)
-        payload = {"tag": tag, "suite": args.suite, "results": merged, "averages": averages, "task_status": task_status}
+        # Assemble payload, including an explicit calibration summary (ECE) if available
+        per_task_ece = {}
+        for task, metrics in merged.items():
+            if isinstance(metrics, dict) and isinstance(metrics.get("ece"), (int, float)):
+                per_task_ece[task] = float(metrics["ece"])
+        calibration = {
+            "avg_ece": averages.get("avg_ece"),
+            "per_task_ece": per_task_ece,
+        }
+        payload = {
+            "tag": tag,
+            "suite": args.suite,
+            "results": merged,
+            "averages": averages,
+            "task_status": task_status,
+            "calibration": calibration,
+        }
         save_json(payload, json_result_file)
 
         # Upsert into unified registry keyed by params hash
         try:
             params_blob: Optional[Dict[str, Any]] = None
             if args.params_json and Path(args.params_json).exists():
-                params_blob = json.load(open(args.params_json))
+                with open(args.params_json, "r", encoding="utf-8") as f:
+                    params_candidate = json.load(f)
+                if isinstance(params_candidate, dict):
+                    params_blob = params_candidate.get("params") or params_candidate
+                    if isinstance(params_candidate.get("id"), str):
+                        params_hash = params_candidate["id"]
+                        upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status)
+                        raise StopIteration
             else:
                 # Preferred: run_params.json saved by training
                 rp = model_dir / "run_params.json"
@@ -1277,22 +1331,6 @@ def main():
             if not args.disable_wandb:
                 # Prefer robust WandBLogger if available
                 if WandBLogger is not None:
-                    eval_run = WandBLogger(
-                        project=args.wandb_project,
-                        entity=os.getenv("WANDB_ENTITY"),
-                        name=f"eval-{tag}",
-                        config={
-                            "suite": args.suite,
-                            "model": str(model_dir),
-                            "task_status": task_status,
-                        },
-                        tags=["evaluation", args.suite],
-                        group=os.getenv("WANDB_GROUP"),
-                        job_type="eval",
-                        notes=os.getenv("WANDB_NOTES"),
-                        resume=os.getenv("WANDB_RESUME", "allow"),
-                        run_id=os.getenv("WANDB_RUN_ID"),
-                    )
                     if getattr(eval_run, "enabled", False):
                         flat = {}
                         for task, metrics in merged.items():
