@@ -141,7 +141,7 @@ Our results show that token-selective KD achieve the best accuracy--efficiency P
 \begin{figure}[h!]
 	\centering
 	% \includegraphics[width=\linewidth]{rskd_grid_two_axis_blue.png}
-	\resizebox{\columnwidth}{!}{\input{../graphs/rskd_grid.pgf}}
+	\resizebox{\columnwidth}{!}{\input{../graphs/rskd_grid_two_axis_with_axes.pgf}}
 	\resizebox{\columnwidth}{!}{\input{../graphs/rskd_legend.pgf}}
 	\caption{Two-axis SampledKD: position-selective KD along the sequence axis (Y) and RS-KD over classes (X). Offline we cache $U$ class samples and an entropy proxy per position; online we select $K_{\text{pos}}$ positions and compute KD only over cached classes.}
 	\label{fig:two-axis}
