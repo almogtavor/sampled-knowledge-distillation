@@ -665,15 +665,15 @@ class Distiller:
             if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
             ent_raw = self._entropy_for_selection(input_ids, t_pred)
-            t_log_probs_T1 = torch.log_softmax(t_pred, dim=-1)
-            s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+            # Use the same temperature as KD for CE computation (consistency fix)
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
 
             targets = input_ids[:, 1:].to(self.student_device)
             targets = targets.masked_fill(~valid_next, 0)
             # Teacher/student CE and KL are the contextual features consumed by the bandit.
-            teacher_ce = (-t_log_probs_T1.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
-            student_ce = (-s_log_probs_T1.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+            # Use log_probs at temperature T (already computed) for consistency
+            teacher_ce = (-t_log_probs.to(self.student_device).gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
+            student_ce = (-s_log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)).detach()
 
             kd_terms, metrics = self.bandit_manager.select_tokens(
                 input_ids=input_ids,
@@ -856,8 +856,9 @@ class Distiller:
                     kd_pos_proxy_rows = -(probs_U * s_logp_on_U).sum(dim=1)     # [P]
 
                     y_rows = input_ids_s[batch_idx, pos_idx + 1]                # [P]
-                    z_y = s_rows.gather(1, y_rows.view(-1, 1)).squeeze(1) / T   # [P]
-                    z_M_ce = (z_M_all - (math.log(max(1, V)))) if M_neg > 0 else z_y.view(-1, 1)[:, :0]
+                    # CE should always be at T=1 (standard KD practice)
+                    z_y = s_rows.gather(1, y_rows.view(-1, 1)).squeeze(1)       # [P] (no temperature division)
+                    z_M_ce = z_M_all if M_neg > 0 else z_y.view(-1, 1)[:, :0]  # [P, M] (no log(V) correction needed for T=1)
                     z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1)         # [P, 1+M]
                     logZ_ce = torch.logsumexp(z_all, dim=1)                     # [P]
                     ce_pos_proxy_rows = -(z_y - logZ_ce)                        # [P]
@@ -1193,10 +1194,10 @@ class Distiller:
                 targets = input_ids_s[:, 1:]  # [B, L-1]
                 # In the new mode, CE is on ALL valid tokens (standard masking)
                 targets = targets.masked_fill(~valid_next, -100)
-                if s_log_probs is None:
-                    s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
-                V = s_log_probs.size(-1)
-                flat_log_probs = s_log_probs.reshape(-1, V)
+                # CE loss should always be at T=1 (standard practice in KD)
+                s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+                V = s_log_probs_T1.size(-1)
+                flat_log_probs = s_log_probs_T1.reshape(-1, V)
                 flat_targets = targets.reshape(-1)
                 ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
             total = (1.0 - self.config.alpha_ce) * kd_loss + self.config.alpha_ce * ce_loss

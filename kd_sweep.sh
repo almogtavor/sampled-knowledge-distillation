@@ -196,10 +196,6 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
   echo "[run_all_4m] All jobs submitted and completed in sequence."
-else
-  usage; exit 1
-fi
-  
 
 
 elif [[ "$MODE" == "run_sampledkd_4m" ]]; then
