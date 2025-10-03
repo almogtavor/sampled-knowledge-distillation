@@ -260,7 +260,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
 
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
   # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
-  # sbatch --wait evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
+  sbatch evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
   # sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_4m] Training runs (4M tokens each)"
@@ -279,6 +279,8 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   # 6) Token Selective KD Random k=25 Baseline
   sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm random 25 light "$KD_SWEEP_TAG"
 
+  sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
+
   # 7) SampledKD k=25 (top-k with cached elimination)
   sbatch train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
@@ -293,8 +295,8 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
 
   # # 12) SampledKD Trained also on GSM8K k=25 (GSM8K-only run)
   # # Note: train.slurm supports DATASETS / DATASET_CONFIG / PROMPT_COL / ANSWER_COL overrides
-  # sbatch --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
-  #   train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  sbatch --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
+    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 13) SampledKD LinUCB k=25
   sbatch train.slurm linucb 25 light "$KD_SWEEP_TAG"

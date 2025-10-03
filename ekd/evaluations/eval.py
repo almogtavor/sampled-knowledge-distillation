@@ -391,7 +391,7 @@ TASK_TIMEOUTS = {
     # light-ish baselines
     "arc_challenge": 6000,
     "arc_easy": 6000,
-    "gsm8k": 6000,
+    "gsm8k": 10000,
     "svamp": 6000,
     "aime25": 6000,
     "boolq": 600,
@@ -653,12 +653,15 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
     and computes top-1 ECE.
     """
     if not lmeval_dir or not lmeval_dir.exists():
+        print(f"[ECE] lmeval_dir does not exist: {lmeval_dir}")
         return {}
     # Gather all sample files
     sample_files = list(lmeval_dir.rglob("*.jsonl"))
+    print(f"[ECE] Found {len(sample_files)} .jsonl files in {lmeval_dir}")
     # Filter to the typical samples/ subdir first if present
     preferred = [p for p in sample_files if "samples" in p.as_posix().split("/")]
     files = preferred or sample_files
+    print(f"[ECE] Using {len(files)} sample files (preferred={len(preferred)})")
     per_task: Dict[str, Dict[str, float]] = {}
 
     def _normalize_task_from_filename(stem: str) -> str:
@@ -701,6 +704,9 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
                 ece = compute_ece(confidences, correctness, n_bins=bins)
                 per_task.setdefault(task_name, {})["ece"] = float(ece)
                 per_task[task_name]["ece_n"] = float(len(confidences))
+                print(f"[ECE] {task_name}: ECE={ece:.4f} (n={len(confidences)})")
+            else:
+                print(f"[ECE] {task_name}: Skipped (only {len(confidences)} MC samples, need >=10)")
         except Exception as e:
             print(f"Failed to compute ECE from {p}: {e}")
     return per_task
@@ -1281,15 +1287,54 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
         averages = compute_averages(merged)
-        # Assemble payload, including an explicit calibration summary (ECE) if available
+        # Assemble payload, including calibration (ECE) and perplexity summaries
         per_task_ece = {}
+        ece_values = []
+        per_task_perplexity = {}
+        perplexity_values = []
+        
         for task, metrics in merged.items():
-            if isinstance(metrics, dict) and isinstance(metrics.get("ece"), (int, float)):
-                per_task_ece[task] = float(metrics["ece"])
+            if isinstance(metrics, dict):
+                # Collect ECE
+                if isinstance(metrics.get("ece"), (int, float)):
+                    ece_val = float(metrics["ece"])
+                    per_task_ece[task] = ece_val
+                    ece_values.append(ece_val)
+                # Collect perplexity (check common variants)
+                for ppl_key in ("perplexity,none", "perplexity", "word_perplexity,none", "byte_perplexity,none"):
+                    if isinstance(metrics.get(ppl_key), (int, float)):
+                        ppl_val = float(metrics[ppl_key])
+                        per_task_perplexity[task] = ppl_val
+                        perplexity_values.append(ppl_val)
+                        break  # Only take first perplexity metric found
+        
+        # Compute average ECE across tasks (prefer computed avg_ece from averages, fallback to manual)
+        avg_ece_val = averages.get("avg_ece")
+        if avg_ece_val is None and ece_values:
+            avg_ece_val = sum(ece_values) / len(ece_values)
+        
+        # Compute average perplexity (prefer from averages, fallback to manual)
+        avg_ppl_val = averages.get("avg_perplexity,none") or averages.get("avg_perplexity")
+        if avg_ppl_val is None and perplexity_values:
+            avg_ppl_val = sum(perplexity_values) / len(perplexity_values)
+        
         calibration = {
-            "avg_ece": averages.get("avg_ece"),
+            "avg_ece": avg_ece_val,
             "per_task_ece": per_task_ece,
+            "avg_perplexity": avg_ppl_val,
+            "per_task_perplexity": per_task_perplexity,
         }
+        
+        # Log summaries if available
+        if avg_ece_val is not None:
+            print(f"\n[ECE Summary] Average ECE across {len(ece_values)} tasks: {avg_ece_val:.4f}")
+            for task, ece in per_task_ece.items():
+                print(f"  {task}: {ece:.4f}")
+        
+        if avg_ppl_val is not None:
+            print(f"\n[Perplexity Summary] Average perplexity across {len(perplexity_values)} tasks: {avg_ppl_val:.2f}")
+            for task, ppl in per_task_perplexity.items():
+                print(f"  {task}: {ppl:.2f}")
         timings = {
             "lm_eval_total_sec": lmeval_wall,
             "lm_eval_task_sec": task_durations,

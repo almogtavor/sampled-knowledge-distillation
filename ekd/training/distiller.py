@@ -482,7 +482,9 @@ class Distiller:
                     prefilter_mask[prefilter_idx] = True
                     
                     # Gather only prefiltered rows for KL computation
-                    t_rows_pre = t_log_probs[i, prefilter_idx, :].to(self.student_device)  # [k_pre, V]
+                    # Ensure indices are on the same device as teacher log-probs
+                    pre_idx_t = prefilter_idx.to(t_log_probs.device)
+                    t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_pre, V]
                     s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
                     kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
                     
@@ -566,7 +568,12 @@ class Distiller:
                 kd_loss = t_pred.sum() * 0.0
             else:
                 b_idx, t_idx = rows[:, 0], rows[:, 1]
-                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                # Teacher gather requires indices on the teacher tensor's device
+                device_t = t_log_probs.device
+                b_idx_t = b_idx.to(device_t)
+                t_idx_t = t_idx.to(device_t)
+                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
+                # Student tensors live on student device; indices are already there
                 s_rows = s_log_probs[b_idx, t_idx, :]
                 kd_loss = self._kl_loss(t_rows, s_rows).mean()
             
@@ -609,7 +616,8 @@ class Distiller:
                     prefilter_idx = valid_idx[prefilter_mask_rel]  # Absolute indices in bucket
                     
                     # Stage 2: Compute KL/CE only on bucket positions (efficient!)
-                    t_rows_pre = t_log_probs[i, prefilter_idx, :].to(self.student_device)  # [k_bucket, V]
+                    pre_idx_t = prefilter_idx.to(t_log_probs.device)
+                    t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_bucket, V]
                     s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_bucket, V]
                     kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_bucket]
                     
@@ -661,7 +669,10 @@ class Distiller:
                 kd_loss = t_pred.sum() * 0.0
             else:
                 b_idx, t_idx = rows[:, 0], rows[:, 1]
-                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                device_t = t_log_probs.device
+                b_idx_t = b_idx.to(device_t)
+                t_idx_t = t_idx.to(device_t)
+                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 s_rows = s_log_probs[b_idx, t_idx, :]
                 kd_loss = self._kl_loss(t_rows, s_rows).mean()
         elif self.config.distill_type == "random":
@@ -712,7 +723,10 @@ class Distiller:
                 kd_loss = t_pred.sum() * 0.0
             else:
                 b_idx, t_idx = rows[:, 0], rows[:, 1]
-                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                device_t = t_log_probs.device
+                b_idx_t = b_idx.to(device_t)
+                t_idx_t = t_idx.to(device_t)
+                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 s_rows = s_log_probs[b_idx, t_idx, :]
                 kd_loss = self._kl_loss(t_rows, s_rows).mean()
         elif self.config.distill_type == "pos-rs-kd":
@@ -784,8 +798,10 @@ class Distiller:
                 b_indices = torch.tensor([p[0] for p in selected_positions], dtype=torch.long, device=self.student_device)
                 t_indices = torch.tensor([p[1] for p in selected_positions], dtype=torch.long, device=self.student_device)
                 weights = torch.tensor([p[2] for p in selected_positions], dtype=torch.float32, device=self.student_device)
-                
-                t_rows = t_log_probs[b_indices, t_indices, :].to(self.student_device)
+                # Move indices to teacher device for gather
+                b_idx_t = b_indices.to(t_log_probs.device)
+                t_idx_t = t_indices.to(t_log_probs.device)
+                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 s_rows = s_log_probs[b_indices, t_indices, :]
                 kl_per_pos = self._kl_loss(t_rows, s_rows)  # [P]
                 # Global normalization across ALL selected tokens → weighted per-token batch mean
