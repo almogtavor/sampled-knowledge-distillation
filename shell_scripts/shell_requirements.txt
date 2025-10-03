@@ -1,0 +1,58 @@
+# Use PyPI as primary; add PyTorch CUDA 12.1 (H100/H200 safe)
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core EKD deps (pin to what's already working in your env)
+torch==2.2.2+cu121
+transformers==4.56.2
+python-dotenv==1.1.1
+accelerate==1.10.1
+bitsandbytes==0.43.3
+sentencepiece==0.2.1
+rich==14.1.0
+tiktoken==0.11.0
+ollama==0.5.4
+qwen==0.1.1
+pydantic==2.11.9
+numpy<2
+hf_transfer==0.1.9
+tensorboard==2.20.0
+wandb==0.22.0
+
+# HF stacks
+datasets==3.6.0
+evaluate==0.4.5
+
+# For the evaluation runs
+tqdm==4.67.1
+pandas==2.3.2
+
+# ---- Eval harnesses (pins; avoid resolver backtracking) ----
+lm-eval==0.4.9.1
+langdetect==1.0.9
+
+lighteval==0.10.0
+rouge-score==0.1.2
+evalplus==0.3.1
+alpaca-eval==0.6.6
+
+# ---- Optional safety (script skips if missing env/configs)
+#jailbreakbench==1.0.0
+litellm==1.77.1
+PyYAML>=6.0.1
+
+# ---- Torch companions for CUDA 12.1
+torchvision==0.17.2+cu121
+torchaudio==2.2.2+cu121
+
+# ---- HF datasets QoL
+pyarrow==18.1.0
+scikit-learn==1.5.2
+sympy==1.13.3
+numexpr==2.12.1
+
+# NOTE: intentionally NOT installing latex2sympy2 to avoid resolver thrash.
+# lighteval brings latex2sympy2_extended itself.
+
+# (optional for Hopper FP8 speedups)
+# transformer-engine

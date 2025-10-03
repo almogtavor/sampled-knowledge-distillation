@@ -171,7 +171,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
 
   echo "[run_all_4m] Training runs (4M tokens each)"
   # 1) FullKD Qwen8B->0.6B on 4M tokens Basline
-  sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
+  # sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
 
   # 2) Token Selective KD k=25
   sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
@@ -189,7 +189,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   sbatch train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 8) SampledKD k=25 with softmax (no cache/no elim)
-  sbatch train.slurm entropy-top-k-with-softmax 25 light "$KD_SWEEP_TAG"
+  sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 9) SampledKD k=75
   sbatch train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
