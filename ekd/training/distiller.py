@@ -1229,10 +1229,9 @@ class Distiller:
                                 valid_idx_i = torch.where(mask_i)[0]
                                 abs_sel = valid_idx_i[rel_sel]
 
-                                # Compute importance weights and store in mask
+                                # Compute importance weights (unnormalized) and store in mask
                                 q_sel = q[rel_sel]
                                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
-                                w = w / w.sum()
                                 weight_mask[i, abs_sel] = w
 
                             # Apply weighted mask to KD loss
