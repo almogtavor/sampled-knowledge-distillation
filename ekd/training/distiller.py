@@ -749,7 +749,7 @@ class Distiller:
                 else:
                     base = ent_raw[i][valid_next_i].float()
 
-                base = torch.clamp(base, min=1e-8)
+                base = torch.clamp(base, min=1e-8)  # H_t ≥ 0 already
                 if alpha == 0.0:
                     q_un = torch.ones_like(base)
                 else:

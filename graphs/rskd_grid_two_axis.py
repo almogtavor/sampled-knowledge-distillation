@@ -71,12 +71,12 @@ for r, row in enumerate(y_labels):
         in_sel = (col in select_map[row])
         in_ours = (row in two_axis_rows) and in_sel
         color = "white" if in_ours else ("black" if in_sel else num_dim)
-        ax.text(c+0.5, r+0.5, f"{val:+.2f}", ha="center", va="center", fontsize=10.5, color=color)
+        ax.text(c+0.5, r+0.5, f"{val:+.2f}", ha="center", va="center", fontsize=12, color=color)
 
 ax.set_xlim(0, C); ax.set_ylim(R, 0)
 ax.set_xticks([i+0.5 for i in range(C)]); ax.set_yticks([i+0.5 for i in range(R)])
-ax.set_xticklabels(x_labels, fontsize=11)
-ax.set_yticklabels(y_labels, fontsize=11)
+ax.set_xticklabels(x_labels, fontsize=12)
+ax.set_yticklabels(y_labels, fontsize=12)
 
 ax.set_aspect("equal")
 ax.tick_params(length=0)
@@ -88,18 +88,20 @@ legend_elements = [
     Patch(facecolor=strong_blue, edgecolor="black", label="Ours (2-axis RS-KD)"),
     Patch(facecolor=reg_gray_bg, edgecolor="black", label="Regular Distillation"),
 ]
-ax.legend(handles=legend_elements, loc="upper right", frameon=True)
+# ax.legend(handles=legend_elements, loc="upper right", frameon=True)
 
 png_path = "rskd_grid_two_axis_blue.png"
-plt.tight_layout(pad=0.45)
-plt.savefig(png_path, dpi=400, bbox_inches="tight", pad_inches=0.1)
+plt.tight_layout()
+plt.savefig(png_path, dpi=400, bbox_inches="tight", pad_inches=0)
+plt.savefig('rskd_grid_two_axis.pgf', bbox_inches="tight", pad_inches=0)
 
-ax.text(0.5, -0.08, "Logits of Probable Next-Token Predictions",
-        transform=ax.transAxes, ha="center", va="top", fontsize=10, color="#333333")
-ax.text(-0.20, 0.5, "Ground Truth Text Tokens",
-        transform=ax.transAxes, ha="right", va="center", rotation=90, fontsize=10, color="#333333", clip_on=False)
+ax.text(0.5, -0.05, "Logits of Probable Next-Token Predictions",
+        transform=ax.transAxes, ha="center", va="top", fontsize=12, color="#333333")
+ax.text(-0.15, 0.5, "Ground Truth Text Tokens",
+        transform=ax.transAxes, ha="right", va="center", rotation=90, fontsize=12, color="#333333", clip_on=False)
 png_path = "rskd_grid_two_axis_blue_with_axes.png"
 plt.tight_layout(pad=0.45)
-plt.savefig(png_path, dpi=400, bbox_inches="tight", pad_inches=0.1)
+plt.savefig(png_path, dpi=400, bbox_inches="tight", pad_inches=0)
+plt.savefig('rskd_grid_two_axis_with_axes.pgf', bbox_inches="tight", pad_inches=0)
 
 plt.close()
