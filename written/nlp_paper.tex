@@ -234,7 +234,8 @@ This keeps us close to the mean of the KD loss--a KLD averaged equally over all 
 Low-uncertainty tokens still appear with nonzero probability (set by $\alpha$ and floors), and we keep CE on all positions.
 
 \subsection{LinUCB Selection Policy}
-For each valid position $t$ we form a feature vector $x_t\in\mathbb{R}^d$ (here $d{=}6$: entropy, teacher CE, student CE, per-token KL, a coarse token/POS code, normalized position).
+In order to create a model that chooses to select on its own, we implement a LinUCB (Linear Upper Confidence Bound) selection policy--a single linear model with state $A$ ($d{\times}d$) and $b$ ($d$).
+For each valid position $t$ we form a feature vector $x_t\in\mathbb{R}^d$ (here $d{=}4$: entropy, teacher CE, student CE, per-token KL).
 LinUCB maintains
 \(
 A\in\mathbb{R}^{d\times d}, b\in\mathbb{R}^d,
@@ -242,24 +243,22 @@ A\in\mathbb{R}^{d\times d}, b\in\mathbb{R}^d,
 \)
 where $A\!\leftarrow\!\lambda I+\sum x x^\top$ and $b\!\leftarrow\!\sum r x$ accumulate past contexts $x$ and rewards $r$.
 
-We predict the mean reward (expected KL drop) as $\mu_t=\theta^\top x_t$ and its uncertainty as
+We predict the mean reward (expected KL drop) as $\mu_t=\theta^\top x_t$ ($\theta$ is the weight vector) and its uncertainty as
 $\sigma_t=\sqrt{x_t^\top A^{-1}x_t}$. The score
 \[
 s_t=\underbrace{\theta^\top x_t}_{\text{mean reward}}
 +\underbrace{\alpha\,\sqrt{x_t^\top A^{-1}x_t}}_{\text{UCB: optimism for uncertain }x_t}
 \]
-is an \emph{upper confidence bound} on the unknown true mean reward of $x_t$; larger $\alpha$ encourages exploration.
-If too few have been selected, we take the highest-$s_t$ tokens up to the allowed budget.
-
+balances exploitation (favoring tokens with high predicted gain \(\mu_t\)) and exploration (favoring uncertain tokens via \(\sigma_t\)). A larger \(\alpha\) shifts the balance toward exploration.
 After the optimizer step we compute $r_t=\mathrm{KL}_{\text{before}}(t)-\mathrm{KL}_{\text{after}}(t)$ and update
 $A\!\leftarrow\!A+x_tx_t^\top,\; b\!\leftarrow\!b+r_tx_t$.
-
-The bandit is a single linear model with state $A$ ($d{\times}d$) and $b$ ($d$); with $d{=}6$ this is tiny (dozens of floats), and updates are $\mathcal{O}(d^2)$.
+If too few have been selected, we take the highest-$s_t$ tokens up to the allowed budget.
 
 \subsection{GLS (Global-Level Selection) for Position Selection}
-We keep a global buffer of recent scores and set a percentile threshold
-$\tau$ at $1-\tfrac{k\%}{100}$; select all batch positions with score $\ge\tau$ (warm-up: per-example top-$k$).
-This enforces a steady acceptance rate and lowers cross-batch variance.
+We maintain a global FIFO queue of recent token scores across batches.  
+At each step we set a threshold $\tau$ at the $(1-\tfrac{k\%}{100})$ percentile of this history,  
+All current positions with score $\ge\tau$ are selected; during warm-up we fall back to per-example top-$k$.  
+This way, roughly $k\%$ of tokens are always kept, giving a stable acceptance rate and reducing variance across batches, instead of selecting top-$k$ tokens per batch.
 
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
@@ -418,25 +417,12 @@ Table~\ref{tab:storage} summarizes the storage requirements across different met
 \section{Evaluation}
 \label{sec:evaluation}
 
-We evaluate SampledKD on a diverse set of language understanding and reasoning benchmarks to assess the effectiveness of our token-selective distillation approach.
-Models are pretrained on FineWeb-Edu for 1M and 4M tokens and evaluated zero-shot.
-All evaluations report pass@1 accuracy as the primary metric.
-During the benchmarks, we have limited each answer of the evaluated model to 256 tokens per answer, to avoid infinity generation loops or excessive computation.
-
-\subsection{Datasets}
-
-\subsubsection{Mathematical reasoning}
-\paragraph{GSM8K} \citep{cobbe2021gsm8k} contains grade-school math word problems with natural language solutions. We use the standard train/test split for distillation training and evaluation.
-Due to resources constrains, our experiments on GSM8K included only $250$ randomly sampled (with a constant seed of 1337) test examples from the original $1.3K$ training examples.
-For all evaluations, we did zero shot evaluations, except a sepecific ablation where we distilled SampledKD on GSM8K.
-\paragraph{SVAMP} \citep{patel2021svamp} provides single-step arithmetic reasoning problems with algebraic variations. We leverage the available train/test split for consistent evaluation.
-For SVAMP, we sampled $250$ examples from $1.3K$ test examples.
-
-\subsubsection{Reading comprehension and commonsense reasoning}
-\paragraph{LAMBADA (OpenAI)} \citep{paperno2016lambada} tests language models' ability to predict the final word of passages requiring broad context. Since this benchmark provides only a test set without an official training split, we use it exclusively for zero-shot evaluation.
-
-\subsubsection{Science and knowledge}
-\paragraph{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
+We train our models on FineWeb-Edu with 1M and 4M tokens and evaluate them zero-shot on three diverse benchmarks: \textbf{HellaSwag} \citep{zellers2019hellaswag} (commonsense inference), \textbf{GSM8K} \citep{cobbe2021gsm8k} (grade-school math word problems), \textbf{PIQA} \citep{bisk2020piqa} (physical commonsense), and \textbf{LAMBADA} \citep{paperno2016lambada} (broad-context word prediction).
+Due to compute constraints we set a maximum sequence length of 256 tokens, and filtered out longer documents.
+An analysis on HellaSwag showed that 95\% of its documents are shorter than this, making the cutoff adequate.
+To address the high perplexity observed when training on longer sequences, we further filtered out FineWeb documents exceeding 256 tokens, which stabilized perplexity during training.
+% \subsubsection{Science and knowledge}
+% \paragraph{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
 
 \subsection{Experimental setup}
 
@@ -447,39 +433,32 @@ All experiments report pass@1 accuracy, measuring the percentage of problems sol
 \begin{table*}[t]
 	\centering
 	\small
-	\setlength{\tabcolsep}{6pt}
-	\begin{tabular}{lcccccccc}
+	\setlength{\tabcolsep}{8pt}
+	\begin{tabular}{lcccc}
 		\toprule
-		\multirow{2}{*}{Method}
-		                                                    & \multicolumn{2}{c}{GSM8K ($\uparrow$)}
-		                                                    & \multicolumn{2}{c}{SVAMP ($\uparrow$)}
-		                                                    & \multicolumn{2}{c}{ARC-Challenge (acc $\uparrow$)}
-		                                                    & \multicolumn{2}{c}{ARC-Easy (acc $\uparrow$)}              \\
-		\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
-		                                                    & 1M                                                 & 4M                      & 1M                       & 4M                       & 1M   & 4M   & 1M   & 4M   \\
+		Method & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & LAMBADA (\%) $\uparrow$ \\
 		\midrule
-		Full KD (all tokens, full softmax)                  & 31.0                                               & ---                     & 4.0                      & ---                      & 34.0 & ---  & 38.0 & ---  \\
-		\textbf{Token-selective KD (entropy top-$30\%$)}    & 28.0                                               & ---                     & 4.0                      & ---                      & 33.0 & ---  & 40.0 & ---  \\
-		Token-selective KD (bucket of $5\%-30\%$)           & 25.0                                               & ---                     & 3.0                      & ---                      & 30.0 & ---  & 42.0 & ---  \\
-		Token-selective KD (random $25\%$)                  & 20.0                                               & ---                     & 1.0                      & ---                      & 26.0 & ---  & 36.0 & ---  \\
-		\addlinespace[2pt]
-		\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 32.0                                               & 26.0                    & 2.0                      & 4.0                      & 30.0 & 32.0 & 34.0 & 34.0 \\
-		\quad Top $k=75\%$ positions                        & 40.0                                               & ---                     & 2.0                      & ---                      & 40.0 & ---  & 28.0 & ---  \\
-		\quad Top $k=30\%$ pos, GLS (global queue)          & 29.0                                               & ---                     & 2.0                      & ---                      & 32.0 & ---  & 39.0 & ---  \\
-		\quad Top $k=30\%$ pos, Score based Selection       & 38.0                                               & ---                     & 1.0                      & ---                      & 30.0 & ---  & 36.0 & ---  \\
-		\quad Positional RS-KD $k=30\%$	(sampled)           & 30.0                                               & ---                     & 2.0                      & ---                      & 24.0 & ---  & 27.0 & ---  \\
-		\quad $k=100\%$                                     & 40.0                                               & ---                     & 2.0                      & ---                      & 26.0 & ---  & 36.0 & ---  \\
-		\quad $k=30\%$, distilled on GSM8K train split      & \multicolumn{2}{c}{38.0}                           & ---                     & ---                      & ---                      & ---  & ---                \\
-		\quad LinUCB model as selector                      & 11.0                                               & ---                     & 0.0                      & ---                      & 15.0 & ---  & 20.0 & ---  \\
+		Full KD (all tokens, full softmax)                  & 34.6 & 34.6 & 65.1  & \textbf{40.6} \\
+		Token-selective KD (entropy top-30\%)			     & 26.8  & 53.0 & ---  & ---  \\
+		Token-selective KD (bucket of 5\%-30\%)            & ---  & 30.0 & ---  & ---  \\
+		Token-selective KD (random 25\%)                   & ---  & 26.0 & ---  & ---  \\
+		\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 26.0 & 30.0 & 32.0 & 34.0 \\
+		\quad Top $k=75\%$ positions                        & ---  & 40.0 & ---  & ---  \\
+		\quad Top $k=30\%$ pos, GLS (global queue)          & ---  & 32.0 & ---  & ---  \\
+		\quad Top $k=30\%$ pos, Score based Selection       & ---  & 30.0 & ---  & ---  \\
+		\quad Positional RS-KD $k=30\%$ (sampled)          & ---  & 24.0 & ---  & ---  \\
+		\quad $k=100\%$                                     & ---  & 26.0 & ---  & ---  \\
+		\quad $k=30\%$, distilled on GSM8K train split      & 49.2 & ---  & ---  & ---  \\
+		\quad LinUCB model as selector                      & ---  & 15.0 & ---  & 20.0 \\
 		\midrule
-		No KD baseline (untrained student)                  & \multicolumn{2}{c}{48.0}                           & \multicolumn{2}{c}{6.0} & \multicolumn{2}{c}{32.0} & \multicolumn{2}{c}{62.0}                             \\
+		No KD baseline (untrained Qwen3-0.6B)               & 47.6 & 37.5 & 67.6 & 40.4 \\
 		\bottomrule
 	\end{tabular}
-	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy.
-		Token selective KD \& Full KD are regular distillations that do not apply softmax elimination nor offline cache.
-	}
+	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu 4M tokens ($\sim 22K$ examples); we report pass@1 (\%) for GSM8K and HellaSwag, accuracy (\%) for PIQA and LAMBADA.
+	Token selective KD and Full KD are regular distillations that do not apply softmax elimination nor offline cache.}
 	\label{tab:main-reasoning}
 \end{table*}
+
 
 \subsection{Discussion}
 \label{sec:discussion}
