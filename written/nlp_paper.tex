@@ -166,7 +166,16 @@ Only the packed samples and scalar $H_t$ are stored (no full logits).
 \subsection{Online stage (student, many epochs)}
 At each update we (i) select a subset $S$ of token positions, then (ii) compute a sampled KD loss (with optional softmax elimination) and combine it with CE.
 
-\subsubsection{Position-selection policies}
+\section{Positions Selection Policies}
+The KD objective for an autoregressive step is a mean over positions:
+\[
+	\mathcal{L}_{\text{KD}} \;=\; \frac{1}{N_{\text{pos}}} \sum_{t=1}^{N_{\text{pos}}}
+	\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+\]
+where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
+Full KD evaluates all positions; we instead sample positions using a proposal
+$q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
+
 We evaluate five policies per sequence (uniform random is a baseline):
 \begin{enumerate}
 	\item \textbf{Top-$k$ positions.} Select the top $K_{\text{pos}}$ positions by entropy.
@@ -201,22 +210,8 @@ For each selected position $t$:
 \end{enumerate}
 KD uses a sampled objective and CE uses a sampled-softmax proxy; by default CE is computed over all valid tokens.
 
-
 \subsection{Complexity}
 Compute scales as $\mathcal{O}(K_{\text{pos}}K_{\text{voc}})$ per sequence; storage is $\approx 3U + 1$ bytes per valid position (IDs+q7 plus 1-byte $\hat H$).
-
-\section{"Fork" Tokens Selection Variants}
-\subsection{Position-Selective Distillation (RS-KD over Positions)}
-\label{sec:posrs}
-
-The KD objective for an autoregressive step is a mean over positions:
-\[
-	\mathcal{L}_{\text{KD}} \;=\; \frac{1}{N_{\text{pos}}} \sum_{t=1}^{N_{\text{pos}}}
-	\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
-\]
-where $p_t$ and $s_t$ are teacher and student class distributions at position $t$.
-Full KD evaluates all positions; we instead sample positions using a proposal
-$q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
 
 \subsection{Positional RS-KD Selection Policy}
 RS-KD is a method suggested in order to mitigate the bias issues of top-k logit methods, using a sampling strategy that will not overweight low certainty positions. Orthogonally, we implement Positional RS-KD, in order to overcome bias in positional top-k selection. We sample $K_{\text{pos}}$ distinct positions per sequence by uncertainty. Let $H_t$ be the per-token entropy/ score and define a per-position probability:
@@ -238,13 +233,41 @@ $w_t \propto 1/\max(q_{\text{pos}}(t),q_{\min})$ with $\sum_{t\in S} w_t=1$ ($q_
 This keeps us close to the mean of the KD loss--a KLD averaged equally over all valid positions, while avoiding repeats and therefore reducing the estimator's variance.
 Low-uncertainty tokens still appear with nonzero probability (set by $\alpha$ and floors), and we keep CE on all positions.
 
+\subsection{LinUCB Selection Policy}
+For each valid position $t$ we form a feature vector $x_t\in\mathbb{R}^d$ (here $d{=}6$: entropy, teacher CE, student CE, per-token KL, a coarse token/POS code, normalized position).
+LinUCB maintains
+\(
+A\in\mathbb{R}^{d\times d}, b\in\mathbb{R}^d,
+\theta=A^{-1}b,
+\)
+where $A\!\leftarrow\!\lambda I+\sum x x^\top$ and $b\!\leftarrow\!\sum r x$ accumulate past contexts $x$ and rewards $r$.
+
+We predict the mean reward (expected KL drop) as $\mu_t=\theta^\top x_t$ and its uncertainty as
+$\sigma_t=\sqrt{x_t^\top A^{-1}x_t}$. The score
+\[
+s_t=\underbrace{\theta^\top x_t}_{\text{mean reward}}
++\underbrace{\alpha\,\sqrt{x_t^\top A^{-1}x_t}}_{\text{UCB: optimism for uncertain }x_t}
+\]
+is an \emph{upper confidence bound} on the unknown true mean reward of $x_t$; larger $\alpha$ encourages exploration.
+If too few have been selected, we take the highest-$s_t$ tokens up to the allowed budget.
+
+After the optimizer step we compute $r_t=\mathrm{KL}_{\text{before}}(t)-\mathrm{KL}_{\text{after}}(t)$ and update
+$A\!\leftarrow\!A+x_tx_t^\top,\; b\!\leftarrow\!b+r_tx_t$.
+
+The bandit is a single linear model with state $A$ ($d{\times}d$) and $b$ ($d$); with $d{=}6$ this is tiny (dozens of floats), and updates are $\mathcal{O}(d^2)$.
+
+\subsection{GLS (Global-Level Selection) for Position Selection}
+We keep a global buffer of recent scores and set a percentile threshold
+$\tau$ at $1-\tfrac{k\%}{100}$; select all batch positions with score $\ge\tau$ (warm-up: per-example top-$k$).
+This enforces a steady acceptance rate and lowers cross-batch variance.
+
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
 In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
 With this change---and after batching across all valid positions with shared negatives---we improved throughput from ${\sim}2.4\text{s}/\text{step}$ to ${\sim}0.77\text{s}/\text{step}$ ($\approx3\times$ faster) on the same setup.
 It is important to mention a high degradation in perplexity, dependent on hyperparameter settings.
 
-\subsection{Student KD (importance-corrected sampled softmax)}
+\subsection{Importance-Corrected Sampled Softmax)}
 \label{sec:sampled_softmax}
 We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
 At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
@@ -415,12 +438,7 @@ For SVAMP, we sampled $250$ examples from $1.3K$ test examples.
 \subsubsection{Science and knowledge}
 \paragraph{ARC-Challenge and ARC-Easy} \citep{clark2018arc} test science question answering at middle-school level, with Challenge focusing on questions requiring reasoning and Easy covering direct retrieval. Both use train/dev/test splits.
 
-\subsubsection{Competition-level benchmarks}
-\paragraph{AIME'25} evaluates mathematical reasoning on problems from the American Invitational Mathematics Examination.
-
 \subsection{Experimental setup}
-
-For benchmarks with available training splits (GSM8K, SVAMP, ARC-Challenge, ARC-Easy, HellaSwag, PIQA), we apply SampledKD during student training and evaluate on the respective test sets. For evaluation-only benchmarks (LAMBADA, AIME'25, IFEval), we assess the distilled models in a zero-shot setting to measure knowledge transfer effectiveness.
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
 
