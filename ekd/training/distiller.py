@@ -671,7 +671,7 @@ class Distiller:
                 else:
                     base = ent_raw[i][valid_next_i].float()
 
-                base = torch.clamp(base - base.min(), min=1e-8)  # strictly positive
+                base = torch.clamp(base, min=1e-8)  # H_t ≥ 0 already
                 if alpha == 0.0:
                     q_un = torch.ones_like(base)
                 else:
@@ -1127,8 +1127,7 @@ class Distiller:
                                 else:
                                     ent_i = self._entropy_for_selection(input_ids, t_pred=None)[i]
                                     base = ent_i[mask_i].float()
-
-                                base = torch.clamp(base - base.min(), min=1e-8)
+                                base = torch.clamp(base, min=1e-8)
                                 q_un = torch.ones_like(base) if alpha == 0.0 else base.pow(alpha)
                                 if q_un.sum() <= 0:
                                     q = torch.full_like(q_un, 1.0 / q_un.numel())

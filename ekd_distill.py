@@ -190,45 +190,21 @@ def load_teacher_with_fallback(
 
 def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
     """
-    Stream FineWeb-Edu and take ~max_tokens worth of text, reproducibly.
-    Filters out documents that exceed max_seq_len tokens.
+    Load FineWeb-Edu subset with automatic caching.
+    First run: streams, filters, and caches to disk.
+    Subsequent runs: loads from cache instantly.
+    
     Returns a list of {prompt, answer} examples.
     """
-    print(f"[fineweb] Streaming HuggingFaceFW/fineweb-edu with token budget={max_tokens:,}, seed={seed}")
-    print(f"[fineweb] Filtering docs to max_seq_len={max_seq_len} tokens")
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
-
-    # Shuffle with fixed seed for reproducibility (uses a buffer)
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
-
-    total_tokens = 0
-    examples = []
-    docs_seen = 0
-    docs_filtered = 0
+    from ekd.data.cache import load_or_create_fineweb_cache
     
-    for ex in ds:
-        docs_seen += 1
-        txt = ex.get("text", None)
-        if not txt:
-            continue
-        # Tokenize with the same tokenizer used for training
-        ids = tokenizer(txt, add_special_tokens=False)["input_ids"]
-        n_tokens = len(ids)
-        
-        # Filter out documents that exceed max_seq_len
-        if n_tokens > max_seq_len:
-            docs_filtered += 1
-            continue
-        
-        if total_tokens + n_tokens > max_tokens:
-            break
-        examples.append({"prompt": txt, "answer": ""})
-        total_tokens += n_tokens
-
-    filter_pct = (docs_filtered / docs_seen * 100) if docs_seen > 0 else 0.0
-    print(f"[fineweb] Sampled {len(examples)} docs, {total_tokens:,} tokens")
-    print(f"[fineweb] Filtered {docs_filtered}/{docs_seen} docs ({filter_pct:.1f}%) exceeding {max_seq_len} tokens")
-    return examples
+    return load_or_create_fineweb_cache(
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        max_seq_len=max_seq_len,
+        seed=seed,
+        batch_size=512,
+    )
 
 
 def parse_args_to_config() -> TrainingConfig:
