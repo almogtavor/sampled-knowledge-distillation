@@ -1,4 +1,4 @@
-<img align="right" width="60%" height="50%" src="graphs/rskd_grid_two_axis_blue_with_axes.png">
+<img align="right" width="50%" height="50%" src="graphs/rskd_grid_two_axis_blue_with_axes.png">
 
 # SampledKD
 
