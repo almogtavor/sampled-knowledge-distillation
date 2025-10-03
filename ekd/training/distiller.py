@@ -769,12 +769,11 @@ class Distiller:
                 valid_idx = torch.where(valid_next_i)[0]
                 selected_abs = valid_idx[sel_rel]  # [k]
 
-                # Compute importance weights: w = 1/q, normalized
+                # Compute unnormalized importance weights: w = 1/q (global normalization later)
                 q_sel = q[sel_rel]  # [k]
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
-                w = w / w.sum()
                 
-                # Store (batch_idx, time_idx, weight)
+                # Store (batch_idx, time_idx, weight) with UNNORMALIZED weights
                 for j, pos in enumerate(selected_abs):
                     selected_positions.append((i, pos.item(), w[j].item()))
 
@@ -789,7 +788,9 @@ class Distiller:
                 t_rows = t_log_probs[b_indices, t_indices, :].to(self.student_device)
                 s_rows = s_log_probs[b_indices, t_indices, :]
                 kl_per_pos = self._kl_loss(t_rows, s_rows)  # [P]
-                kd_loss = (kl_per_pos * weights).sum()
+                # Global normalization across ALL selected tokens → weighted per-token batch mean
+                w_all = weights  # [P] (unnormalized)
+                kd_loss = (kl_per_pos * w_all).sum() / w_all.sum().clamp_min(1e-12)
         elif self.config.distill_type == "linucb":
             if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
@@ -1235,7 +1236,8 @@ class Distiller:
                                 weight_mask[i, abs_sel] = w
 
                             # Apply weighted mask to KD loss
-                            kd_loss = (kd_pos_proxy * weight_mask).sum()
+                            # Weighted per-token batch mean using proxy KD and importance weights
+                            kd_loss = (kd_pos_proxy * weight_mask).sum() / weight_mask.sum().clamp_min(1e-12)
 
                             # CE on ALL valid rows to match top-k-tok behavior
                             ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
