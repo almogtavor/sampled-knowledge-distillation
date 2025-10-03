@@ -29,6 +29,12 @@ export XDG_CACHE_HOME="$TMPDIR/xdg_cache";          mkdir -p "$XDG_CACHE_HOME"
 export WANDB_CACHE_DIR="$TMPDIR/wandb_cache";       mkdir -p "$WANDB_CACHE_DIR"  
 export WANDB_DIR="$TMPDIR/wandb";                   mkdir -p "$WANDB_DIR"
 export EVALPLUS_TRUST_REMOTE_CODE=1
+# W&B defaults for online eval logging (override at submission if needed)
+export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_DISABLED=${WANDB_DISABLED:-false}
+export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
+# safe even if PYTHONPATH is unset
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Optional tiny extras in LIGHT suite (BoolQ, HumanEval) -> set LIGHT_EXTRAS=1 to enable
 # export LIGHT_EXTRAS=1
@@ -71,6 +77,13 @@ echo "================================"
 $PY - <<'PY'
 import torch
 print("CUDA available:", torch.cuda.is_available(), "| torch", torch.__version__, "| cuda", getattr(torch.version, "cuda", None))
+try:
+  import wandb, os
+  print("wandb ok, version=", getattr(wandb, "__version__", "?"))
+  print("WANDB_MODE=", os.getenv("WANDB_MODE"))
+  print("WANDB_DISABLED=", os.getenv("WANDB_DISABLED"))
+except Exception as e:
+  print("wandb import failed:", e)
 PY
 
 # ---------- install/upgrade eval deps (idempotent) ----------
@@ -122,14 +135,15 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 # ---------- args ----------
-# Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light>
-# MODEL_PATH can be either a HF model directory or a .pt checkpoint; eval.py will auto-detect.
+# Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light> [from_hf|from_path] [OUTPUT_DIR]
+# MODEL_PATH can be either a HF hub ID (when MODE=from_hf), a HF model directory, or a .pt checkpoint; eval.py will auto-detect or obey the flag.
 MODEL_PATH=${1:-}
 SUITE=${2:-}
-OUTPUT_DIR=${3:-"evaluation_json_results"}
+MODE_ARG=${3:-}
+OUTPUT_DIR=${4:-"evaluation_json_results"}
 
 if [[ -z "$MODEL_PATH" || -z "$SUITE" ]]; then
-  echo "Error: missing args. Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light>"
+  echo "Error: missing args. Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light> [from_hf|from_path] [OUTPUT_DIR]"
   exit 2
 fi
 if [[ "$SUITE" != "heavy" && "$SUITE" != "light" ]]; then
@@ -148,11 +162,17 @@ EVAL_ARGS=(
   --suite "$SUITE"
   --wandb_project selective-entropy-knowledge-distillation
 )
-srun -u "$PY" ekd/evaluations/eval.py "$MODEL_PATH" "${EVAL_ARGS[@]}" | tee "eval_runs/$(basename "$MODEL_PATH").${SLURM_JOB_ID}.${SUITE}.log"
+
+# Forward optional mode flag to eval.py
+if [[ "$MODE_ARG" == "from_hf" ]]; then
+  EVAL_ARGS+=( --from_hf )
+fi
+LOG_BASENAME=$(echo "$MODEL_PATH" | sed 's#[/ ]#_#g')
+srun -u "$PY" ekd/evaluations/eval.py "$MODEL_PATH" "${EVAL_ARGS[@]}" | tee "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log"
 
 # extract LaTeX table if present
-awk '/\\begin{table}/, /\\end{table}/' "eval_runs/$(basename "$MODEL_PATH").${SLURM_JOB_ID}.${SUITE}.log" > "eval_runs/$(basename "$MODEL_PATH").${SUITE}.table.${SLURM_JOB_ID}.tex" || true
-echo "Done. Logs: eval_runs/$(basename "$MODEL_PATH").${SLURM_JOB_ID}.${SUITE}.log"
+awk '/\\begin{table}/, /\\end{table}/' "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log" > "eval_runs/${LOG_BASENAME}.${SUITE}.table.${SLURM_JOB_ID}.tex" || true
+echo "Done. Logs: eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log"
 
 # Example usage:
 # sbatch evals.slurm kd_top_k_tok_run_out_models/model_2617 light

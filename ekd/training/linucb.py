@@ -48,6 +48,8 @@ class LinUCBBandit:
         if contexts.size(0) == 0:
             return torch.zeros(0, dtype=torch.bool), torch.zeros(0, dtype=torch.float32)
 
+        # Keep track of the original device to map outputs back for downstream code
+        orig_device = contexts.device
         ctx = contexts.to(self.device, dtype=torch.float32)
         self._factorize()
         theta = self.theta
@@ -65,7 +67,8 @@ class LinUCBBandit:
             keep[topk_idx] = True
             mask = keep
 
-        return mask.cpu(), scores.cpu()
+        # Return on the same device as the incoming contexts to avoid device mismatch downstream
+        return mask.to(orig_device), scores.to(orig_device)
 
     @torch.no_grad()
     def update(self, contexts: Tensor, rewards: Tensor) -> None:

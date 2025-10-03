@@ -12,6 +12,7 @@ from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from ekd.config import TrainingConfig
+from ekd.run_registry import compute_params_hash, upsert_run_start, mark_trained, exists as registry_exists, normalize_params
 from ekd.utils import _bnb_triton_available
 from ekd.data.dataset import AIMEJsonl, DistillCollator
 from ekd.models.loader import load_model
@@ -187,33 +188,23 @@ def load_teacher_with_fallback(
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
-def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337):
+def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
     """
-    Stream FineWeb-Edu and take ~max_tokens worth of text, reproducibly.
+    Load FineWeb-Edu subset with automatic caching.
+    First run: streams, filters, and caches to disk.
+    Subsequent runs: loads from cache instantly.
+    
     Returns a list of {prompt, answer} examples.
     """
-    print(f"[fineweb] Streaming HuggingFaceFW/fineweb-edu with token budget={max_tokens:,}, seed={seed}")
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
-
-    # Shuffle with fixed seed for reproducibility (uses a buffer)
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
-
-    total_tokens = 0
-    examples = []
-    for ex in ds:
-        txt = ex.get("text", None)
-        if not txt:
-            continue
-        # Tokenize with the same tokenizer used for training
-        ids = tokenizer(txt)["input_ids"]
-        n_tokens = len(ids)
-        if total_tokens + n_tokens > max_tokens:
-            break
-        examples.append({"prompt": txt, "answer": ""})
-        total_tokens += n_tokens
-
-    print(f"[fineweb] Sampled ~{len(examples)} docs, {total_tokens:,} tokens")
-    return examples
+    from ekd.data.cache import load_or_create_fineweb_cache
+    
+    return load_or_create_fineweb_cache(
+        tokenizer=tokenizer,
+        max_tokens=max_tokens,
+        max_seq_len=max_seq_len,
+        seed=seed,
+        batch_size=512,
+    )
 
 
 def parse_args_to_config() -> TrainingConfig:
@@ -230,7 +221,6 @@ def parse_args_to_config() -> TrainingConfig:
         "bucket",
         "pos-rs-kd",
         "linucb",
-        "entropy-top-k-with-softmax",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
@@ -287,7 +277,7 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Absolute clip value applied to KL improvement rewards before LinUCB updates")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
-    parser.add_argument("--alpha_ce", type=float, default=0.1,
+    parser.add_argument("--alpha_ce", type=float, default=0.3,
                         help="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
@@ -333,8 +323,20 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--no_eliminate_softmax", dest="eliminate_softmax", action="store_false",
                         help="Disable softmax elimination (force full-vocab softmax).")
 
-    parser.add_argument("--sampled_softmax_negatives", type=int, default=1024,
+    parser.add_argument("--sampled_softmax_negatives", type=int, default=1500,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
+    # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
+    parser.add_argument("--gls_enabled", action="store_true", default=False,
+                        help="Enable global-level selection FIFO queue (only impacts top-k-tok)")
+    parser.add_argument("--gls_queue_size", type=int, default=30000,
+                        help="Capacity of GLS FIFO queue for computing global threshold")
+    parser.add_argument("--gls_log_threshold", action="store_true", default=False,
+                        help="Log the GLS threshold each time it's computed")
+    # Unified upsert registry controls
+    parser.add_argument("--runs_registry", type=str, default="results/runs.json",
+                        help="Path to the unified runs JSON registry (a JSON list).")
+    parser.add_argument("--override", action="store_true", default=False,
+                        help="If set, run even if an identical-params hash already exists in the registry.")
     # Reproducibility
     default_seed = int(os.environ.get("SEED", "1337"))
     default_det = bool(int(os.environ.get("DETERMINISTIC", "0")))
@@ -350,6 +352,20 @@ def parse_args_to_config() -> TrainingConfig:
 def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
+    
+    # Print all CLI parameters at startup
+    print("=" * 80)
+    print("TRAINING CONFIGURATION")
+    print("=" * 80)
+    try:
+        params_dict = config.model_dump()
+    except Exception:
+        params_dict = vars(config)
+    
+    for key, value in sorted(params_dict.items()):
+        print(f"  {key:30s} = {value}")
+    print("=" * 80)
+    print()
 
     # global seeding
     random.seed(config.seed)
@@ -390,6 +406,50 @@ def main():
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+
+    # ----------------- runs registry preflight -----------------
+    registry_path = Path(getattr(config, "runs_registry", "results/runs.json"))
+    # Build a stable hash over parameters (exclude dates/job ids)
+    try:
+        params_dict = config.model_dump()
+    except Exception:
+        # Fallback for older Pydantic versions
+        params_dict = vars(config)
+    params_hash = compute_params_hash(params_dict)
+
+    if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+        print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
+        return
+
+    # Create experiment name early (not part of the hash)
+    current_date = datetime.now().strftime("%Y%m%d_%H%M")
+    job_id = os.getenv("SLURM_JOB_ID", "local")
+    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+    if config.distill_type == "top-k-tok" or config.distill_type == "random":
+        experiment_name += f"_k={config.k_percent}"
+    elif config.distill_type == "bucket":
+        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+
+    upsert_run_start(
+        registry_path,
+        params_dict,
+        experiment_name=experiment_name,
+        job_id=job_id,
+        model_output_dir=config.output_dir,
+    )
+
+    # Persist normalized params and hash alongside model outputs for downstream eval
+    try:
+        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+        params_out = Path(config.output_dir) / "run_params.json"
+        with open(params_out, "w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump({
+                "id": params_hash,
+                "params": normalize_params(params_dict),
+            }, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[registry] Warning: failed to write run_params.json: {e}")
 
     # ----------------- teacher / student device planning -----------------
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -468,7 +528,7 @@ def main():
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
-            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed)
+            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
         else:
             # Load from Hugging Face dataset if user passes HF dataset name
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")
@@ -483,19 +543,7 @@ def main():
                 })
             dataset = examples
 
-    # Optional: for entropy-top-k-with-softmax, subsample to 1/20 of the dataset size
-    if getattr(config, "distill_type", "") == "entropy-top-k-with-softmax":
-        try:
-            from torch.utils.data import Subset
-            total_len = len(dataset)  # works for list or dataset-like
-            sub_len = max(1, total_len // 10)
-            if isinstance(dataset, list):
-                dataset = dataset[:sub_len]
-            else:
-                dataset = Subset(dataset, list(range(sub_len)))
-            print(f"[entropy-top-k-with-softmax] Using a 1/10 subset: {sub_len} / {total_len} examples")
-        except Exception as e:
-            print(f"[entropy-top-k-with-softmax] Failed to create 1/20 subset ({e}); proceeding with full dataset.")
+    # (Removed) special-case subsampling for deprecated 'entropy-top-k-with-softmax'
 
     collate = DistillCollator(tok, config.max_seq_len)
     # Seeded DataLoader generator for reproducible shuffling
@@ -518,14 +566,7 @@ def main():
         worker_init_fn=_seed_worker,
     )
 
-    # Initialize logging with experiment name
-    current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random" or config.distill_type == "entropy-top-k-with-softmax":
-        experiment_name += f"_k={config.k_percent}"
-    elif config.distill_type == "bucket":
-        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+    # Initialize logging with experiment name (built above)
     
     # Initialize combined logger (W&B + TensorBoard)
     combined_logger = create_training_combined_logger(
@@ -556,6 +597,12 @@ def main():
     print("Saving student to", config.output_dir)
     student.save_pretrained(config.output_dir)
     tok.save_pretrained(config.output_dir)
+
+    # Mark trained in registry
+    try:
+        mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
+    except Exception as e:
+        print(f"[registry] Failed to mark trained: {e}")
 
 
 if __name__ == "__main__":
