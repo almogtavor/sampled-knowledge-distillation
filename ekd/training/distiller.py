@@ -447,32 +447,75 @@ class Distiller:
             kd_loss = (kl_pos * valid_next).sum() / denom
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens among valid positions; optionally global threshold via GLS
+            # Select positions FIRST, then compute KL only on selected rows (efficient)
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
 
-            # Build ranking statistic: default entropy; if score enabled, use combined score
+            # Build ranking statistic with two-stage selection when scoring enabled
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
-            score_ctx = None
+            
             if score_enabled:
-                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
-                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
-            # stat initialized with -inf outside valid positions
-            stat = ent_raw.masked_fill(~valid_next, float('-inf'))
-            if score_enabled:
+                # === Two-stage selection for efficiency ===
+                # Stage 1: Prefilter by entropy (cheap, no softmax needed)
+                prefilter_mult = float(getattr(self.config, "score_prefilter_multiplier", 3.0))
+                # Stage 2: Compute KL/CE only on prefiltered subset
+                
                 stat = torch.full_like(ent_raw, float('-inf'))
                 for i in range(valid_next.size(0)):
                     mask_i = valid_next[i]
-                    combined = self._build_score_vector(score_ctx, i, mask_i)
+                    n_valid = int(mask_i.sum().item())
+                    if n_valid < 3:
+                        continue
+                    
+                    # Stage 1: Select top (k * prefilter_mult) by entropy
+                    k_final = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                    k_pre = min(n_valid, max(k_final, int(k_final * prefilter_mult)))
+                    
+                    valid_idx = torch.where(mask_i)[0]
+                    ent_valid = ent_raw[i][mask_i]
+                    _, pre_rel_idx = torch.topk(ent_valid, k=k_pre, largest=True, sorted=False)
+                    prefilter_idx = valid_idx[pre_rel_idx]  # [k_pre] absolute indices
+                    
+                    # Stage 2: Compute KL/CE only on prefiltered positions (efficient!)
+                    # Create mask for prefiltered positions
+                    prefilter_mask = torch.zeros_like(mask_i, dtype=torch.bool)
+                    prefilter_mask[prefilter_idx] = True
+                    
+                    # Gather only prefiltered rows for KL computation
+                    t_rows_pre = t_log_probs[i, prefilter_idx, :].to(self.student_device)  # [k_pre, V]
+                    s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
+                    kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
+                    
+                    # Build full-size KL tensor with -inf for non-prefiltered
+                    kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
+                    kl_pos_partial[prefilter_idx] = kl_pre
+                    
+                    # Prepare score context with partial KL
+                    score_ctx_i = self._prepare_score_context(
+                        ent_raw[i:i+1],
+                        kl_pos_partial.unsqueeze(0),
+                        s_log_probs[i:i+1] if s_log_probs is not None else None,
+                        prefilter_mask.unsqueeze(0),
+                        input_ids[i:i+1]
+                    )
+                    combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask)
                     if combined is not None:
                         stat[i] = combined
+                
                 stat = stat.masked_fill(~valid_next, float('-inf'))
+            else:
+                # Entropy-only ranking (no softmax needed, fully efficient)
+                stat = ent_raw.masked_fill(~valid_next, float('-inf'))
 
             use_gls = bool(getattr(self.config, "gls_enabled", False))
-            kd_terms = []
             sel_topk_count = 0
             sel_gls_count = 0
+            
+            # Create boolean mask for positions to include in KD loss
+            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
+            
             if not use_gls:
-                # Per-example top-k (original behavior)
+                # Per-example top-k
                 for i in range(valid_next.size(0)):
                     mask = valid_next[i]
                     n_valid = int(mask.sum().item())
@@ -486,13 +529,7 @@ class Distiller:
                         continue
                     _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
                     sel = valid_idx[rel_idx]
-                    idx_t = sel.to(t_log_probs.device)
-                    kl_sel = self._kl_loss(
-                        t_log_probs[i, idx_t, :].to(self.student_device),
-                        s_log_probs[i, sel, :]
-                    )
-                    kd_terms.append(kl_sel.mean())
-                kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+                    keep_mask[i, sel] = True
             else:
                 # GLS: global threshold over history with warm-up fallback
                 self._gls_init_if_needed()
@@ -512,30 +549,27 @@ class Distiller:
                             continue
                         _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
                         sel = valid_idx[rel_idx]
-                        idx_t = sel.to(t_log_probs.device)
-                        kl_sel = self._kl_loss(
-                            t_log_probs[i, idx_t, :].to(self.student_device),
-                            s_log_probs[i, sel, :]
-                        )
-                        kd_terms.append(kl_sel.mean())
-                    kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
+                        keep_mask[i, sel] = True
                 else:
                     keep_mask = (stat >= thr) & valid_next
                     sel_gls_count = int(keep_mask.sum().item())
-                    for i in range(valid_next.size(0)):
-                        keep_i = keep_mask[i]
-                        if keep_i.any():
-                            kd_terms.append(self._kl_loss(
-                                t_log_probs[i][keep_i].to(self.student_device),
-                                s_log_probs[i][keep_i]
-                            ).mean())
-                    kd_loss = torch.stack(kd_terms).mean() if kd_terms else t_pred.sum() * 0.0
                 # Push current batch stats and optionally log threshold
                 flat_vals = stat[valid_next].detach().float().to("cpu")
                 flat_vals = flat_vals[torch.isfinite(flat_vals)]
                 self._gls_push(flat_vals)
                 if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
                     self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+            
+            # Compute KL only on selected positions (efficient)
+            rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
+            if rows.numel() == 0:
+                kd_loss = t_pred.sum() * 0.0
+            else:
+                b_idx, t_idx = rows[:, 0], rows[:, 1]
+                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                s_rows = s_log_probs[b_idx, t_idx, :]
+                kd_loss = self._kl_loss(t_rows, s_rows).mean()
+            
             # Log selection counters (per batch)
             if self.logger:
                 self.logger.log({
@@ -545,17 +579,14 @@ class Distiller:
 
         elif self.config.distill_type == "bucket":
             # Bucket: distill on tokens with entropy in [lower_bound, upper_bound] percentiles
-            # e.g., if lower=70, upper=80: distill on tokens with 70th-80th percentile entropy
+            # Select positions FIRST, then compute KL only on selected rows (efficient)
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
-            score_ctx = None
-            kl_pos = None
-            if score_enabled:
-                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
-                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
 
-            kd_terms = []
+            # Create boolean mask for positions to include in KD loss
+            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
+            
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
                 valid_next_i = valid_next[i]
@@ -563,42 +594,90 @@ class Distiller:
                     continue
 
                 if score_enabled:
-                    combined = self._build_score_vector(score_ctx, i, valid_next_i)
+                    # === Two-stage selection for efficiency ===
+                    # Stage 1: Prefilter by entropy to bucket range
+                    ent_valid = ent_raw[i][valid_next_i].float()
+                    lower_thr = torch.quantile(ent_valid, self.config.bucket_lower_percent / 100.0)
+                    upper_thr = torch.quantile(ent_valid, self.config.bucket_upper_percent / 100.0)
+                    
+                    valid_idx = torch.where(valid_next_i)[0]
+                    prefilter_mask_rel = (ent_valid >= lower_thr) & (ent_valid <= upper_thr)
+                    
+                    if not prefilter_mask_rel.any():
+                        continue
+                    
+                    prefilter_idx = valid_idx[prefilter_mask_rel]  # Absolute indices in bucket
+                    
+                    # Stage 2: Compute KL/CE only on bucket positions (efficient!)
+                    t_rows_pre = t_log_probs[i, prefilter_idx, :].to(self.student_device)  # [k_bucket, V]
+                    s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_bucket, V]
+                    kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_bucket]
+                    
+                    # Build full-size KL tensor
+                    kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
+                    kl_pos_partial[prefilter_idx] = kl_pre
+                    
+                    # Create prefilter mask for score context
+                    prefilter_mask_full = torch.zeros_like(valid_next_i, dtype=torch.bool)
+                    prefilter_mask_full[prefilter_idx] = True
+                    
+                    # Prepare score context with partial KL
+                    score_ctx_i = self._prepare_score_context(
+                        ent_raw[i:i+1],
+                        kl_pos_partial.unsqueeze(0),
+                        s_log_probs[i:i+1] if s_log_probs is not None else None,
+                        prefilter_mask_full.unsqueeze(0),
+                        input_ids[i:i+1]
+                    )
+                    combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask_full)
                     if combined is None:
                         continue
-                    vec = combined[valid_next_i].float()
+                    
+                    # Apply bucket thresholds to combined score
+                    vec = combined[prefilter_mask_full].float()
+                    if vec.numel() < 1:
+                        continue
+                    score_lower = torch.quantile(vec, max(0.0, (self.config.bucket_lower_percent - self.config.bucket_lower_percent) / 100.0))
+                    score_upper = torch.quantile(vec, min(1.0, (self.config.bucket_upper_percent - self.config.bucket_lower_percent) / (100.0 - self.config.bucket_lower_percent)))
+                    
+                    # Final selection within prefiltered set
+                    final_sel = (vec >= score_lower) & (vec <= score_upper)
+                    if final_sel.any():
+                        keep_mask[i, prefilter_idx[final_sel]] = True
                 else:
+                    # Entropy-only bucket (no softmax needed)
                     vec = ent_raw[i][valid_next_i].float()
+                    lower_thr = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
+                    upper_thr = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
 
-                lower_thr = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
-                upper_thr = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
+                    keep_idx = torch.where(valid_next_i)[0]
+                    sel_mask = (vec >= lower_thr) & (vec <= upper_thr)
+                    if sel_mask.any():
+                        keep_mask[i, keep_idx[sel_mask]] = True
 
-                keep = torch.zeros_like(valid_next_i)
-                keep_idx = torch.where(valid_next_i)[0]
-                sel_mask = (vec >= lower_thr) & (vec <= upper_thr)
-                if sel_mask.any():
-                    keep[keep_idx[sel_mask]] = True
-                    kd_terms.append(
-                        self._kl_loss(
-                            t_log_probs[i][keep].to(self.student_device),
-                            s_log_probs[i][keep]
-                        ).mean()
-                    )
-
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else:  # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+            # Compute KL only on selected positions (efficient)
+            rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
+            if rows.numel() == 0:
+                kd_loss = t_pred.sum() * 0.0
+            else:
+                b_idx, t_idx = rows[:, 0], rows[:, 1]
+                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                s_rows = s_log_probs[b_idx, t_idx, :]
+                kd_loss = self._kl_loss(t_rows, s_rows).mean()
         elif self.config.distill_type == "random":
+            # Random selection with optional score-weighted sampling
+            # Select positions FIRST, then compute KL only on selected rows (efficient)
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
             score_ctx = None
-            kl_pos = None
+            ent_raw = None
             if score_enabled:
                 ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1] for context only
-                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
-                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+                kl_pos_for_score = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos_for_score, s_log_probs, valid_next, input_ids)
 
-            kd_terms = []
+            # Create boolean mask for positions to include in KD loss
+            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
+            
             Bsz = t_log_probs.size(0)
             for i in range(Bsz):
                 valid_next_i = valid_next[i]
@@ -625,38 +704,37 @@ class Distiller:
                     perm = torch.randperm(len(valid_indices), device=self.student_device)
                     selected_indices = valid_indices[perm[:k_count]]
 
-                keep = torch.zeros_like(valid_next_i)
-                keep[selected_indices] = True
-                if keep.any():
-                    kd_terms.append(
-                        self._kl_loss(
-                            t_log_probs[i][keep].to(self.student_device),
-                            s_log_probs[i][keep]
-                        ).mean()
-                    )
+                keep_mask[i, selected_indices] = True
 
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else:  # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+            # Compute KL only on selected positions (efficient)
+            rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
+            if rows.numel() == 0:
+                kd_loss = t_pred.sum() * 0.0
+            else:
+                b_idx, t_idx = rows[:, 0], rows[:, 1]
+                t_rows = t_log_probs[b_idx, t_idx, :].to(self.student_device)
+                s_rows = s_log_probs[b_idx, t_idx, :]
+                kd_loss = self._kl_loss(t_rows, s_rows).mean()
         elif self.config.distill_type == "pos-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by distribution q(i)
-            # Default q(i) ∝ H_i^alpha; with scores enabled, q(i) ∝ score_i^alpha
+            # Select positions FIRST with importance weights, then compute KL only on selected rows
             ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
 
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
             score_ctx = None
-            kl_pos = None
             if score_enabled:
-                kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)  # [B, L-1]
-                score_ctx = self._prepare_score_context(ent_raw, kl_pos, s_log_probs, valid_next, input_ids)
+                kl_pos_for_score = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
+                score_ctx = self._prepare_score_context(ent_raw, kl_pos_for_score, s_log_probs, valid_next, input_ids)
 
-            kd_terms = []
+            # Build per-position importance weights
             Bsz = t_pred.size(0)
             alpha = float(getattr(self.config, "rs_alpha", 1.0))
             q_floor = float(getattr(self.config, "rs_floor", 1e-6))
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
 
+            # Collect selected positions and their importance weights
+            selected_positions = []  # List of (b, t, weight) tuples
+            
             for i in range(Bsz):
                 valid_next_i = valid_next[i]  # [L-1] bool of valid positions
                 valid_count = int(valid_next_i.sum().item())
@@ -671,7 +749,7 @@ class Distiller:
                 else:
                     base = ent_raw[i][valid_next_i].float()
 
-                base = torch.clamp(base, min=1e-8)  # H_t ≥ 0 already
+                base = torch.clamp(base, min=1e-8)
                 if alpha == 0.0:
                     q_un = torch.ones_like(base)
                 else:
@@ -691,21 +769,27 @@ class Distiller:
                 valid_idx = torch.where(valid_next_i)[0]
                 selected_abs = valid_idx[sel_rel]  # [k]
 
-                idx_t = selected_abs.to(t_log_probs.device)
-                kl_sel = self._kl_loss(
-                    t_log_probs[i, idx_t, :].to(self.student_device),
-                    s_log_probs[i, selected_abs, :]
-                )  # [k]
-
+                # Compute importance weights: w = 1/q, normalized
                 q_sel = q[sel_rel]  # [k]
                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                 w = w / w.sum()
-                kd_terms.append((kl_sel * w).sum())
+                
+                # Store (batch_idx, time_idx, weight)
+                for j, pos in enumerate(selected_abs):
+                    selected_positions.append((i, pos.item(), w[j].item()))
 
-            if kd_terms:
-                kd_loss = torch.stack(kd_terms).mean()
-            else:  # skip the batch if nothing selected
-                kd_loss = t_pred.sum() * 0.0  # zero loss with gradient
+            # Compute weighted KL only on selected positions
+            if len(selected_positions) == 0:
+                kd_loss = t_pred.sum() * 0.0
+            else:
+                b_indices = torch.tensor([p[0] for p in selected_positions], dtype=torch.long, device=self.student_device)
+                t_indices = torch.tensor([p[1] for p in selected_positions], dtype=torch.long, device=self.student_device)
+                weights = torch.tensor([p[2] for p in selected_positions], dtype=torch.float32, device=self.student_device)
+                
+                t_rows = t_log_probs[b_indices, t_indices, :].to(self.student_device)
+                s_rows = s_log_probs[b_indices, t_indices, :]
+                kl_per_pos = self._kl_loss(t_rows, s_rows)  # [P]
+                kd_loss = (kl_per_pos * weights).sum()
         elif self.config.distill_type == "linucb":
             if self.bandit_manager is None:
                 raise RuntimeError("LinUCB bandit is not initialized.")
@@ -1096,10 +1180,13 @@ class Distiller:
                             # Short-circuit to avoid computing below using keep_mask
                             pass
                         elif distill == "pos-rs-kd":
+                            # NEW: Build importance-weighted mask for KD loss
                             alpha = float(getattr(self.config, "rs_alpha", 1.0))
                             q_floor = float(getattr(self.config, "rs_floor", 1e-6))
                             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-                            kd_terms_local = []
+
+                            # Create importance-weighted mask [B, L-1]
+                            weight_mask = torch.zeros_like(valid_next, dtype=torch.float32)
 
                             # Optional: score-based q(i)
                             use_score = bool(getattr(self.config, "score_token_selection", False))
@@ -1141,47 +1228,37 @@ class Distiller:
                                 valid_idx_i = torch.where(mask_i)[0]
                                 abs_sel = valid_idx_i[rel_sel]
 
-                                # KD over selected rows with importance correction
-                                q_sel = q[rel_sel]                    # [k]
+                                # Compute importance weights and store in mask
+                                q_sel = q[rel_sel]
                                 w = 1.0 / torch.clamp(q_sel, min=q_floor)
                                 w = w / w.sum()
+                                weight_mask[i, abs_sel] = w
 
-                                kd_terms_local.append((kd_pos_proxy[i, abs_sel] * w).sum())
-                            kd_loss = (
-                                torch.stack(kd_terms_local).mean()
-                                if kd_terms_local else s_pred.sum() * 0.0
-                            )
+                            # Apply weighted mask to KD loss
+                            kd_loss = (kd_pos_proxy * weight_mask).sum()
 
-                            # CE on ALL valid rows to mirror top-k-tok (or keep it off if you prefer)
+                            # CE on ALL valid rows to match top-k-tok behavior
                             ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
 
-                        # If not the bandit short-circuit above, compute losses using keep_mask
-                        if distill != "linucb":
-                            # Map selection to flattened rows
-                            # If not the bandit short-circuit above, compute losses using keep_mask
-                            keep_rows = keep_mask[batch_idx, pos_idx] if P_total > 0 else torch.zeros(
-                                0, dtype=torch.bool, device=self.student_device
-                            )
-
+                        # If not the bandit short-circuit above or pos-rs-kd, compute losses using keep_mask
+                        if distill not in {"linucb", "pos-rs-kd"}:
+                            # NEW: Apply mask to proxy KD loss (all positions computed, only selected contribute)
+                            # Scatter keep_mask to full [B, L-1] if needed
                             if distill == "top-k-tok":
-                                if keep_rows.any():
-                                    # KD: only on selected rows (same as before)
-                                    kd_loss = kd_pos_proxy_rows[keep_rows].mean()
-                                    # CE: on ALL valid rows to match old top-k behavior
-                                    if self.config.enable_ce:
-                                        ce_loss_override = ce_pos_proxy_rows.mean()
-                                    else:
-                                        ce_loss_override = None
-                                else:
-                                    kd_loss = s_pred.sum() * 0.0
-                                    ce_loss_override = None
+                                # KD: masked loss over selected positions
+                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                # CE: on ALL valid positions (standard practice for top-k-tok)
+                                ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
                             else:
-                                # bucket/random: keep previous behavior (KD and CE both on the selected rows)
-                                if keep_rows.any():
-                                    kd_loss = kd_pos_proxy_rows[keep_rows].mean()
-                                    ce_loss_override = ce_pos_proxy_rows[keep_rows].mean() if self.config.enable_ce else None
+                                # bucket/random: KD and CE both on selected positions
+                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                # For CE on selected positions, we need to mask ce_pos_proxy
+                                if self.config.enable_ce:
+                                    keep_rows = keep_mask[batch_idx, pos_idx] if P_total > 0 else torch.zeros(
+                                        0, dtype=torch.bool, device=self.student_device
+                                    )
+                                    ce_loss_override = ce_pos_proxy_rows[keep_rows].mean() if keep_rows.any() else s_pred.sum() * 0.0
                                 else:
-                                    kd_loss = s_pred.sum() * 0.0
                                     ce_loss_override = None
             else:
                 # Vectorized online RS-KD over vocabulary: flatten all valid positions across the batch
