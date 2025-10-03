@@ -11,7 +11,7 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb", "entropy-top-k-with-softmax"] = "vanilla"
+    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
     alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")    
@@ -71,6 +71,9 @@ class TrainingConfig(BaseModel):
     wandb_project: str = "selective-entropy-knowledge-distillation"
     wandb_entity: str = "selective-entropy-knowledge-distillation"
     wandb_enabled: bool = True
+    # Unified runs registry
+    runs_registry: str = Field(default="results/runs.json", description="Path to the unified runs JSON registry")
+    override: bool = Field(default=False, description="If true, run even if an identical-params hash exists in the registry")
     
     # Offline cache (teacher precomputation for entropy approx + RS-KD over vocab)
     offline_cache: bool = True
@@ -85,6 +88,11 @@ class TrainingConfig(BaseModel):
     # Sampled softmax elimination (only active when using offline cache within cached path)
     eliminate_softmax: bool = Field(default=False, description="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     sampled_softmax_negatives: int = Field(default=1024, description="Number of uniform negative samples per position when eliminate_softmax=True")
+    
+    # Global-Level Selection (GLS) over tokens — only affects top-k-tok when enabled
+    gls_enabled: bool = Field(default=False, description="Enable global-level selection FIFO queue (only impacts top-k-tok)")
+    gls_queue_size: int = Field(default=30000, description="Capacity of GLS FIFO queue for computing global threshold")
+    gls_log_threshold: bool = Field(default=False, description="Log the GLS threshold each time it's computed")
     
     # Checkpointing
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")

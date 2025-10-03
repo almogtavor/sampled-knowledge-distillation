@@ -72,6 +72,16 @@ if [[ -n "$SCORE_KL_WEIGHT" ]]; then
   EXTRA_ARGS+=(--score_kl_weight "$SCORE_KL_WEIGHT")
 fi
 
+# ---------- bucket selection overrides ----------
+if [[ "$DISTILL_TYPE" == "bucket" ]]; then
+  if [[ -n "${BUCKET_LOWER_PERCENT:-}" ]]; then
+    EXTRA_ARGS+=(--bucket_lower_percent "${BUCKET_LOWER_PERCENT}")
+  fi
+  if [[ -n "${BUCKET_UPPER_PERCENT:-}" ]]; then
+    EXTRA_ARGS+=(--bucket_upper_percent "${BUCKET_UPPER_PERCENT}")
+  fi
+fi
+
 # ---------- caches / env ----------
 mkdir -p logs
 export TMPDIR="/home/joberant/NLP_2425b/$USER/ekd/tmp"
@@ -254,21 +264,24 @@ unset PYTHONPATH PYTHONHOME
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
-  --datasets "fineweb" \
-  --fineweb_tokens "${FINEWEB_TOKENS:-1000000}" \
+  --datasets "${DATASETS:-fineweb}" \
+  --fineweb_tokens "${FINEWEB_TOKENS:-4000000}" \
   --epochs "$EPOCHS" \
-  --batch_size 1 \
-  --gradient_accumulation_steps 16 \
-  --checkpoint_steps 250 \
-  --keep_checkpoints 3 \
-  --max_seq_len 384 \
+  --batch_size 16 \
+  --gradient_accumulation_steps 8 \
+  --max_seq_len 250 \
   --lr 1e-5 \
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \
   --seed "${SEED:-1337}" \
+  $(if [[ -n "${NO_OFFLINE+1}" ]]; then echo "--no_offline_cache"; fi) \
+  $(if [[ -n "${NO_ELIMINATE_SOFTMAX+1}" ]]; then echo "--no_eliminate_softmax"; fi) \
   $(if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then echo "--no_offline_cache --no_eliminate_softmax"; fi) \
   $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
   $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi) \
+  $(if [[ -n "${DATASET_CONFIG:-}" ]]; then echo "--dataset_config ${DATASET_CONFIG}"; fi) \
+  $(if [[ -n "${PROMPT_COL:-}" ]]; then echo "--prompt_col ${PROMPT_COL}"; fi) \
+  $(if [[ -n "${ANSWER_COL:-}" ]]; then echo "--answer_col ${ANSWER_COL}"; fi) \
   "${EXTRA_ARGS[@]}"
 
 END_TIME=$(date -u)
