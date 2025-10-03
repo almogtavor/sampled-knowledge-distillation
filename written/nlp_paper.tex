@@ -219,24 +219,24 @@ Full KD evaluates all positions; we instead sample positions using a proposal
 $q_{\text{pos}}(t)$ to focus compute on informative steps while keeping the estimate (approximately) unbiased.
 
 \subsection{Positional RS-KD Selection Policy}
-In one SampledKD variant, we sample positions by uncertainty, instead of deterministically picking the top $K_{\text{pos}}$.
-Let $H_t$ be token entropy / score, and set $q_{\text{pos}}(t)\propto H_t^{\alpha}$ with $\alpha\!\ge\!0$ controlling how we favor uncertain tokens, and \(
-q_{\text{pos}}(t)=\frac{\max(H_t,\epsilon)^{\alpha}}{\sum_j \max(H_j,\epsilon)^{\alpha}}.
-\)
-
-For a with-replacement sample of size $K_{\text{pos}}$:
+RS-KD is a method suggested in order to mitigate the bias issues of top-k logit methods, using a sampling strategy that will not overweight low certainty positions. Orthogonally, we implement Positional RS-KD, in order to overcome bias in positional top-k selection. We sample $K_{\text{pos}}$ distinct positions per sequence by uncertainty. Let $H_t$ be the per-token entropy/ score and define a per-position probability:
 \[
-    \widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}} \;=\;
-    \frac{1}{K_{\text{pos}}} \sum_{t \sim q_{\text{pos}}}
-    \frac{1}{q_{\text{pos}}(t)} \,\mathrm{KL}\!\left(p_t \,\|\, s_t\right),
+	q_{\text{pos}}(t)=\frac{\max(H_t,\epsilon)^{\alpha}}{\sum_j \max(H_j,\epsilon)^{\alpha}},
 \]
-which is unbiased for the uniform mean over positions.
+with $\alpha\ge0$ controlling uncertain tokens impact, and a floor $\epsilon>0$.
 
-In practice we draw without replacement and weight each chosen position by normalized inverse probability,
-$w_t \propto 1/\max(q_{\text{pos}}(t),q_{\min})$ with $\sum_{t\in S} w_t=1$ and $q_{\min}=10^{-6}$ to cap weights. This keeps the estimate close to the uniform mean and reduces variance.
+For reference, the with-replacement estimator is
+\[
+	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}}
+	=\frac{1}{K_{\text{pos}}}\sum_{t\sim q_{\text{pos}}}\frac{1}{q_{\text{pos}}(t)}
+	\,\mathrm{KL}(p_t\|s_t),
+\]
+and in expectation it matches the same per-position weighting as using all valid positions equally (proof at Appendix \ref{app:pos-rs-kd-proof}).
 
-This acts along the sequence axis (orthogonal to class-level RS-KD). Low-uncertainty tokens still appear with nonzero probability (tuned by $\alpha$). We keep CE on all positions and add the position-sampled KD to the total loss.
-
+In practice, we perform a multinomial draw without replacement (no duplicates) using $q_{\text{pos}}$ and weight each selected position by
+$w_t \propto 1/\max(q_{\text{pos}}(t),q_{\min})$ with $\sum_{t\in S} w_t=1$ ($q_{\min}$ caps weights).
+This keeps us close to the mean of the KD loss--a KLD averaged equally over all valid positions, while avoiding repeats and therefore reducing the estimator's variance.
+Low-uncertainty tokens still appear with nonzero probability (set by $\alpha$ and floors), and we keep CE on all positions.
 
 \section{Softmax Elimination Optimizations}
 \label{sec:softmax_elimination}
@@ -427,45 +427,45 @@ All experiments report pass@1 accuracy, measuring the percentage of problems sol
 \section{Main Results}
 \label{sec:main-results}
 \begin{table*}[t]
-\centering
-\small
-\setlength{\tabcolsep}{6pt}
-\begin{tabular}{lcccccccc}
-\toprule
-\multirow{2}{*}{Method} 
-& \multicolumn{2}{c}{GSM8K ($\uparrow$)} 
-& \multicolumn{2}{c}{SVAMP ($\uparrow$)} 
-& \multicolumn{2}{c}{ARC-Challenge (acc $\uparrow$)} 
-& \multicolumn{2}{c}{ARC-Easy (acc $\uparrow$)} \\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
-& 1M & 4M & 1M & 4M & 1M & 4M & 1M & 4M \\
-\midrule
-Full KD (all tokens, full softmax)    & 31.0 & --- & 4.0 & --- & 34.0 & --- & 38.0 & --- \\
-\textbf{Token-selective KD (entropy top-$30\%$)}  & 28.0 & --- & 4.0 & --- & 33.0 & --- & 40.0 & --- \\
-Token-selective KD (bucket of $5\%-30\%$)    & 25.0 & --- & 3.0 & --- & 30.0 & --- & 42.0 & --- \\
-Token-selective KD (random $25\%$)    & 20.0 & --- & 1.0 & --- & 26.0 & --- & 36.0 & --- \\
-\addlinespace[2pt]
-\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 32.0 & 26.0 & 2.0 & 4.0 & 30.0 & 32.0 & 34.0 & 34.0 \\
-\quad Top $k=75\%$ positions                      	& 40.0 & --- & 2.0 & --- & 40.0 & --- & 28.0 & --- \\
-\quad Top $k=30\%$ pos, GLS (global queue) 	    & 29.0 & --- & 2.0 & --- & 32.0 & --- & 39.0 & --- \\
-\quad Top $k=30\%$ pos, Score based Selection & 38.0 & --- & 1.0 & --- & 30.0 & --- & 36.0 & --- \\
-\quad Positional RS-KD $k=30\%$	(sampled)    	& 30.0 & --- & 2.0 & --- & 24.0 & --- & 27.0 & --- \\
-\quad $k=100\%$                       	& 40.0 & --- & 2.0 & --- & 26.0 & --- & 36.0 & --- \\
-\quad $k=30\%$, distilled on GSM8K train split   & \multicolumn{2}{c}{38.0} & --- & --- & --- & --- & --- \\
-\quad LinUCB model as selector        	& 11.0 & --- & 0.0 & --- & 15.0 & --- & 20.0 & --- \\
-\midrule
-No KD baseline (untrained student)    & \multicolumn{2}{c}{48.0} & \multicolumn{2}{c}{6.0} & \multicolumn{2}{c}{32.0} & \multicolumn{2}{c}{62.0} \\
-\bottomrule
-\end{tabular}
-\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy.
-Token selective KD \& Full KD are regular distillations that do not apply softmax elimination nor offline cache.
-}
-\label{tab:main-reasoning}
+	\centering
+	\small
+	\setlength{\tabcolsep}{6pt}
+	\begin{tabular}{lcccccccc}
+		\toprule
+		\multirow{2}{*}{Method}
+		                                                    & \multicolumn{2}{c}{GSM8K ($\uparrow$)}
+		                                                    & \multicolumn{2}{c}{SVAMP ($\uparrow$)}
+		                                                    & \multicolumn{2}{c}{ARC-Challenge (acc $\uparrow$)}
+		                                                    & \multicolumn{2}{c}{ARC-Easy (acc $\uparrow$)}              \\
+		\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+		                                                    & 1M                                                 & 4M                      & 1M                       & 4M                       & 1M   & 4M   & 1M   & 4M   \\
+		\midrule
+		Full KD (all tokens, full softmax)                  & 31.0                                               & ---                     & 4.0                      & ---                      & 34.0 & ---  & 38.0 & ---  \\
+		\textbf{Token-selective KD (entropy top-$30\%$)}    & 28.0                                               & ---                     & 4.0                      & ---                      & 33.0 & ---  & 40.0 & ---  \\
+		Token-selective KD (bucket of $5\%-30\%$)           & 25.0                                               & ---                     & 3.0                      & ---                      & 30.0 & ---  & 42.0 & ---  \\
+		Token-selective KD (random $25\%$)                  & 20.0                                               & ---                     & 1.0                      & ---                      & 26.0 & ---  & 36.0 & ---  \\
+		\addlinespace[2pt]
+		\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 32.0                                               & 26.0                    & 2.0                      & 4.0                      & 30.0 & 32.0 & 34.0 & 34.0 \\
+		\quad Top $k=75\%$ positions                        & 40.0                                               & ---                     & 2.0                      & ---                      & 40.0 & ---  & 28.0 & ---  \\
+		\quad Top $k=30\%$ pos, GLS (global queue)          & 29.0                                               & ---                     & 2.0                      & ---                      & 32.0 & ---  & 39.0 & ---  \\
+		\quad Top $k=30\%$ pos, Score based Selection       & 38.0                                               & ---                     & 1.0                      & ---                      & 30.0 & ---  & 36.0 & ---  \\
+		\quad Positional RS-KD $k=30\%$	(sampled)           & 30.0                                               & ---                     & 2.0                      & ---                      & 24.0 & ---  & 27.0 & ---  \\
+		\quad $k=100\%$                                     & 40.0                                               & ---                     & 2.0                      & ---                      & 26.0 & ---  & 36.0 & ---  \\
+		\quad $k=30\%$, distilled on GSM8K train split      & \multicolumn{2}{c}{38.0}                           & ---                     & ---                      & ---                      & ---  & ---                \\
+		\quad LinUCB model as selector                      & 11.0                                               & ---                     & 0.0                      & ---                      & 15.0 & ---  & 20.0 & ---  \\
+		\midrule
+		No KD baseline (untrained student)                  & \multicolumn{2}{c}{48.0}                           & \multicolumn{2}{c}{6.0} & \multicolumn{2}{c}{32.0} & \multicolumn{2}{c}{62.0}                             \\
+		\bottomrule
+	\end{tabular}
+	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu for 1M and 4M tokens; we report pass@1 (\%) for GSM8K and SVAMP, accuracy (\%) for ARC-Challenge/Easy.
+		Token selective KD \& Full KD are regular distillations that do not apply softmax elimination nor offline cache.
+	}
+	\label{tab:main-reasoning}
 \end{table*}
 
 \subsection{Discussion}
 \label{sec:discussion}
-We ablated a wide range of position-selection settings for a 0.6B student, varying the number of supervised positions $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$ and comparing top-$k$, percentile buckets, and RS-KD sampling with $\alpha\!\in\!\{0,0.5,1,2\}$, with and without GLS.
+We ablated a wide range of position-selection settings for a 0.6B student, varying the number of top $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$, score based, percentile buckets, with and without GLS.
 We also tested RS temperature $\tau{\in}\{1,2\}$, negatives $M{\in}\{256,512,1024\}$.  
 
 Results were often noisy, and in most cases the distilled student underperformed the Qwen3-0.6B baseline.
@@ -525,9 +525,53 @@ Given its principled foundations and prior successes of sampled softmax and RS-K
 \bibliographystyle{acl_natbib}
 
 \appendix
-\section{Alternative tail estimators (unbiased IS and control variates)}
+\section{Positional RS-KD matches the equal-weight KD objective}
+\label{app:pos-rs-kd-proof}
+
+Let \(P_x\) be the set of valid next-token positions for sequence \(x\), and define \(N=\lvert P_x\rvert\).
+The target objective of knowledge distillation is
+\[
+	\mathcal{L}_{\text{KD}}
+	=\mathbb{E}_{x}\!\left[\frac{1}{N}\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t)\right].
+\]
+
+Let \(q_{\text{pos}}(\cdot)\) be any distribution over \(P_x\) (built from entropies / scores).
+Draw \(K_{\text{pos}}\) i.i.d. samples \(t_k\sim q_{\text{pos}}\) (with replacement) and define
+\[
+	\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}}(x)
+	=\frac{1}{N}\cdot\frac{1}{K_{\text{pos}}}\sum_{k=1}^{K_{\text{pos}}}
+	\frac{1}{q_{\text{pos}}(t_k)}\,\mathrm{KL}(p_{t_k}\|s_{t_k}).
+\]
+Note that the random term can be written as
+\[
+\mathrm{KL}(p_{t_k}\|s_{t_k})
+=\sum_{t\in P_x}\mathbf{1}\!\{t_k=t\}\,\mathrm{KL}(p_t\|s_t),
+\]
+so:
+\[
+\mathbb{E}_{t_k\sim q_{\text{pos}}}\!\left[
+  \frac{\mathrm{KL}(p_{t_k}\|s_{t_k})}{q_{\text{pos}}(t_k)}
+\right]
+= \sum_{t\in P_x} q_{\text{pos}}(t)\,
+  \frac{\mathrm{KL}(p_t\|s_t)}{q_{\text{pos}}(t)}.
+\]
+And taking \(\mathbb{E}_x\) over dataset distribution of \(x\) yields \(\mathcal{L}_{\text{KD}}\):
+\begin{align*}
+\mathbb{E}\!\left[\widehat{\mathcal{L}}_{\text{KD}}^{\text{pos}}(x)\right]
+&= \frac{1}{N K_{\text{pos}}}\sum_{k=1}^{K_{\text{pos}}}
+   \mathbb{E}_{t_k\sim q_{\text{pos}}}\!\left[
+     \frac{\mathrm{KL}(p_{t_k}\|s_{t_k})}{q_{\text{pos}}(t_k)}
+   \right] \\
+&= \frac{1}{N K_{\text{pos}}}\sum_{k=1}^{K_{\text{pos}}}
+   \sum_{t\in P_x}\mathrm{KL}(p_t\|s_t) \\
+&= \frac{1}{N}\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t) \\
+&=\mathcal{L}_{\text{KD}}.
+\end{align*}
+
+\section{Alternative tail estimators (unbiased IS and control variated)}
 \label{app:tail-IS}
-Let $T$ be the tail indices (outside top-$m$), $P_T=\sum_{v\in T}p_v$, and $q(v)=p_v/P_T$ the tail-normalized sampling distribution. The exact tail \emph{contribution to entropy} is
+Let \(T\) denote the \emph{tail index set}, i.e., the set of vocabulary indices lying outside the top-\(m\) logits.
+Define the total tail probability mass $P_T=\sum_{v\in T}p_v$, and $q(v)=p_v/P_T$ the tail-normalized sampling distribution. The exact tail contribution to entropy is
 \[
 	H_T \;=\; -\sum_{v\in T} p_v \log p_v \;=\; -P_T\,\underset{v\sim q}{\mathbb{E}}\,[\log p_v].
 \]
