@@ -1413,7 +1413,7 @@ class Distiller:
                     continue
                 
                 # Only update weights after accumulation steps
-                if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                if step % self.config.gradient_accumulation_steps == 0:
                     # ===== OOM Reduction: AMP optimizer step =====
                     scaler = getattr(self, "_scaler", None)
                     if scaler is not None:
