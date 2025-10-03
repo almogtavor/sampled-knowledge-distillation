@@ -502,7 +502,8 @@ Our methods differ in using entropy/KL primarily to decide which tokens receive 
 
 % (moved) Entropy approximation subsection relocated before Related Work.
 
-\subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP. Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}.
+\subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP.
+Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}.
 Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2024perplexedperplexityperplexitybaseddata} and surveys consolidate techniques \citep{datasel2024survey}.
 % Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. 
 Our method is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
