@@ -43,7 +43,7 @@ normalization via `--score_normalize`.
 We use Ollama's Qwen3-8B in 4-bit as teacher:
 ```bash
 # Vanilla KD
-python ekd_distill.py \
+python run_distillation.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type vanilla \
@@ -54,7 +54,7 @@ python ekd_distill.py \
     --output_dir ./kd_vanilla_run
 
 # Entropy-guided KD (top-k token selection)
-python ekd_distill.py \
+python run_distillation.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type top-k-tok \
@@ -66,7 +66,7 @@ python ekd_distill.py \
     --output_dir ./kd_top_k_tok_run
 
 # Bucket distillation (e.g., distill on 70th-80th percentile entropy tokens)
-python ekd_distill.py \
+python run_distillation.py \
     --teacher_model Qwen/Qwen3-8B \
     --student_model Qwen/Qwen3-0.6B \
     --distill_type bucket \
@@ -79,7 +79,7 @@ python ekd_distill.py \
     --output_dir ./kd_bucket_run
 
 # Top-k selection with score-based ranking (entropy + CE + KL)
-python ekd_distill.py \
+python run_distillation.py \
   --teacher_model Qwen/Qwen3-8B \
   --student_model Qwen/Qwen3-0.6B \
   --distill_type top-k-tok \
@@ -95,7 +95,7 @@ python ekd_distill.py \
   --output_dir ./kd_score_run
 
 # LinUCB contextual bandit distillation
-python ekd_distill.py \
+python run_distillation.py \
   --teacher_model Qwen/Qwen3-8B \
   --student_model Qwen/Qwen3-0.6B \
   --distill_type linucb \
