@@ -13,7 +13,7 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-from ekd.run_registry import compute_params_hash, upsert_eval_results
+from sampledkd.run_registry import compute_params_hash, upsert_eval_results
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -30,7 +30,7 @@ if "HF_DATASETS_CACHE" not in os.environ:
 
 # ---------- Logging imports ----------
 try:
-    from ekd.logging.wandb_utils import (
+    from sampledkd.logging.wandb_utils import (
         WandBLogger,
         log_evaluation_to_wandb,
         log_evaluation_to_tensorboard,
@@ -150,7 +150,7 @@ def materialize_manual_tasks(config: BenchmarkConfig, cache_root: Path) -> Path:
     src_utils = Path(__file__).with_name("utils.py")
     if src_utils.exists():
         # Copy as a flattened module name for lm-eval to find
-        shutil.copy2(src_utils, manual_dir / "ekd.evaluations.utils.py")
+        shutil.copy2(src_utils, manual_dir / "sampledkd.evaluations.utils.py")
     return manual_dir
 
 # ---------- Utility ----------

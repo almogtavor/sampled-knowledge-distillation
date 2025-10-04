@@ -295,7 +295,7 @@ The evaluator now accepts a single model path:
 sbatch evals.slurm <MODEL_PATH> <SUITE: light|heavy>
 
 # Direct (if you already have an env active)
-python -m ekd.evaluations.eval <MODEL_PATH> --suite light
+python -m sampledkd.evaluations.eval <MODEL_PATH> --suite light
 ```
 
 **Examples:**

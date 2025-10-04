@@ -168,7 +168,7 @@ if [[ "$MODE_ARG" == "from_hf" ]]; then
   EVAL_ARGS+=( --from_hf )
 fi
 LOG_BASENAME=$(echo "$MODEL_PATH" | sed 's#[/ ]#_#g')
-srun -u "$PY" ekd/evaluations/eval.py "$MODEL_PATH" "${EVAL_ARGS[@]}" | tee "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log"
+srun -u "$PY" sampledkd/evaluations/eval.py "$MODEL_PATH" "${EVAL_ARGS[@]}" | tee "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log"
 
 # extract LaTeX table if present
 awk '/\\begin{table}/, /\\end{table}/' "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log" > "eval_runs/${LOG_BASENAME}.${SUITE}.table.${SLURM_JOB_ID}.tex" || true
