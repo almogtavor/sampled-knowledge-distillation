@@ -260,7 +260,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
 
   echo "[run_all_4m] Evaluating baselines (suite=$SUITE)"
   # Pass a mode flag 'from_hf' to tell evals to treat MODEL_PATH as a HF hub ID
-  sbatch evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
+  # sbatch evals.slurm "Qwen/Qwen3-8B" "$SUITE" from_hf
   # sbatch --wait evals.slurm "Qwen/Qwen3-0.6B" "$SUITE" from_hf
 
   echo "[run_all_4m] Training runs (4M tokens each)"
@@ -268,18 +268,18 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 100 light "$KD_SWEEP_TAG"
 
   # 2) Token Selective KD k=25
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 3) Token Selective KD k=75
   sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
 
   # 4) Token Selective KD Bucket top 5% of the tokens to top 25%
-  sbatch --wait --export=ALL,BUCKET_LOWER_PERCENT=5,BUCKET_UPPER_PERCENT=25,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm bucket 0 light "$KD_SWEEP_TAG"
+  sbatch --export=ALL,BUCKET_LOWER_PERCENT=5,BUCKET_UPPER_PERCENT=25,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm bucket 0 light "$KD_SWEEP_TAG"
 
   # 6) Token Selective KD Random k=25 Baseline
   sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm random 25 light "$KD_SWEEP_TAG"
 
-  sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
+  sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
 
   # 7) SampledKD k=25 (top-k with cached elimination)
   sbatch --wait train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
@@ -291,18 +291,18 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   sbatch --wait train.slurm top-k-tok 75 light "$KD_SWEEP_TAG"
 
   # 11) SampledKD Pos RS-KD k=25
-  sbatch train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
-
-  # # 12) SampledKD Trained also on GSM8K k=25 (GSM8K-only run)
-  # # Note: train.slurm supports DATASETS / DATASET_CONFIG / PROMPT_COL / ANSWER_COL overrides
-  sbatch --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
-    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  sbatch --wait train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
 
   # 13) SampledKD LinUCB k=25
   sbatch --wait train.slurm linucb 25 light "$KD_SWEEP_TAG"
 
   # 10) SampledKD Score k=25 (enable score-based selection)
   sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+
+  # # 12) SampledKD Trained also on GSM8K k=25 (GSM8K-only run)
+  # # Note: train.slurm supports DATASETS / DATASET_CONFIG / PROMPT_COL / ANSWER_COL overrides
+  sbatch --wait --export=ALL,DATASETS="gsm8k",DATASET_CONFIG="main",PROMPT_COL="question",ANSWER_COL="answer" \
+    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   echo "[run_all_4m] All jobs submitted and completed in sequence."
 

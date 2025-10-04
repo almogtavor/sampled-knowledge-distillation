@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --gpus=4
+#SBATCH --gpus=2
 #SBATCH --output=logs/train.%j.log
 #SBATCH --error=logs/train.%j.log
 # Ensure W&B agent env vars propagate into job
