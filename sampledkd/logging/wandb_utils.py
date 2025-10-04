@@ -27,7 +27,7 @@ except ImportError:
 
     if TYPE_CHECKING:
         # For type checkers/linting only; avoids runtime import cycles
-        from ekd.config import TrainingConfig
+        from sampledkd.config import TrainingConfig
 
 
 class WandBLogger:

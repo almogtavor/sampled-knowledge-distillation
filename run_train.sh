@@ -16,7 +16,7 @@ OUTPUT_DIR="/home/joberant/NLP_2425b/$USER/ekd/kd_${DISTILL_TYPE_DIR}_run_out_mo
 
 # The python script with all its arguments.
 # Adjust arguments here as needed.
-python3 ekd_distill.py \
+python3 run_distillation.py \
     --teacher_model "Qwen/Qwen3-8B" \
     --student_model "Qwen/Qwen3-0.6B" \
     --distill_type "$DISTILL_TYPE" \

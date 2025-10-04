@@ -1,211 +1,34 @@
 import argparse
 import os
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from datasets import load_dataset
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from ekd.config import TrainingConfig
-from ekd.run_registry import compute_params_hash, upsert_run_start, mark_trained, exists as registry_exists, normalize_params
-from ekd.utils import _bnb_triton_available
-from ekd.data.dataset import AIMEJsonl, DistillCollator
-from ekd.models.loader import load_model
-from ekd.training.distiller import Distiller
+from sampledkd.config import TrainingConfig
+from sampledkd.run_registry import (
+    compute_params_hash,
+    upsert_run_start,
+    mark_trained,
+    exists as registry_exists,
+    normalize_params,
+    get_entry,
+)
+from sampledkd.data.dataset import AIMEJsonl, DistillCollator
+from sampledkd.models.loader import load_model
+from sampledkd.distill import Distiller
+from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
 
 # Import logging utils with fallback
 try:
-    from ekd.logging.wandb_utils import create_training_combined_logger
+    from sampledkd.logging.wandb_utils import create_training_combined_logger
 except ImportError:
     def create_training_combined_logger(*args, **kwargs):
         return None
-
-
-def load_teacher_with_fallback(
-    model_name: str,
-    prefer_gpus: List[int],          # Local GPU indices to use for the teacher, in order of preference
-    student_gpu: Optional[int],      # Local GPU index reserved for the student (exclude from teacher)
-) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
-    """
-    1) Try single-GPU FP16 on prefer_gpus[0]
-    2) If OOM, try 2-GPU sharding across prefer_gpus[0:2] (excluding student_gpu)
-    3) If still OOM, try 8-bit on single GPU
-    4) If still OOM, try 4-bit on single GPU
-    Returns: (teacher_model, tokenizer, teacher_device_for_inputs)
-    """
-    # Helper: make a local offload/cache dir (per job if SLURM), prefer node-local TMPDIR
-    tmpdir = os.environ.get("TMPDIR", "/home/joberant/NLP_2425b/almogt/ekd/tmp")
-    offload_dir = os.path.join(tmpdir, "hf_offload_teacher")
-    os.makedirs(offload_dir, exist_ok=True)
-
-    # Tokenizer first (slow & local to avoid cluster hiccups)
-    tok = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,
-        trust_remote_code=True,
-        local_files_only=False,   # set True if your cache is complete
-    )
-    if tok.pad_token_id is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token
-
-    # Filter teacher GPUs (exclude student's GPU if present)
-    teacher_gpus = [g for g in prefer_gpus if g != student_gpu]
-    if not teacher_gpus:
-        raise RuntimeError("No GPUs available for teacher after excluding the student GPU.")
-
-    # ===== 1) 8-bit quantization on single GPU =====
-    try:
-        if not _bnb_triton_available():
-            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
-        from transformers import BitsAndBytesConfig
-        q8 = BitsAndBytesConfig(load_in_8bit=True)
-        one = teacher_gpus[0]
-        print(f"[teacher] Trying 8-bit quantization on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            quantization_config=q8,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded 8-bit.", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except Exception as e:
-        print(f"[teacher] 8-bit failed: {e}", flush=True)
-
-
-    # ===== 2) Single-GPU FP16 (best performance if it fits) =====
-    try:
-        one = teacher_gpus[0]
-        print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            dtype=torch.float16,             # use 'dtype' (not torch_dtype)
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded on single GPU.", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except RuntimeError as e:
-        if "out of memory" not in str(e).lower():
-            print(f"[teacher] Single-GPU load failed (non-OOM): {e}", flush=True)
-            # continue anyway and try multi-GPU
-        else:
-            print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
-
-    # ===== 3) Multi-GPU sharding with Accelerate =====
-    if len(teacher_gpus) >= 2:
-        try:
-            print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
-
-            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
-
-            # Use all teacher_gpus with per-GPU caps
-            max_memory = {g: "11GiB" for g in teacher_gpus}
-            max_memory["cpu"] = "40GiB"
-
-            teacher = load_checkpoint_and_dispatch(
-                empty_model,
-                checkpoint=model_name,
-                device_map="balanced_low_0",
-                max_memory=max_memory,
-                offload_folder=offload_dir,
-                dtype=torch.float16,
-            )
-            teacher.eval()
-            for p in teacher.parameters():
-                p.requires_grad_(False)
-
-            print(f"[teacher] Multi-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
-            # For model-parallel HF models, feeding inputs on the first teacher GPU is fine:
-            return teacher, tok, torch.device(f"cuda:{teacher_gpus[0]}")
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                print(f"[teacher] Multi-GPU load failed (non-OOM): {e}", flush=True)
-            else:
-                print("[teacher] Multi-GPU OOM, falling back to quantization (you should always start with no quantization or FP16!)...", flush=True)
-        except Exception as e:
-            print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
-
-    # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
-    try:
-        import importlib
-        _torch_ver = getattr(torch, "__version__", "?")
-        try:
-            _triton = importlib.import_module("triton")
-            _triton_ver = getattr(_triton, "__version__", "installed")
-        except Exception:
-            _triton_ver = "not-installed"
-        try:
-            _bnb = importlib.import_module("bitsandbytes")
-            _bnb_ver = getattr(_bnb, "__version__", "installed")
-        except Exception:
-            _bnb_ver = "not-installed"
-        print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
-    except Exception:
-        pass
-
-    # ===== 4) 4-bit quantization on single GPU (last resort) =====
-    try:
-        if not _bnb_triton_available():
-            raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
-        from transformers import BitsAndBytesConfig
-        q4 = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        one = teacher_gpus[0]
-        print(f"[teacher] Trying 4-bit quantization (last resort) on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            quantization_config=q4,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded with 4-bit quantization (last resort).", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except Exception as e:
-        raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
-
-
-def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
-    """
-    Load FineWeb-Edu subset with automatic caching.
-    First run: streams, filters, and caches to disk.
-    Subsequent runs: loads from cache instantly.
-    
-    Returns a list of {prompt, answer} examples.
-    """
-    from ekd.data.cache import load_or_create_fineweb_cache
-    
-    return load_or_create_fineweb_cache(
-        tokenizer=tokenizer,
-        max_tokens=max_tokens,
-        max_seq_len=max_seq_len,
-        seed=seed,
-        batch_size=512,
-    )
-
 
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
@@ -383,12 +206,12 @@ def main():
     # If SLURM provides a local scratch (e.g., /dev/shm), use it; fall back to repo tmp
     node_tmp = os.environ.get("TMPDIR")
     if not node_tmp:
-        shm_candidate = f"/dev/shm/{os.environ.get('USER', 'user')}.ekd.{os.environ.get('SLURM_JOB_ID', 'local')}"
+        shm_candidate = f"/dev/shm/{os.environ.get('USER', 'user')}.sampledkd.{os.environ.get('SLURM_JOB_ID', 'local')}"
         try:
             os.makedirs(shm_candidate, exist_ok=True)
             node_tmp = shm_candidate
         except Exception:
-            node_tmp = f"/home/joberant/NLP_2425b/{os.environ.get('USER', 'user')}/ekd/tmp"
+            node_tmp = f"/home/joberant/NLP_2425b/{os.environ.get('USER', 'user')}/sampledkd/tmp"
         os.environ["TMPDIR"] = node_tmp
     # Point HF caches to tmp (can still hit shared cache via symlink if needed)
     os.environ.setdefault("HF_HOME", os.path.join(node_tmp, "hf"))
@@ -418,8 +241,15 @@ def main():
     params_hash = compute_params_hash(params_dict)
 
     if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+        entry = get_entry(registry_path, params_hash)
+        completed_eval = bool(entry and entry.get("completed_eval"))
+        runs_info = entry.get("runs", {}) if entry else {}
+        existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
         print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
-        return
+        needs_eval = not completed_eval
+        meta_output_dir = existing_output_dir or ""
+        print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
+        sys.exit(11 if needs_eval else 10)
 
     # Create experiment name early (not part of the hash)
     current_date = datetime.now().strftime("%Y%m%d_%H%M")

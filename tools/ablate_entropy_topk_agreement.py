@@ -33,8 +33,8 @@ if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
 try:
-    from ekd.data.dataset import DistillCollator
-    from ekd.training.entropy_utils import (
+    from sampledkd.data.dataset import DistillCollator
+    from sampledkd.training.entropy_utils import (
         token_entropy,
         truncated_entropy_topk_tail,
         truncated_entropy_topk_tail_midpoint,
@@ -44,7 +44,7 @@ try:
     )
 except ModuleNotFoundError as e:
     raise SystemExit(
-        "Failed to import 'ekd'. Run from the repo root, or install the package (pip install -e .).\n"
+    "Failed to import 'sampledkd'. Run from the repo root, or install the package (pip install -e .).\n"
         f"sys.path[0]={sys.path[0]} repo_root={_repo_root} original error: {e}"
     )
 
@@ -98,7 +98,7 @@ def main():
     if args.base_model and args.checkpoint:
         from pathlib import Path
         from tempfile import TemporaryDirectory
-        from ekd.ekd.evaluations.eval import export_hf_model  # reuse exporter
+        from sampledkd.evaluations.eval import export_hf_model  # reuse exporter
         export_tmp = TemporaryDirectory()
         tmp_dir = Path(export_tmp.name) / "ablate_export"
         ckpt_path = Path(args.checkpoint)

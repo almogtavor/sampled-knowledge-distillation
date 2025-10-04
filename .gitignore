@@ -241,3 +241,4 @@ results/
 .github/copilot-instructions.md
 evals/
 evaluation_json_results/
+.nfs*

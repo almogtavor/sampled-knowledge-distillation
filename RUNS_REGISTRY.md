@@ -83,14 +83,14 @@ Each entry in `runs.json` has this structure:
 
 ## How It Works
 
-### During Training (`ekd_distill.py`)
+### During Training (`run_distillation.py`)
 1. Computes hash from training config
 2. Checks `runs.json` for existing entry with same hash
 3. If `completed_train=True`, **skips training** (unless `--override`)
 4. Otherwise, creates/updates entry with `status="started"`
 5. After training, sets `status="trained"` and `completed_train=True`
 
-### During Evaluation (`ekd/evaluations/eval.py`)
+### During Evaluation (`sampledkd/evaluations/eval.py`)
 1. Loads model's training params (from `run_params.json` or `config.json`)
 2. Computes hash from those params
 3. Finds matching entry in `runs.json`
@@ -144,9 +144,9 @@ The same training run can be evaluated multiple times:
 ## Files
 
 - **Registry**: `results/runs.json`
-- **Registry logic**: `ekd/run_registry.py`
-- **Training integration**: `ekd_distill.py` (calls `upsert_run_start`, `mark_trained`)
-- **Eval integration**: `ekd/evaluations/eval.py` (calls `upsert_eval_results`)
+- **Registry logic**: `sampledkd/run_registry.py`
+- **Training integration**: `run_distillation.py` (calls `upsert_run_start`, `mark_trained`)
+- **Eval integration**: `sampledkd/evaluations/eval.py` (calls `upsert_eval_results`)
 
 ---
 
