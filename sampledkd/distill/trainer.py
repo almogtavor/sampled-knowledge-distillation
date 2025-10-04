@@ -25,6 +25,7 @@ from ._mixins.gls import GLSMixin
 from ._mixins.kd_core import KDCoreMixin
 from ._mixins.selection_scoring import SelectionScoringMixin
 from ._mixins.rs_vocab import kl_from_vocab_samples
+from .ce_estimators import ce_elimination_estimator
 
 
 class Distiller(
@@ -286,12 +287,11 @@ class Distiller(
                     kd_pos_proxy_rows = -(probs_U * s_logp_on_U).sum(dim=1)     # [P]
 
                     y_rows = input_ids_s[batch_idx, pos_idx + 1]                # [P]
-                    # CE should always be at T=1 (standard KD practice)
-                    z_y = s_rows.gather(1, y_rows.view(-1, 1)).squeeze(1)       # [P] (no temperature division)
-                    z_M_ce = z_M_all if M_neg > 0 else z_y.view(-1, 1)[:, :0]  # [P, M] (no log(V) correction needed for T=1)
-                    z_all = torch.cat([z_y.view(-1, 1), z_M_ce], dim=1)         # [P, 1+M]
-                    logZ_ce = torch.logsumexp(z_all, dim=1)                     # [P]
-                    ce_pos_proxy_rows = -(z_y - logZ_ce)                        # [P]
+                    ce_pos_proxy_rows = ce_elimination_estimator(
+                        s_rows=s_rows,
+                        ids_M_shared=ids_M_shared,
+                        y_rows=y_rows,
+                    )
 
                     # Scatter proxies back to [B, L-1]
                     Bsz, Lm1 = valid_next.size()

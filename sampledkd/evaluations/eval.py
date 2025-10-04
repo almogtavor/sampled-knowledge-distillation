@@ -389,13 +389,15 @@ HEAVY_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
 # Per-task timeouts (seconds).
 TASK_TIMEOUTS = {
     # light-ish baselines
+    "gsm8k": 30000,
+    "hellaswag": 30000,
+    "piqa": 30000,
+    "lambada_openai": 30000,
     "arc_challenge": 6000,
     "arc_easy": 6000,
-    "gsm8k": 10000,
     "svamp": 6000,
     "aime25": 6000,
     "boolq": 600,
-    "hellaswag": 10000,
     # heavy add-ons
     "asdiv": 1200,
     "hendrycks_math": 3600,
