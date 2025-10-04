@@ -87,6 +87,15 @@ def find_entry(items: List[Dict[str, Any]], params_hash: str) -> Optional[int]:
     return None
 
 
+def get_entry(registry_path: Path, params_hash: str) -> Optional[Dict[str, Any]]:
+    """Return the registry entry for the given hash, if present."""
+    items = _load_registry(registry_path)
+    idx = find_entry(items, params_hash)
+    if idx is None:
+        return None
+    return items[idx]
+
+
 def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                      experiment_name: Optional[str] = None,
                      job_id: Optional[str] = None,

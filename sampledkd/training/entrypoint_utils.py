@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from typing import List, Optional, Tuple
 
@@ -8,6 +9,35 @@ from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from sampledkd.utils import _bnb_triton_available
+
+
+def _cleanup_cuda(device_idx: int) -> None:
+    """Aggressively free caches on the target CUDA device before loading."""
+    if not torch.cuda.is_available():
+        return
+    try:
+        prev = torch.cuda.current_device()
+    except Exception:
+        prev = None
+    try:
+        torch.cuda.set_device(device_idx)
+    except Exception:
+        pass
+    try:
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+        torch.cuda.reset_max_memory_allocated()
+        torch.cuda.reset_max_memory_cached()
+    except Exception:
+        pass
+    finally:
+        if prev is not None:
+            try:
+                torch.cuda.set_device(prev)
+            except Exception:
+                pass
+    gc.collect()
 
 
 def load_teacher_with_fallback(
@@ -69,6 +99,8 @@ def load_teacher_with_fallback(
     # ===== 2) Single-GPU FP16 (best performance if it fits) =====
     try:
         one = teacher_gpus[0]
+        print(f"[teacher] Clearing CUDA caches on cuda:{one} before FP16 load", flush=True)
+        _cleanup_cuda(one)
         print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,

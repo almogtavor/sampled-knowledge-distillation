@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +10,14 @@ import torch
 from datasets import load_dataset
 
 from sampledkd.config import TrainingConfig
-from sampledkd.run_registry import compute_params_hash, upsert_run_start, mark_trained, exists as registry_exists, normalize_params
+from sampledkd.run_registry import (
+    compute_params_hash,
+    upsert_run_start,
+    mark_trained,
+    exists as registry_exists,
+    normalize_params,
+    get_entry,
+)
 from sampledkd.data.dataset import AIMEJsonl, DistillCollator
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
@@ -233,8 +241,15 @@ def main():
     params_hash = compute_params_hash(params_dict)
 
     if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+        entry = get_entry(registry_path, params_hash)
+        completed_eval = bool(entry and entry.get("completed_eval"))
+        runs_info = entry.get("runs", {}) if entry else {}
+        existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
         print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
-        return
+        needs_eval = not completed_eval
+        meta_output_dir = existing_output_dir or ""
+        print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
+        sys.exit(11 if needs_eval else 10)
 
     # Create experiment name early (not part of the hash)
     current_date = datetime.now().strftime("%Y%m%d_%H%M")
