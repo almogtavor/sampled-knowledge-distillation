@@ -25,7 +25,7 @@ from ._mixins.gls import GLSMixin
 from ._mixins.kd_core import KDCoreMixin
 from ._mixins.selection_scoring import SelectionScoringMixin
 from ._mixins.rs_vocab import kl_from_vocab_samples
-from .ce_estimators import ce_elimination_estimator
+from .ce_estimators import ce_is_estimator
 
 
 class Distiller(
@@ -287,9 +287,12 @@ class Distiller(
                     kd_pos_proxy_rows = -(probs_U * s_logp_on_U).sum(dim=1)     # [P]
 
                     y_rows = input_ids_s[batch_idx, pos_idx + 1]                # [P]
-                    ce_pos_proxy_rows = ce_elimination_estimator(
+                    ce_pos_proxy_rows = ce_is_estimator(
                         s_rows=s_rows,
+                        ids_U=ids_U,
+                        probs_U=probs_U,
                         ids_M_shared=ids_M_shared,
+                        M_neg=M_neg,
                         y_rows=y_rows,
                     )
 
