@@ -242,3 +242,4 @@ results/
 evals/
 evaluation_json_results/
 .nfs*
+pip-*

@@ -282,7 +282,7 @@ elif [[ "$MODE" == "run_all_4m" ]]; then
   # sbatch --export=ALL,NO_ELIMINATE_SOFTMAX=1,NO_OFFLINE=1 train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
 
   # 7) SampledKD k=25 (top-k with cached elimination)
-  sbatch train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+  # sbatch train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
   # 8) SampledKD k=25 with softmax (no cache/no elim)
   sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"

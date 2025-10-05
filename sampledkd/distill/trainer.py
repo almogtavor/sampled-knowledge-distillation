@@ -162,10 +162,23 @@ class Distiller(
         do_elim = bool(getattr(self.config, "eliminate_softmax", False)) and (cached_items is not None)
         # Whether we will use the cached RS-KD vocabulary estimator path at all
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
+        distill_type = getattr(self.config, "distill_type", "vanilla")
+        score_enabled_flag = bool(getattr(self.config, "score_token_selection", False))
 
-        # Only run teacher forward if we are NOT in elimination mode or cache is missing
+        supports_cached_no_elim = (
+            use_vocab_rs_kd
+            and cached_items is not None
+            and not do_elim
+            and distill_type in {"vanilla", "top-k-tok", "bucket", "random"}
+        )
+
+        # Only run teacher forward if we are NOT in elimination mode or cache is missing/unsupported
         t_pred = t_log_probs = None
-        if not do_elim:
+        if supports_cached_no_elim and not self._printed_cache_info:
+            print("[logits-cache] Using offline cache without elimination → computing KD from cache.", flush=True)
+            self._printed_cache_info = True
+
+        if not do_elim and not supports_cached_no_elim:
             input_ids_t = input_ids.to(self.teacher_device)
             attn_t = attn_mask.to(self.teacher_device)
             with torch.no_grad():
@@ -304,17 +317,177 @@ class Distiller(
                     ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows
 
                     if not do_elim:
-                        # ---------- EKD over cached subset U (vectorized over all positions) ----------
                         if s_log_probs is None:
                             s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
                         s_rows_logp = s_log_probs[batch_idx, pos_idx]          # [P_total, V]
-                        s_logp_on_U = torch.gather(s_rows_logp, 1, ids_U)      # [P_total, U_max]
-                        kd_loss = -(probs_U * s_logp_on_U).sum(dim=1).mean()
+                        s_logp_on_U_exact = torch.gather(s_rows_logp, 1, ids_U)  # [P_total, U_max]
+                        kd_rows_exact = -(probs_U * s_logp_on_U_exact).sum(dim=1)
                         ce_loss_override = None
+
+                        if not supports_cached_no_elim:
+                            kd_loss = kd_rows_exact.mean() if kd_rows_exact.numel() > 0 else s_pred.sum() * 0.0
+                        else:
+                            distill = distill_type
+                            score_enabled = score_enabled_flag
+                            score_ctx = None
+                            ent_cached = None
+                            if distill in {"top-k-tok", "bucket", "random"}:
+                                ent_cached = self._entropy_for_selection(input_ids, t_pred=None).to(self.student_device)
+                                if score_enabled:
+                                    score_ctx = self._prepare_score_context(
+                                        ent_raw=ent_cached,
+                                        kl_pos=kd_pos_proxy,
+                                        s_log_probs=None,
+                                        valid_next=valid_next,
+                                        input_ids=input_ids,
+                                        student_ce_override=ce_pos_proxy,
+                                    )
+
+                            if distill == "vanilla":
+                                kd_loss = kd_rows_exact.mean() if kd_rows_exact.numel() > 0 else s_pred.sum() * 0.0
+                            elif distill == "top-k-tok":
+                                pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                if score_enabled and score_ctx is not None:
+                                    stat = torch.full_like(ent_cached, float('-inf'))
+                                    for i in range(valid_next.size(0)):
+                                        mask_i = valid_next[i]
+                                        combined = self._build_score_vector(score_ctx, i, mask_i)
+                                        if combined is not None:
+                                            stat[i] = combined
+                                    stat = stat.masked_fill(~valid_next, float('-inf'))
+                                else:
+                                    stat = ent_cached.masked_fill(~valid_next, float('-inf'))
+
+                                use_gls = bool(getattr(self.config, "gls_enabled", False))
+                                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                                sel_topk_count = 0
+                                sel_gls_count = 0
+                                if not use_gls:
+                                    for i in range(valid_next.size(0)):
+                                        mask_i = valid_next[i]
+                                        n_valid = int(mask_i.sum().item())
+                                        if n_valid < 3:
+                                            continue
+                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        sel_topk_count += int(k)
+                                        valid_idx_i = torch.where(mask_i)[0]
+                                        scores = stat[i][mask_i].float()
+                                        if scores.numel() == 0:
+                                            continue
+                                        _, rel = torch.topk(scores, k=k, largest=True, sorted=False)
+                                        sel_abs = valid_idx_i[rel]
+                                        keep_mask[i, sel_abs] = True
+                                else:
+                                    self._gls_init_if_needed()
+                                    thr = self._gls_threshold(top_percent=self.config.k_percent)
+                                    if thr is None:
+                                        for i in range(valid_next.size(0)):
+                                            mask_i = valid_next[i]
+                                            n_valid = int(mask_i.sum().item())
+                                            if n_valid < 3:
+                                                continue
+                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                            sel_topk_count += int(k)
+                                            valid_idx_i = torch.where(mask_i)[0]
+                                            scores = stat[i][mask_i].float()
+                                            if scores.numel() == 0:
+                                                continue
+                                            _, rel = torch.topk(scores, k=k, largest=True, sorted=False)
+                                            sel_abs = valid_idx_i[rel]
+                                            keep_mask[i, sel_abs] = True
+                                    else:
+                                        keep_mask = (stat >= thr) & valid_next
+                                        sel_gls_count = int(keep_mask.sum().item())
+                                    vals = stat[valid_next].detach().float().to("cpu")
+                                    vals = vals[torch.isfinite(vals)]
+                                    self._gls_push(vals)
+                                    if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
+                                        self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+
+                                if P_total > 0:
+                                    selected_rows = keep_mask[batch_idx, pos_idx]
+                                else:
+                                    selected_rows = torch.zeros(0, dtype=torch.bool, device=self.student_device)
+                                if selected_rows.any():
+                                    kd_loss = kd_rows_exact[selected_rows].mean()
+                                else:
+                                    kd_loss = s_pred.sum() * 0.0
+
+                                if self.logger:
+                                    self.logger.log({
+                                        "train/selected_tokens_topk": float(sel_topk_count),
+                                        "train/selected_tokens_gls": float(sel_gls_count),
+                                    }, self.global_step)
+
+                            elif distill == "bucket":
+                                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                                for i in range(valid_next.size(0)):
+                                    mask_i = valid_next[i]
+                                    if mask_i.sum() < 3:
+                                        continue
+                                    if score_enabled and score_ctx is not None:
+                                        combined = self._build_score_vector(score_ctx, i, mask_i)
+                                        if combined is None:
+                                            continue
+                                        vec = combined[mask_i].float()
+                                    else:
+                                        vec = ent_cached[i][mask_i].float()
+
+                                    low = torch.quantile(vec, self.config.bucket_lower_percent / 100.0)
+                                    high = torch.quantile(vec, self.config.bucket_upper_percent / 100.0)
+                                    rel = torch.where(mask_i)[0]
+                                    sel = (vec >= low) & (vec <= high)
+                                    if sel.any():
+                                        keep_mask[i, rel[sel]] = True
+
+                                if P_total > 0:
+                                    selected_rows = keep_mask[batch_idx, pos_idx]
+                                else:
+                                    selected_rows = torch.zeros(0, dtype=torch.bool, device=self.student_device)
+                                if selected_rows.any():
+                                    kd_loss = kd_rows_exact[selected_rows].mean()
+                                else:
+                                    kd_loss = s_pred.sum() * 0.0
+
+                            elif distill == "random":
+                                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
+                                pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                for i in range(valid_next.size(0)):
+                                    mask_i = valid_next[i]
+                                    n_valid = int(mask_i.sum().item())
+                                    if n_valid < 2:
+                                        continue
+                                    k = max(1, int(n_valid * pct))
+                                    valid_idx_i = torch.where(mask_i)[0]
+                                    if score_enabled and score_ctx is not None:
+                                        combined = self._build_score_vector(score_ctx, i, mask_i)
+                                        if combined is None:
+                                            continue
+                                        scores = combined[mask_i].float()
+                                        s = scores - scores.min()
+                                        s = torch.clamp(s, min=1e-8)
+                                        probs = s / s.sum()
+                                        rel = torch.multinomial(probs, num_samples=k, replacement=False)
+                                    else:
+                                        perm = torch.randperm(valid_idx_i.numel(), device=self.student_device)
+                                        rel = perm[:k]
+                                    sel_abs = valid_idx_i[rel]
+                                    keep_mask[i, sel_abs] = True
+
+                                if P_total > 0:
+                                    selected_rows = keep_mask[batch_idx, pos_idx]
+                                else:
+                                    selected_rows = torch.zeros(0, dtype=torch.bool, device=self.student_device)
+                                if selected_rows.any():
+                                    kd_loss = kd_rows_exact[selected_rows].mean()
+                                else:
+                                    kd_loss = s_pred.sum() * 0.0
+                            else:
+                                kd_loss = kd_rows_exact.mean() if kd_rows_exact.numel() > 0 else s_pred.sum() * 0.0
                     else:
                         # ---------- Elimination path with selection-aware proxies ----------
-                        distill = getattr(self.config, "distill_type", "vanilla")
-                        score_enabled = bool(getattr(self.config, "score_token_selection", False))
+                        distill = distill_type
+                        score_enabled = score_enabled_flag
 
                         # Default: keep all valid rows
                         keep_mask = valid_next.clone()
