@@ -151,3 +151,22 @@ The same training run can be evaluated multiple times:
 ---
 
 **TL;DR**: `runs.json` is a content-addressed database of training runs and their evaluations. Hash = training config. No duplicates, easy lookups, clean diffs.
+
+## Automation helper
+
+To keep a sweep moving without babysitting SLURM, you can use the polling helper in `tools/runs_autopilot.py`. It reads `results/runs.json`, keeps a small number of training jobs active, and will trigger evaluations once training finishes.
+
+```bash
+python tools/runs_autopilot.py \
+  --max-train 3 \
+  --max-eval 2 \
+  --interval 900
+```
+
+Key assumptions:
+
+- The registry already contains the parameter blobs for runs you want to execute (they appear automatically once a run starts).
+- Training jobs are launched through `train.slurm`, which in turn submits `evals.slurm` when the `--eval-suite` argument is provided (default `light`).
+- The helper keeps a tiny state file at `results/automation_state.json` so it can avoid resubmitting the same job if it is already queued.
+
+Use `--dry-run` to see what _would_ be submitted without actually calling `sbatch`, and `--once` to run a single pass for scripting/debugging.
