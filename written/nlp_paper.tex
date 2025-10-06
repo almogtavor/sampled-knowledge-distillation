@@ -19,7 +19,6 @@
 % For Vietnamese characters
 % \usepackage[T5]{fontenc}
 % See https://www.latex-project.org/help/documentation/encguide.pdf for other character sets
-\usepackage{graphicx} % Added for figures
 \usepackage{wrapfig}
 
 \graphicspath{{../graphs/}{graphs/}} % Search in repo graphs/ from paper dir
@@ -37,6 +36,7 @@
 % the typewriter font.
 \usepackage{inconsolata}
 
+\usepackage{amsmath, amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{mathtools}
@@ -267,42 +267,6 @@ At each step we set a threshold $\tau$ at the $(1-\tfrac{k\%}{100})$ percentile 
 All current positions with score $\ge\tau$ are selected; during warm-up we fall back to per-example top-$k$.  
 This way, roughly $k\%$ of tokens are always kept, giving a stable acceptance rate and reducing variance across batches, instead of selecting top-$k$ tokens per batch.
 
-\section{Softmax Elimination Optimizations}
-\label{sec:softmax_elimination}
-In a need of further efficiency boost, we eliminate full-vocabulary softmax during training, both at the teacher offline forward pass and both at the student distillation, by combining 4 optimizations.
-With this change, and with batching across all valid positions with shared negatives---we improved throughput from $\sim2.4,\text{s/step}$ to $\sim0.77,\text{s/step}$ ($\approx 3\times$ faster) on the same setup (max\_seq\_len=256, batch\_size=1, gradient\_accumulation\_steps=16, NVIDIA TITAN Xp GPU).
-
-\subsection{Importance-Corrected Sampled Softmax)}
-\label{sec:sampled_softmax}
-We denote by $U_t$ the small set of cached teacher tokens per position ($|U_t|=12$).
-At training time we also draw $M_t$ additional candidate tokens ($|M_t| \approx 1\text{k}$) uniformly.
-Lower choices of $M_t$ have caused high perplexity degradation.
-Let $S_t = U_t \cup M_t$.
-
-For the student, we normalize its logits $z_i$ only over $S_t$ while correcting for the sampling distribution:
-\[
-	\hat s_t(i) = \frac{\exp(z_i/T - \log q(i))}{\sum_{j \in S_t} \exp(z_j/T - \log q(j))},
-\]
-where $T$ is the KD temperature.
-The KD loss uses these $\hat s_t(i)$ on the cached teacher subset $U_t$. This replaces a full $\mathcal{O}(V)$ softmax with $\mathcal{O}(|S_t|)$.
-The $-\log q(i)$ term yields an importance-sampling estimator whose expectation matches the full softmax \citep{jean2015large}.
-
-\subsection{Sampled CE}
-Define $\tilde z_i = z_i/T - \log q(i)$ for negatives and $\tilde z_{y_t}=z_{y_t}/T$ for the gold token (no importance correction).
-Where $y_t$ is gold next-token ID at position $t$, and $i$ indexes token classes ($i\in S_t$ for KD; $i\in\{y_t\}\cup M_t$ for CE).
-
-For the cross-entropy, we include the gold token $y_t$ and negatives $M_t$ (reused from the sampled softmax \S\ref{sec:sampled_softmax}):
-\begin{align*}
-	\hat s^{\text{CE}}_t(i) = \frac{\exp(\tilde z_i)}{\sum_{j \in \{y_t\}\cup M_t} \exp(\tilde z_j)},
-\end{align*}
-Which results
-\(
-\widehat{\text{CE}}_t = -\log \hat s^{\text{CE}}_t(y_t),
-\)
-as the sampled CE loss.
-This yields an unbiased approximation to full softmax CE with cost proportional to $|M_t|$.
-Prior empirical studies show that $~1k$ negatives suffice for good convergence \citep{blanc2018adaptive}.
-
 % \section{Entropy Approximation and Gumbel Trick}
 \subsection{Entropy Approximation}
 \label{sec:entropy}
@@ -384,7 +348,8 @@ This is $3U+1$ bytes per valid position; with $U{=}12$ this is $37$~B/token.
 \[
 	\text{bytes/token} = (12 \cdot 3) + 1 = 37\ \text{B/token},
 \]
-which yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
+so for Qwen3-0.6B's $V{=}151{,}643$-token vocabulary, a float16 cache of full logits would require $2V \approx 303$~kB/token (float32: $4V \approx 607$~kB), making our 37~B/token footprint roughly $8\text{k}$--$16\text{k}\times$ smaller.
+This yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-KD cache that keeps only the packed samples, our layout adds only \textbf{1}B for entropy per position:
 \[
 	\underbrace{(12 \cdot 3)}_{\text{RS-KD }=36} \;+\; \underbrace{1}_{\text{ours}}
 	= 37\text{B/token}.
@@ -432,6 +397,9 @@ To address the high perplexity observed when training on longer sequences, we fu
 \subsection{Experimental setup}
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
+We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd}.
+That said, \citep{wang2021selectivekd} focused on CE-based selection, and we found that GLS was a bit less successful for entropy-based selection than batch top-k, even though the results were fairly close and might change when scaled.
+\citep{wang2021selectivekd} have reported $50K$ to be successful too, which we did not test.
 
 \section{Main Results}
 \label{sec:main-results}
@@ -439,28 +407,41 @@ All experiments report pass@1 accuracy, measuring the percentage of problems sol
 	\centering
 	\small
 	\setlength{\tabcolsep}{8pt}
-	\begin{tabular}{lcccc}
+	\begin{tabular}{lcccccc}
 		\toprule
-		Method                                              & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & LAMBADA (\%) $\uparrow$ \\
+		Method                                              & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & \multicolumn{2}{c}{LAMBADA} & avg. \\
+		\cmidrule(lr){5-6}
+        & & & & acc. (\%) $\uparrow$ & perplexity $\downarrow$ \\
 		\midrule
-		Full KD (all tokens, full softmax)                  & 38.6                  & 36.9                      & 66.8                 & 40.6                    \\
-		Token-selective KD (entropy top-25\%)               & 39.3                  & 37.1                      & 67.0                 & \textbf{40.7}           \\
-		Token-selective KD (bucket of 5\%-25\%)             & 39.8                  & \textbf{37.2}             & 67.2                 & 40.6                    \\
-		Token-selective KD (random 25\%)                    & 39.0                  & 36.8                      & 66.4                 & 40.4                    \\
-		\textbf{SampledKD} (top $k=30\%$ positions + RS-KD) & 29.4                  & 34.6                      & 64.8                 & 38.9                    \\
-		\quad Top $k=75\%$ positions                        & 29.1                  & 34.5                      & 64.5                 & 38.8                    \\
-		\quad Top $k=30\%$ pos, GLS (global queue)          & 26.1                  & 32.1                      & 62.6                 & 35.2                    \\
-		\quad Top $k=30\%$ pos, Score based Selection       & 29.3                  & 34.7                      & 64.4                 & 39.1                    \\
-		\quad Positional RS-KD $k=25\%$ (sampled)           & 29.5                  & 32.8                      & 65.0                 & 39.1                    \\
-		\quad $k=100\%$                                     & 29.2                  & 34.0                      & 64.4                 & 38.7                    \\
-		\quad $k=25\%$, distilled on GSM8K train split      & \textbf{41.2}         & ---                       & ---                  & ---                     \\
-		\quad LinUCB model as selector                      & 22.0                  & 27.1                      & 52.5                 & 7.6                     \\
+		Full KD (all tokens, full softmax)                  & 34.5                  & 34.7                      & 65.2                 & 40.8                    & 67.3 & 46.9 \\
+		Token-selective KD (entropy top-25\%)               & 38.4                  & 37.0                      & 67.1                 & \textbf{42.2}           & \textbf{23.4} & \textbf{48.8} \\
+		Token-selective KD (entropy top-75\%)               & ---                   & 34.7                      & 64.9                 & 41.0                    & 72.9 & --- \\
+		Token-selective KD (bucket of 5\%-25\%)             & 35.6                  & 34.5             			& 64.7                 & 40.3                    & 77.2 & 46.5 \\
+		Token-selective KD (random 25\%)                    & 31.6                  & 34.5                      & 65.3                 & 40.6                    & 69.4 & 46.8 \\
+		Token-selective KD (pos-rs-kd 25\%)                 & 32.5                  & 34.4                      & 65.5                 & 41.6           & 69.0 & 47.1 \\
+		Token-selective KD (entropy top-25\%, GLS)          & ----                  & 36.9                      & 67.1                 & ----           & ---- & ---- \\
 		\midrule
-		No KD baseline (untrained Qwen3-0.6B)               & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                    \\
+		Sampled KD (entropy top-25\%)                 		& 26.3                  & 35.7                      & 60.0                 & \textit{41.2}           		 & 38.7 & \textit{45.6} \\
+		Sampled KD (entropy top-75\%)                 		& 35.7                  & 33.8                      & 62.2                 & 33.7           		 & 305.9 & 43.2 \\
+		\midrule
+		% Sampled KD (top-75\%), softmax-elim      			& 27.3                  & 31.2                      & 59.8                 & 24.5                  	 & 2029 & 38.5 \\
+		% Sampled KD (pos-rs-kd-25\%), softmax-elim			& 23.7                  & 31.4                      & 60.6                 & 23.1                  	 & 2336 & 38.4 \\
+
+		% \quad Top $k=75\%$ positions                        & 29.1                  & 34.5                      & 64.5                 & 38.8                  &---   & \\
+		% \quad Top $k=25\%$ pos, GLS (global queue)          & 26.1                  & 32.1                      & 62.6                 & 35.2                  &---   & \\
+		% \quad Top $k=25\%$ pos, Score based Selection       & 29.3                  & 34.7                      & 64.4                 & 39.1                  &---   & \\
+		% \quad Positional RS-KD $k=25\%$ (sampled)           & 29.5                  & 32.8                      & 65.0                 & 39.1                  &---   & \\
+		% \quad $k=100\%$                                     & 29.2                  & 34.0                      & 64.4                 & 38.7                  &---   & \\
+		% \quad $k=25\%$, distilled on GSM8K train split      & \textbf{41.2}         & ---                       & ---                  & ---                   &---   & \\
+		% \quad LinUCB model as selector                      & 22.0                  & 27.1                      & 52.5                 & 7.6                   &---   & \\
+		\midrule
+		No KD baseline (untrained Qwen3-0.6B)               & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                    & 24.72 & 48.2\\
 		\bottomrule
 	\end{tabular}
 	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu 4M tokens ($\sim 22K$ examples); we report pass@1 (\%) for GSM8K and HellaSwag, accuracy (\%) for PIQA and LAMBADA.
-		Token selective KD and Full KD are regular distillations that do not apply softmax elimination nor offline cache.}
+		Token selective KD and Full KD are regular distillations that do not apply RS-KD (hence no offline cache).
+		SampledKD means positions selection + RS-KD for KLD.
+		Average excludes perplexity.}
 	\label{tab:main-reasoning}
 \end{table*}
 
@@ -516,13 +497,16 @@ We expect different behavior at larger teacher/student scales and without low-pr
 
 \subsection{SampledKD underperformance}
 While SampledKD is principled and builds on successful ideas in sampled softmax and RS-KD, and we observe superior efficiency and strong accuracy relative to baselines, our results do not yet fully match full KD at equal wall-clock.
-We attribute the remaining gap primarily to the limited training budgets (only 4M FineWeb-Edu tokens) and predominantly zero-shot evaluation, together with (i) scale and quantization effects, (ii) specific optimization techniques  (e.g., softmax elimination), and (iv) implementation details.
+We attribute the remaining gap primarily to the limited training budgets (only 4M FineWeb-Edu tokens) and predominantly zero-shot evaluation, together with scale and quantization effects.
+Another reason for the gap could be due to the fact we have trained with max\_seq\_len=256, and filtered all documents that were longer than that (to avoid perplexity issues).
+This is shorter than the average length of the FineWeb-Edu dataset (which is $\approx750$), and that may have caused bias in the training data.
+Fineweb is also a mixture of many domains, and not a good match for training a math reasoning model, which was one of our evaluation tasks that the model's performance consitently degraded at (GSM8K).
 
 \subsection{Future work}
 Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD: 
 (1) Curriculum learning based knowledge distillation for and stability, so that the model can gradually adapt to more challenging tasks, implemented according to token entropy; (2) a short speculative on-policy distillation phase after off-policy SampledKD---to re-balance calibration once accuracy has improved, leveraging SKD/GKD-style teacher feedback on student prefixes \citep{xu2024speculative}.
 
-From a computational point of view, applying token-selective KD that removes KLD steps, but keeps CE on all tokens (for stability), is losing the main efficiency gain of the time steps selection idea.
+From a computational point of view, applying token-selective KD that removes KLD steps, but keeping CE on all tokens (for stability), loses the main efficiency gain of the time steps selection idea.
 This is because CE requires softmax over all tokens, which as we have seen by the experiments, is the main performance bottleneck.
 SampledKD is one solution to this problem, but it is also possible to apply softmax elimination only on the CE term and keeping softmax for KLD, or alternatively dropping CE altogether.
 We have not explored these options yet, and leave them for future work.
