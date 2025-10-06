@@ -22,5 +22,5 @@ Assuming the Y axis is positions (the text's tokens), our KL divergence looks li
 ## Results
 
 Token-selective KD (TSKD) already matches or beats the full-KD and no-KD baselines on key zero-shot tasks.
-SampledKD delivers an ~8k–16k×logit-storage reduction with competitive accuracy, signaling that these efficiency gains should compound at larger scales!
+SampledKD delivers an ~8k–16k×logit-storage reduction with competitive accuracy, signaling that these efficiency gains should become much more impactful at larger scales!
 <img align="center" width="100%" height="100%" src="graphs/results_table.png">
