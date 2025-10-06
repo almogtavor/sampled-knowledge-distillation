@@ -423,7 +423,7 @@ Table~\ref{tab:storage} summarizes the storage requirements across different met
 \section{Evaluation}
 \label{sec:evaluation}
 
-We train our models on FineWeb-Edu with 4M tokens and evaluate them zero-shot on three diverse benchmarks: \textbf{HellaSwag} \citep{zellers2019hellaswag} (commonsense inference), \textbf{GSM8K} \citep{cobbe2021gsm8k} (grade-school math word problems), \textbf{PIQA} \citep{bisk2020piqa} (physical commonsense), and \textbf{LAMBADA} \citep{paperno2016lambada} (contextual word prediction benchmark).
+We train our models on FineWeb-Edu with 4M tokens and evaluate them zero-shot on three diverse benchmarks: \textbf{HellaSwag} \citep{zellers2019hellaswag} (commonsense inference), \textbf{GSM8K} \citep{cobbe2021gsm8k} (grade-school math word problems), \textbf{PIQA} \citep{bisk2019piqa} (physical commonsense), and \textbf{LAMBADA} \citep{paperno2016lambada} (contextual word prediction benchmark).
 
 Due to compute constraints we set a maximum sequence length of 256 tokens, and filtered out longer documents.
 An analysis on HellaSwag showed that 95\% of its documents are shorter than this, making the cutoff adequate.
@@ -536,7 +536,7 @@ SampledKD achieves a much superior performance but, in our current small-scale, 
 Given its principled foundations and prior successes of sampled softmax and RS-KD, we view SampledKD as promising, especially at larger scales and without aggressive quantization.
 
 
-\bibliography{anthology, custom}
+\bibliography{custom}
 \bibliographystyle{acl_natbib}
 
 \appendix
