@@ -58,6 +58,15 @@ EVAL_NAME_FALLBACKS = ("ekd-eval",)
 CUSTOM_TRAIN_SEQUENCE = [
     {
         "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "GLS_ENABLED": "1",
+            "FINEWEB_TOKENS": "10000000",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
@@ -152,15 +161,6 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 25,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "GLS_ENABLED": "1",
             "FINEWEB_TOKENS": "10000000",
         },
     },
@@ -605,7 +605,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-minutes", type=int, default=30, help="Delay before requeueing a failed job")
     parser.add_argument("--tag", default=None, help="Fallback KD_SWEEP_TAG when none can be inferred")
     parser.add_argument("--user", default=os.environ.get("USER"), help="SLURM account/user to monitor (default: $USER)")
-    parser.add_argument("--log-file", type=Path, default=None, help="Optional path to append all console output")
+    parser.add_argument("--log-file", type=Path, default="logs/autopilot.log", help="Optional path to append all console output")
     parser.add_argument("--dry-run", action="store_true", help="Print intended actions without calling sbatch")
     parser.add_argument("--once", action="store_true", help="Run single iteration instead of looping")
     return parser.parse_args()
