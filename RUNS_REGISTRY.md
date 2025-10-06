@@ -83,14 +83,14 @@ Each entry in `runs.json` has this structure:
 
 ## How It Works
 
-### During Training (`ekd_distill.py`)
+### During Training (`run_distillation.py`)
 1. Computes hash from training config
 2. Checks `runs.json` for existing entry with same hash
 3. If `completed_train=True`, **skips training** (unless `--override`)
 4. Otherwise, creates/updates entry with `status="started"`
 5. After training, sets `status="trained"` and `completed_train=True`
 
-### During Evaluation (`ekd/evaluations/eval.py`)
+### During Evaluation (`sampledkd/evaluations/eval.py`)
 1. Loads model's training params (from `run_params.json` or `config.json`)
 2. Computes hash from those params
 3. Finds matching entry in `runs.json`
@@ -144,10 +144,29 @@ The same training run can be evaluated multiple times:
 ## Files
 
 - **Registry**: `results/runs.json`
-- **Registry logic**: `ekd/run_registry.py`
-- **Training integration**: `ekd_distill.py` (calls `upsert_run_start`, `mark_trained`)
-- **Eval integration**: `ekd/evaluations/eval.py` (calls `upsert_eval_results`)
+- **Registry logic**: `sampledkd/run_registry.py`
+- **Training integration**: `run_distillation.py` (calls `upsert_run_start`, `mark_trained`)
+- **Eval integration**: `sampledkd/evaluations/eval.py` (calls `upsert_eval_results`)
 
 ---
 
 **TL;DR**: `runs.json` is a content-addressed database of training runs and their evaluations. Hash = training config. No duplicates, easy lookups, clean diffs.
+
+## Automation helper
+
+To keep a sweep moving without babysitting SLURM, you can use the polling helper in `tools/runs_autopilot.py`. It reads `results/runs.json`, keeps a small number of training jobs active, and will trigger evaluations once training finishes.
+
+```bash
+python tools/runs_autopilot.py \
+  --max-train 3 \
+  --max-eval 2 \
+  --interval 900
+```
+
+Key assumptions:
+
+- The registry already contains the parameter blobs for runs you want to execute (they appear automatically once a run starts).
+- Training jobs are launched through `train.slurm`, which in turn submits `evals.slurm` when the `--eval-suite` argument is provided (default `light`).
+- The helper keeps a tiny state file at `results/automation_state.json` so it can avoid resubmitting the same job if it is already queued.
+
+Use `--dry-run` to see what _would_ be submitted without actually calling `sbatch`, and `--once` to run a single pass for scripting/debugging.

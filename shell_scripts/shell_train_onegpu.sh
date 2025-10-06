@@ -232,7 +232,7 @@ PY
 
 # ---------- launch ----------
 unset PYTHONPATH PYTHONHOME
-"$PY" ekd_distill.py \
+"$PY" run_distillation.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \

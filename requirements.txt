@@ -7,7 +7,7 @@ torch==2.2.2+cu118
 transformers==4.56.2
 python-dotenv==1.1.1
 accelerate==1.10.1
-bitsandbytes==0.43.3
+bitsandbytes>=0.43.2
 triton
 sentencepiece==0.2.1
 rich==14.1.0

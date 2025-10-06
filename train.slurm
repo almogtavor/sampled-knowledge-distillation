@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
-#SBATCH --gpus=4
+#SBATCH --gpus=2
 #SBATCH --output=logs/train.%j.log
 #SBATCH --error=logs/train.%j.log
 # Ensure W&B agent env vars propagate into job
@@ -165,6 +165,7 @@ fi
 $PY -m pip -V || true
 $PY -m pip install -q --upgrade pip wheel setuptools
 
+
 # --- Force coherent CUDA stack (Torch 2.2.2+cu118 / Triton 2.2.0 / BnB 0.43.3)
 $PY - <<'PY' >/dev/null 2>&1
 import sys, importlib
@@ -181,41 +182,6 @@ if [[ $? -ne 0 ]]; then
   $PY -m pip uninstall -y torch torchvision torchaudio triton bitsandbytes || true
   $PY -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu118 \
       torch==2.2.2+cu118 torchvision==0.17.2+cu118 torchaudio==2.2.2+cu118
-  $PY -m pip install --no-cache-dir triton==2.2.0 bitsandbytes==0.43.3
-fi
-
-
-# ---------- install torch/cu118 if missing ----------
-if ! $PY - <<'PY' >/dev/null 2>&1
-import torch; print(torch.__version__)
-PY
-then
-  echo "Installing torch/cu118 into venv..."
-  $PY -m pip install --no-cache-dir --prefer-binary --only-binary=:all: \
-    --index-url https://download.pytorch.org/whl/cu118 \
-    torch==2.2.2+cu118 torchvision==0.17.2+cu118 torchaudio==2.2.2+cu118
-fi
-
-# ---------- install project requirements (skip torch* to avoid conflicts) ----------
-if [[ -f requirements.txt ]]; then
-  TMP_REQ="$TMPDIR/req.no.torch.txt"
-  grep -v -E '^[[:space:]]*torch(|vision|audio)' requirements.txt > "$TMP_REQ" || true
-  $PY -m pip install --no-cache-dir -r "$TMP_REQ"
-fi
-
-# Ensure triton and bitsandbytes are installed (defensive)
-$PY - <<'PY' >/dev/null 2>&1
-import importlib, sys
-missing = []
-for mod in ("triton", "bitsandbytes"):
-    try:
-        importlib.import_module(mod)
-    except Exception:
-        missing.append(mod)
-sys.exit(0 if not missing else 1)
-PY
-if [[ $? -ne 0 ]]; then
-  echo "Installing triton==2.2.0 and bitsandbytes==0.43.3 (post-reqs)"
   $PY -m pip install --no-cache-dir triton==2.2.0 bitsandbytes==0.43.3
 fi
 
@@ -259,7 +225,11 @@ PY
 
 # ---------- launch ----------
 unset PYTHONPATH PYTHONHOME
-"$PY" ekd_distill.py \
+TRAIN_LOG=$(mktemp)
+trap 'rm -f "$TRAIN_LOG"' EXIT
+MODEL_FOR_EVAL="$OUTPUT_DIR"
+set +e
+"$PY" run_distillation.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "Qwen/Qwen3-0.6B" \
   --distill_type "$DISTILL_TYPE" \
@@ -283,7 +253,32 @@ unset PYTHONPATH PYTHONHOME
   $(if [[ -n "${DATASET_CONFIG:-}" ]]; then echo "--dataset_config ${DATASET_CONFIG}"; fi) \
   $(if [[ -n "${PROMPT_COL:-}" ]]; then echo "--prompt_col ${PROMPT_COL}"; fi) \
   $(if [[ -n "${ANSWER_COL:-}" ]]; then echo "--answer_col ${ANSWER_COL}"; fi) \
-  "${EXTRA_ARGS[@]}"
+  "${EXTRA_ARGS[@]}" |& tee "$TRAIN_LOG"
+TRAIN_EXIT=${PIPESTATUS[0]}
+set -e
+
+if [[ $TRAIN_EXIT -eq 11 ]]; then
+  echo "Detected existing training run with pending evaluation; training skipped."
+  REG_LINE=$(grep -E "\\[registry\\] duplicate params_hash=" "$TRAIN_LOG" | tail -n1 || true)
+  EXISTING_OUTPUT_DIR=""
+  if [[ -n "$REG_LINE" ]]; then
+    EXISTING_OUTPUT_DIR=${REG_LINE#*output_dir=}
+  fi
+  if [[ -n "$EXISTING_OUTPUT_DIR" ]]; then
+    MODEL_FOR_EVAL="$EXISTING_OUTPUT_DIR"
+  else
+    echo "Warning: duplicate run reported but existing output_dir was not found; skipping eval submission." >&2
+    MODEL_FOR_EVAL=""
+  fi
+elif [[ $TRAIN_EXIT -eq 10 ]]; then
+  echo "Run already trained and evaluated; skipping eval submission."
+  MODEL_FOR_EVAL=""
+elif [[ $TRAIN_EXIT -ne 0 ]]; then
+  echo "Training failed with exit code $TRAIN_EXIT" >&2
+  exit $TRAIN_EXIT
+fi
+
+rm -f "$TRAIN_LOG"
 
 END_TIME=$(date -u)
 END_TIME_EPOCH=$(date +%s)
@@ -294,9 +289,13 @@ echo "Job finished at $END_TIME"
 echo "Total elapsed time: $ELAPSED seconds"
 
 if [[ -n "$EVAL_SUITE" ]]; then
-  echo "Submitting eval for model at: $OUTPUT_DIR (suite=$EVAL_SUITE)"
-  sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$OUTPUT_DIR" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
-  echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
+  if [[ -n "$MODEL_FOR_EVAL" ]]; then
+    echo "Submitting eval for model at: $MODEL_FOR_EVAL (suite=$EVAL_SUITE)"
+    sbatch --dependency=afterok:${SLURM_JOB_ID} evals.slurm "$MODEL_FOR_EVAL" "$EVAL_SUITE" "$EVAL_OUTPUT_DIR"
+    echo "Eval submitted with dependency on train job ${SLURM_JOB_ID}"
+  else
+    echo "Skipping eval submission (no pending evaluation required)."
+  fi
 else
   echo "No eval suite provided → skipping eval submission."
 fi
