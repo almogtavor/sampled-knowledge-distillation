@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_REGISTRY = Path("results/runs.json")
 DEFAULT_STATE = Path("results/automation_state.json")
@@ -58,19 +58,19 @@ EVAL_NAME_FALLBACKS = ("ekd-eval",)
 CUSTOM_TRAIN_SEQUENCE = [
     {
         "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "4000000",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
         "k_percent": 25,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "GLS_ENABLED": "1",
             "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 20,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
         },
     },
     {
@@ -341,6 +341,16 @@ class SchedulerContext:
     tag_default: str
     dry_run: bool
     train_sequence: List[dict]
+    sequence_only: bool
+
+    @staticmethod
+    def _coerce_int(value: Optional[object]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def active_train_jobs(self) -> Dict[str, JobInfo]:
         return {
@@ -409,20 +419,34 @@ class SchedulerContext:
         for run_id in to_delete:
             self.state["eval_jobs"].pop(run_id, None)
 
-    def consume_sequence_env(self, distill_type: str, k_percent: int) -> Dict[str, str]:
+    def consume_sequence_env(
+        self,
+        distill_type: Optional[str],
+        k_percent: Optional[object],
+    ) -> Tuple[Dict[str, str], Optional[str], Optional[int], bool]:
         cursor = int(self.state.get("train_sequence_idx", 0))
+        distill_hint = distill_type
+        k_hint = self._coerce_int(k_percent)
         for idx in range(cursor, len(self.train_sequence)):
             item = self.train_sequence[idx]
-            if item.get("distill_type") not in (None, distill_type):
+            item_distill = item.get("distill_type")
+            item_k = self._coerce_int(item.get("k_percent"))
+            if item_distill is not None and distill_hint is not None and item_distill != distill_hint:
                 continue
-            if item.get("k_percent") not in (None, k_percent):
+            if item_k is not None and k_hint is not None and item_k != k_hint:
                 continue
             self.state["train_sequence_idx"] = idx + 1
-            env = item.get("env") or {}
+            env = dict(item.get("env") or {})
+            resolved_distill = item_distill or distill_hint
+            resolved_k = item_k if item_k is not None else k_hint
+            log_distill = resolved_distill or "default"
+            log_k = resolved_k if resolved_k is not None else "default"
             if env:
-                print(f"[sequence] Applying template #{idx+1}: {distill_type} k={k_percent} env={env}")
-            return dict(env)
-        return {}
+                print(f"[sequence] Applying template #{idx+1}: {log_distill} k={log_k} env={env}")
+            else:
+                print(f"[sequence] Applying template #{idx+1}: {log_distill} k={log_k}")
+            return env, resolved_distill, resolved_k, True
+        return {}, None, None, False
 
     def submit_training_if_needed(self) -> None:
         active_jobs = self.active_train_jobs()
@@ -446,25 +470,38 @@ class SchedulerContext:
                 continue
 
             params = entry.get("params", {})
-            distill_type = params.get("distill_type", "top-k-tok")
-            k_percent = params.get("k_percent", 0)
-            datasets = ensure_list(params.get("datasets"))
-            if not datasets:
-                print(f"[warn] Run {run_id} missing datasets; skipping.")
-                continue
+            distill_type_param = params.get("distill_type")
+            distill_type = distill_type_param or "top-k-tok"
+            k_param = params.get("k_percent")
+            k_percent = self._coerce_int(k_param)
 
             sweep_tag = infer_sweep_tag(train_meta.get("output_dir"))
             if not sweep_tag:
                 sweep_tag = self.tag_default
 
             env = self.build_training_env(params)
-            template_env = self.consume_sequence_env(distill_type, k_percent)
-            if template_env:
-                env.update(template_env)
+            template_env, template_distill, template_k, matched_template = self.consume_sequence_env(
+                distill_type_param,
+                k_param,
+            )
+            if matched_template:
+                if template_env:
+                    env.update(template_env)
+                if template_distill:
+                    distill_type = template_distill
+                if template_k is not None:
+                    k_percent = template_k
+            elif self.sequence_only:
+                prefix = "[dry-run skip]" if self.dry_run else "[skip]"
+                print(
+                    f"{prefix} Run {run_id[:8]} distill_type={distill_type} k={k_percent} not in custom sequence."
+                )
+                continue
             job_name = f"{TRAIN_JOB_PREFIX}{run_id[:8]}"
+            final_k_percent = k_percent if k_percent is not None else 0
             args = [
                 distill_type,
-                str(k_percent),
+                str(final_k_percent),
                 self.eval_suite,
                 sweep_tag,
             ]
@@ -478,7 +515,7 @@ class SchedulerContext:
                         "job_id": job_id,
                         "submitted_at": _now().isoformat(),
                         "distill_type": distill_type,
-                        "k_percent": k_percent,
+                        "k_percent": final_k_percent,
                     }
                     available_slots -= 1
                     if available_slots <= 0:
@@ -606,6 +643,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tag", default=None, help="Fallback KD_SWEEP_TAG when none can be inferred")
     parser.add_argument("--user", default=os.environ.get("USER"), help="SLURM account/user to monitor (default: $USER)")
     parser.add_argument("--log-file", type=Path, default="logs/autopilot.log", help="Optional path to append all console output")
+    parser.add_argument(
+        "--allow-registry-fallback",
+        action="store_true",
+        help="Allow submitting registry entries that do not match the custom train sequence",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print intended actions without calling sbatch")
     parser.add_argument("--once", action="store_true", help="Run single iteration instead of looping")
     return parser.parse_args()
@@ -625,6 +667,7 @@ def main() -> int:
     state_path = args.state_file.resolve()
 
     state = load_state(state_path)
+    sequence_only = not args.allow_registry_fallback
 
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -677,6 +720,7 @@ def main() -> int:
             tag_default=tag_default,
             dry_run=args.dry_run,
             train_sequence=CUSTOM_TRAIN_SEQUENCE,
+            sequence_only=sequence_only,
         )
         ctx.cleanup_state()
         ctx.emit_eval_summaries()

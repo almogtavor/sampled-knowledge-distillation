@@ -128,6 +128,7 @@ class Distiller(
 
         # Track once-per-run warnings
         self._warned_invalid_targets = False
+        self._warned_invalid_logprob = False
 
         # LinUCB contextual bandit setup
         self._init_bandit_manager()
@@ -805,24 +806,38 @@ class Distiller(
                 s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
                 V = s_log_probs_T1.size(-1)
                 flat_log_probs = s_log_probs_T1.reshape(-1, V)
-                flat_targets = targets.reshape(-1).long()
-                if torch.isfinite(s_log_probs_T1).all():
-                    valid_mask = flat_targets != -100
-                    if valid_mask.any():
-                        max_id = flat_targets[valid_mask].max()
-                        min_id = flat_targets[valid_mask].min()
-                        if (max_id >= V) or (min_id < 0):
-                            bad_mask = valid_mask & ((flat_targets >= V) | (flat_targets < 0))
-                            bad_count = int(bad_mask.sum().item())
-                            if bad_count > 0:
-                                flat_targets[bad_mask] = -100
-                                if not self._warned_invalid_targets:
-                                    print(
-                                        f"[warn] CE targets out of range (count={bad_count}) → masking from loss.",
-                                        flush=True,
-                                    )
-                                    self._warned_invalid_targets = True
-                ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
+                flat_targets = targets.reshape(-1).long().clone()
+
+                ignore_mask = flat_targets == -100
+                valid_range_mask = (flat_targets >= 0) & (flat_targets < V)
+                invalid_range_mask = ~(ignore_mask | valid_range_mask)
+                if invalid_range_mask.any():
+                    bad_count = int(invalid_range_mask.sum().item())
+                    flat_targets[invalid_range_mask] = -100
+                    if bad_count > 0 and not self._warned_invalid_targets:
+                        print(
+                            f"[warn] CE targets out of range (count={bad_count}) → masking from loss.",
+                            flush=True,
+                        )
+                        self._warned_invalid_targets = True
+
+                # Mask rows that contain non-finite log-probs to avoid device-side asserts
+                finite_row_mask = torch.isfinite(flat_log_probs).all(dim=-1)
+                drop_mask = (~finite_row_mask) & (flat_targets != -100)
+                if drop_mask.any():
+                    drop_count = int(drop_mask.sum().item())
+                    flat_targets[drop_mask] = -100
+                    if drop_count > 0 and not self._warned_invalid_logprob:
+                        print(
+                            f"[warn] CE log-probs contained {drop_count} non-finite rows → masking from loss.",
+                            flush=True,
+                        )
+                        self._warned_invalid_logprob = True
+
+                if (flat_targets != -100).any():
+                    ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
+                else:
+                    ce_loss = torch.zeros((), device=self.student_device, dtype=s_pred.dtype)
             total = (1.0 - self.config.alpha_ce) * kd_loss + self.config.alpha_ce * ce_loss
         else:
             ce_loss = torch.tensor(0.0, device=self.student_device)
