@@ -404,7 +404,7 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 \begin{table*}[t]
 	\centering
 	\small
-	\setlength{\textwidth}{8pt}
+	\resizebox{\textwidth}{!}{%
 	\begin{tabular}{lcccccc}
 		\toprule
 		Method                                     & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & \multicolumn{2}{c}{LAMBADA} & avg.                                    \\
@@ -428,6 +428,7 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 		No KD baseline (Qwen3-0.6B)      & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                        & 24.72                   & 48.2          \\
 		\bottomrule
 	\end{tabular}
+	} % end resizebox
 	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu 4M tokens ($\sim 22K$ examples); we report pass@1 (\%) for GSM8K and HellaSwag, accuracy (\%) for PIQA and LAMBADA.
 		Token selective KD and Full KD are regular distillations that do not apply RS-KD (hence no offline cache).
 		SampledKD means positions selection + RS-KD for KLD.
