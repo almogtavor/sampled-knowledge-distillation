@@ -31,12 +31,8 @@
 % and will typically save some space.
 \usepackage{microtype}
 
-% This is also not strictly necessary, and may be commented out.
-% However, it will improve the aesthetics of text in
-% the typewriter font.
 \usepackage{inconsolata}
 
-\usepackage{amsmath, amssymb}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{mathtools}
@@ -69,7 +65,7 @@
 % \author{Author 1 \\ Address line \\  ... \\ Address line
 %         \And  ... \And
 %         Author n \\ Address line \\ ... \\ Address line}
-% To start a seperate ``row'' of authors use \AND, as in
+% To start a separate ``row'' of authors use \AND, as in
 % \author{Author 1 \\ Address line \\  ... \\ Address line
 %         \AND
 %         Author 2 \\ Address line \\ ... \\ Address line \And
@@ -93,8 +89,7 @@
 	We revisit where and how to distill.
 	First, we propose token-selective KD (TSKD), which selects informative positions (by teacher entropy, teacher-student KL, or student loss) and applies standard KL divergence there, leaving other positions to cross-entropy only.
 	Second, SampledKD adds logits-level random sampling, so the expected KD gradient matches full KD while caching only a few teacher classes per position.
-	On small-scale experiments (Qwen3-8B→0.6B; 4M tokens), token-selective KD beats the full KD on all baselines.
-	SampledKD delivers an $8k$-$16k\times$ logit-storage reduction with competitive accuracy, suggesting these efficiency gains should be more impactful at larger scales.
+	On our small-scale setting, TSKD improves over FullKD on several benchmarks at similar compute, while SampledKD substantially reduces logit storage with a modest accuracy gap that we hypothesize can shrink at larger scales.
 	We release code for reproduction.
 \end{abstract}
 
@@ -115,10 +110,12 @@ Motivated by this insight, we study knowledge distillation (KD), a standard appr
 While classic logit-based KD is effective for encoder-style models (e.g., DistilBERT \citep{sanh2019distilbert}), applying KD to autoregressive LLMs raises two persistent obstacles: (i) train-inference mismatch in sequence generation, and (ii) efficiency limits from storing or querying full teacher logits.
 
 To address (i), recent work proposes on-policy distillation that trains the student on prefixes it actually produces, with the teacher scoring those prefixes \citep{agarwal2024gkd} or replacing them if uninformative (SKD) \citep{xu2024speculative}.
-To address (ii), sparse alternatives avoid caching the full distribution. However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
+To address (ii), sparse alternatives avoid caching the full distribution.
+However, deterministic top-$K$ truncation of teacher logits (e.g., keeping only the largest $K$ probabilities) yields biased supervision and degraded calibration, especially for small $K$ \citep{anshumann2025sparse,shum2024first}.
+Unlike top-$K$ truncation, RS-KD \citep{anshumann2025sparse} preserves the full-KL gradient in expectation by importance-correcting samples.
 Storing more logits improves quality but erodes the efficiency goal.
 
-We revisit \emph{where} and \emph{how} to apply teacher supervision for LLMs.
+We revisit where and how to apply teacher supervision for LLMs.
 Our thesis is that the KD budget should be spent selectively at the token level (where the teacher can add the most information) while keeping unbiased class-level supervision when it is applied.
 Concretely, we present two variants:
 \begin{itemize}
@@ -162,7 +159,7 @@ We separate the teacher processing from student training during distillation thr
 \subsection{Offline stage (teacher forward pass, once)}
 For each training sequence and position $t$:
 \begin{enumerate}
-	\item Compute a top-$m$ entropy proxy $H_t$ via Top-k-plus-tail (\S\ref{sec:entropy}) to drive position selection.
+	\item Compute a top-$m$ entropy proxy $H_t$ via Top-$m$-plus-tail (\S\ref{sec:entropy}) to drive position selection.
 	\item Per position, perform RS-KD: draw $R$ samples with replacement (we optimize it via Gumbel-Max over $p_t^\tau$, where $\tau$ is temperature), compute unique IDs and counts, and retain the top-$U$ unique classes by count.
 	      Convert empirical frequencies to 7-bit quantized probability $q7$.
 	      %  with a residual correction to preserve normalization; pad to $U$ using a sentinel ID ($=V$).
@@ -398,6 +395,7 @@ To address the high perplexity observed when training on longer sequences, we fu
 \subsection{Experimental setup}
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
+Additional training hyperparameters are detailed in Appendix~\ref{app:hyperparams}.
 We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd} (that have been focused on CE-based selection).
 \citep{wang2021selectivekd} have reported $50K$ to be successful too, which we did not test.
 
@@ -414,6 +412,7 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 		                                           &                       &                           &                      & acc. (\%) $\uparrow$        & perplexity $\downarrow$                 \\
 		\midrule
 		Full KD (all tokens, full softmax)         & 34.5                  & 34.7                      & 65.2                 & 40.8                        & 67.3                    & 46.9          \\
+		Token-selective KD (entropy top-20\%)      & 37.7                  & 37.1                      & 66.7                 & 42.2                        & 23.0                    & 48.7          \\
 		Token-selective KD (entropy top-25\%)      & 38.4                  & 37.0                      & 67.1                 & 42.2                        & 23.4                    & 48.8          \\
 		Token-selective KD (entropy top-75\%)      & ---                   & 34.7                      & 64.9                 & 41.0                        & 72.9                    & ---           \\
 		Token-selective KD (bucket of 5\%-25\%)    & 35.6                  & 34.5                      & 64.7                 & 40.3                        & 77.2                    & 46.5          \\
@@ -423,18 +422,10 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 		\midrule
 		Sampled KD (entropy top-25\%)              & 26.3                  & 35.7                      & 60.0                 & \textit{41.2}               & 38.7                    & \textit{45.6} \\
 		Sampled KD (entropy top-75\%)              & 35.7                  & 33.8                      & 62.2                 & 33.7                        & 305.9                   & 43.2          \\
-		% Sampled KD (top-75\%), softmax-elim      			& 27.3                  & 31.2                      & 59.8                 & 24.5                  	 & 2029 & 38.5 \\
-		% Sampled KD (pos-rs-kd-25\%), softmax-elim			& 23.7                  & 31.4                      & 60.6                 & 23.1                  	 & 2336 & 38.4 \\
-
-		% \quad Top $k=75\%$ positions                        & 29.1                  & 34.5                      & 64.5                 & 38.8                  &---   & \\
-		% \quad Top $k=25\%$ pos, GLS (global queue)          & 26.1                  & 32.1                      & 62.6                 & 35.2                  &---   & \\
-		% \quad Top $k=25\%$ pos, Score based Selection       & 29.3                  & 34.7                      & 64.4                 & 39.1                  &---   & \\
-		% \quad Positional RS-KD $k=25\%$ (sampled)           & 29.5                  & 32.8                      & 65.0                 & 39.1                  &---   & \\
-		% \quad $k=100\%$                                     & 29.2                  & 34.0                      & 64.4                 & 38.7                  &---   & \\
-		% \quad $k=25\%$, distilled on GSM8K train split      & \textbf{41.2}         & ---                       & ---                  & ---                   &---   & \\
-		% \quad LinUCB model as selector                      & 22.0                  & 27.1                      & 52.5                 & 7.6                   &---   & \\
+		Sampled KD (pos-rs-kd top-25\%)            & 33.6                  & 33.9                      & 62.2                 & 32.9                        & 287.0                   & 43.0          \\
+		Sampled KD (LinUCB top-25\%)               & 33.5                  & 33.9                      & 62.3                 & 32.9                        & 287.0                   & 43.0          \\
 		\midrule
-		No KD baseline (untrained Qwen3-0.6B)      & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                        & 24.72                   & 48.2          \\
+		No KD baseline (Qwen3-0.6B)      & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                        & 24.72                   & 48.2          \\
 		\bottomrule
 	\end{tabular}
 	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu 4M tokens ($\sim 22K$ examples); we report pass@1 (\%) for GSM8K and HellaSwag, accuracy (\%) for PIQA and LAMBADA.
@@ -504,7 +495,8 @@ FineWeb-Edu also mixes diverse domains, which is a poor match for math-reasoning
 
 \subsection{Future work}
 Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD:
-(1) Curriculum learning based knowledge distillation for and stability, so that the model can gradually adapt to more challenging tasks, implemented according to token entropy; (2) a short speculative on-policy distillation phase after off-policy SampledKD---to re-balance calibration once accuracy has improved, leveraging SKD/GKD-style teacher feedback on student prefixes \citep{xu2024speculative}.
+(1) Curriculum learning based KD for stability, where token-entropy schedules gradually increase difficulty;
+(2) a short on-policy distillation phase after off-policy SampledKD (e.g., SKD/GKD) to rebalance calibration once accuracy has improved \citep{xu2024speculative}.
 
 From a computational perspective, each student distillation step in TSKD still requires a full softmax and significant runtime, for both the KLD and CE.
 SampledKD, while reducing the computational overhead of each KLD, still does not eliminate the need for full-vocabulary softmax at the CE level, and additionally requires at least 1 full vocabulary pass for the KLD at both the student and the teacher.
@@ -515,7 +507,7 @@ Similarly to GLS, normalizing selection tokens count in document lengths is anot
 \section{Conclusion}
 \label{sec:conclusion}
 We introduced TSKD and SampledKD, which augments token selection with class-level RS-KD.
-TSKD provides strong efficiency-accuracy trade-offs and outperforms full KD in our benchmarks.
+TSKD provides stronger efficiency-accuracy trade-offs than FullKD on several benchmarks in our setting.
 SampledKD yields far larger logit-storage reductions with competitive accuracy, but in our small-scale, low-precision setting still lags behind the FullKD (and understandably behind TSKD).
 Given its unbiased foundations and the prior success of RS-KD, we expect SampledKD to become more impactful at larger scales.
 
@@ -523,6 +515,56 @@ Given its unbiased foundations and the prior success of RS-KD, we expect Sampled
 \bibliographystyle{acl_natbib}
 
 \appendix
+\section{Training Hyperparameters}
+\label{app:hyperparams}
+
+Tables~\ref{tab:shared-hparams} and~\ref{tab:variant-hparams} list the hyperparameter choices shared across all runs and the settings that differ between distillation variants.
+
+\begin{table*}[h]
+	\centering
+	\small
+	\setlength{\tabcolsep}{8pt}
+\begin{tabular}{ll}
+	oprule
+Component & Value \\
+\midrule
+Teacher model & Qwen/Qwen3-8B (8-bit quantized) \\
+Student model & Qwen/Qwen3-0.6B with gradient checkpointing \\
+Dataset & FineWeb-Edu stream capped at 4M tokens \\
+Sequence cap & 256 tokens (implemented as \texttt{max\_seq\_len=250}) \\
+Epochs & 1 pass over the streamed subset \\
+Mini-batch / accum. & 1 sample \(\times 32\) gradient steps (effective batch 32) \\
+Optimizer & bitsandbytes Adam8bit (lr $1\times 10^{-5}$; AdamW fallback) \\
+KD temperature & 2.0 (no annealing) \\
+CE mixing weight & $\alpha_{\text{CE}}=0.3$ with KD always on ($1-\alpha_{\text{CE}}$) \\
+Offline cache & Enabled with $U=12$ cached classes and uint8 $\hat H$ \\
+Entropy approx. & Top-$m$ with $m=12$; $\text{rs\_vocab\_samples}=12$ \\
+Seed & 1337 (deterministic off) \\
+\bottomrule
+\end{tabular}
+\caption{Shared hyperparameters across all experiments.}
+\label{tab:shared-hparams}
+\end{table*}
+
+\begin{table*}[h]
+	\centering
+	\small
+	\setlength{\tabcolsep}{8pt}
+\begin{tabular}{p{0.32\linewidth}p{0.6\linewidth}}
+	oprule
+Variant & Additional settings \\
+\midrule
+Full KD & Distills all tokens; offline cache used only for entropy logging (no subsampling). \\
+TSKD (entropy top-$k$) & $k\in\{20,25,75\}$; GLS queue size $30\,000$ tokens when enabled; no composite score unless stated. \\
+TSKD (bucket) & Bucket range $(75,95)$ when active. \\
+Random / Pos-RS-KD token selection & Same $k$ values as entropy top-$k$ with $\alpha=1.0$, $\epsilon=0.02$, $q_{\min}=10^{-6}$. \\
+LinUCB selector & $\alpha=1.0$, $\lambda=1.0$, reward clip $\pm 5$. \\
+\bottomrule
+\end{tabular}
+\caption{Settings specific to each distillation variant reported in the main tables.}
+\label{tab:variant-hparams}
+\end{table*}
+
 \section{Positional RS-KD matches the equal-weight KD objective}
 \label{app:pos-rs-kd-proof}
 
