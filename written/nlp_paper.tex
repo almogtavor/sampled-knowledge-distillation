@@ -529,12 +529,11 @@ Given its unbiased foundations and the prior success of RS-KD, we expect Sampled
 
 Tables~\ref{tab:shared-hparams} and~\ref{tab:variant-hparams} list the hyperparameter choices shared across all runs and the settings that differ between distillation variants.
 
-\begin{table*}[h]
+\begin{table}[h]
 	\centering
 	\small
 	\setlength{\tabcolsep}{8pt}
-\begin{tabular}{ll}
-	oprule
+\begin{tabular}{p{0.25\linewidth}p{0.65\linewidth}}
 Component & Value \\
 \midrule
 Teacher model & Qwen/Qwen3-8B (8-bit quantized) \\
@@ -542,25 +541,24 @@ Student model & Qwen/Qwen3-0.6B with gradient checkpointing \\
 Dataset & FineWeb-Edu stream capped at 4M tokens \\
 Sequence cap & 256 tokens (implemented as \texttt{max\_seq\_len=250}) \\
 Epochs & 1 pass over the streamed subset \\
-Mini-batch / accum. & 1 sample \(\times 32\) gradient steps (effective batch 32) \\
+Mini-batch & 1 sample \(\times 32\) gradient steps (effective batch 32) \\
 Optimizer & bitsandbytes Adam8bit (lr $1\times 10^{-5}$; AdamW fallback) \\
 KD temperature & 2.0 (no annealing) \\
 CE mixing weight & $\alpha_{\text{CE}}=0.3$ with KD always on ($1-\alpha_{\text{CE}}$) \\
 Offline cache & Enabled with $U=12$ cached classes and uint8 $\hat H$ \\
-Entropy approx. & Top-$m$ with $m=12$; $\text{rs\_vocab\_samples}=12$ \\
+Entropy approx. & Top-$m$ with m=12; rs\_vocab\_samples=12 \\
 Seed & 1337 (deterministic off) \\
 \bottomrule
 \end{tabular}
 \caption{Shared hyperparameters across all experiments.}
 \label{tab:shared-hparams}
-\end{table*}
+\end{table}
 
-\begin{table*}[h]
+\begin{table}[h]
 	\centering
 	\small
 	\setlength{\tabcolsep}{8pt}
 \begin{tabular}{p{0.32\linewidth}p{0.6\linewidth}}
-	oprule
 Variant & Additional settings \\
 \midrule
 Full KD & Distills all tokens; offline cache used only for entropy logging (no subsampling). \\
@@ -572,7 +570,7 @@ LinUCB selector & $\alpha=1.0$, $\lambda=1.0$, reward clip $\pm 5$. \\
 \end{tabular}
 \caption{Settings specific to each distillation variant reported in the main tables.}
 \label{tab:variant-hparams}
-\end{table*}
+\end{table}
 
 \section{Positional RS-KD matches the equal-weight KD objective}
 \label{app:pos-rs-kd-proof}
