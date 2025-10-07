@@ -93,7 +93,8 @@
 	We revisit where and how to distill.
 	First, we propose token-selective KD (TSKD), which selects informative positions (by teacher entropy, teacher-student KL, or student loss) and applies standard KL divergence there, leaving other positions to cross-entropy only.
 	Second, SampledKD adds logits-level random sampling, so the expected KD gradient matches full KD while caching only a few teacher classes per position.
-	On small-scale experiments (Qwen3-8B→0.6B; 4M tokens), token-selective KD attains the best accuracy-efficiency trade-off; SampledKD further reduces compute and storage but, at this scale, underperforms full KD on zero-shot benchmarks.
+	On small-scale experiments (Qwen3-8B→0.6B; 4M tokens), token-selective KD beats the full KD on all baselines.
+	SampledKD delivers an $8k$-$16k\times$ logit-storage reduction with competitive accuracy, suggesting these efficiency gains should be more impactful at larger scales.
 	We release code for reproduction.
 \end{abstract}
 
@@ -448,18 +449,21 @@ That said, \citep{wang2021selectivekd} focused on CE-based selection, and we fou
 
 \subsection{Discussion}
 \label{sec:discussion}
-We ablated a wide range of position-selection settings for a 0.6B student, varying the number of top $k \in \{0,1,2,5,10,12,15,20,\ldots,100\}$, score based, percentile buckets, with and without GLS.
+We ablated token position selection for a 0.6B student across score functions (entropy and a combined score with teacher-student KL), top-$k$ and percentile rules, positional RS-KD, LinUCB and global/local selection (GLS). 
 
-Results were often noisy, and in most cases (except for LAMBADA where we have beat the baseline), the distilled student underperformed the Qwen3-0.6B baseline.
-The best results were obtained with token-selective KD, and when scaled up with more data and larger models, we expect further improvements.
-From our analysis of the training dynamics and accuracy trends, we believe that the underperformance of certain variants can be attributed to several factors:
-(i) bias from limited supervision — KD was applied on a single dataset and only a partial subset of it, which gave the student a narrow and potentially unrepresentative view of the teacher's distribution;
-(ii) insufficient hyperparameter tuning, which likely limited the effectiveness of the distillation strategies;
-(iii) limited training scale, as the small 0.6B student and the 4M-token budget were likely insufficient for the student to fully leverage the teacher signal; and 
-(iv) evaluation mismatch, since most evaluations were conducted in a zero-shot setting, 
-which does not necessarily align with the distribution the student was trained on.
+On average, token-selective KD (TSKD) matches or exceeds both full KD and the no-KD baseline, with the clearest gains on LAMBADA (accuracy and perplexity) and competitive results on PIQA and HellaSwag; math benchmark GSM8K is understandably the most challenging, since Fineweb is not a Math dataset.
+Results show non-trivial variance across selection rules, but the strongest TSKD settings are consistently better than full KD at similar compute.
 
-For SampledKD, training on the GSM8K train split gave better results, suggesting that the weak zero-shot outcomes reflect supervision bias, variance, and scale limits rather than a flaw in distillation itself.
+SampledKD achieves large logit-storage reductions ($\sim8k-16k\times$) while maintaining competitive accuracy.
+In our small-scale setting it does not yet close the gap to FullKD, but we believe further tuning and scaling could help bridge this gap, since linearity across SampledKD and TSKD is observed.
+
+From training dynamics and ablations we hypothesize four drivers of underperformance in some variants:
+(i) Narrow supervision - distillation was applied on a single dataset and only a subset of it, giving the student limited coverage of the teacher's distribution;
+(ii) Limited tuning - key hyperparameters (selection thresholds, sampling temperature, loss weights) were not extensively optimized;
+(iii) Insufficient scale - the small 0.6B student and 4M-token budget likely did not fully exploit the teacher signal; and
+(iv) Evaluation mismatch - zero-shot evaluation may not reflect the distribution the student was trained on.
+
+For SampledKD, training on the GSM8K split yielded stronger numbers than zero-shot, suggesting the weak zero-shot outcomes stem from supervision bias, variance, and scale limits rather than a flaw in the distillation objective.
 
 \section{Related Work}
 
@@ -469,8 +473,8 @@ More recently, cross-tokenizer distillation has been enabled by Universal Logit 
 \subsection{Sparse logit KD and calibration}
 Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students.
 Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
-While exploring orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
-Trustworthy distillation (\emph{FIRST}) focuses on calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
+While they have explored orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
+Trustworthy distillation (\emph{FIRST}) targets calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
 
 \subsection{Token-/word-level selective supervision} Several strands selectively apply supervision at the granularity we target. In NMT, \citet{wang2021selectivekd} select high cross-entropy \emph{words} using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}. In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}. In CoT reasoning, KPOD learns token importance weights and a progressive schedule within rationales \citep{feng2024kpod}.
 Compared to these, TSKD and SampledKD select tokens using teacher-centric uncertainty (entropy and teacher-student KL) and couples selection with unbiased class-level RS-KD at selected positions.
@@ -496,29 +500,26 @@ Our primary teacher-student pair (Qwen3-8B $\rightarrow$ Qwen3-0.6B) and the use
 We expect different behavior at larger teacher/student scales and without low-precision constraints.
 
 \subsection{SampledKD underperformance}
-While SampledKD is principled and builds on successful ideas in sampled softmax and RS-KD, and we observe superior efficiency and strong accuracy relative to baselines, our results do not yet fully match full KD at equal wall-clock.
-We attribute the remaining gap primarily to the limited training budgets (only 4M FineWeb-Edu tokens) and predominantly zero-shot evaluation, together with scale and quantization effects.
-Another reason for the gap could be due to the fact we have trained with max\_seq\_len=256, and filtered all documents that were longer than that (to avoid perplexity issues).
-This is shorter than the average length of the FineWeb-Edu dataset (which is $\approx750$), and that may have caused bias in the training data.
-Fineweb is also a mixture of many domains, and not a good match for training a math reasoning model, which was one of our evaluation tasks that the model's performance consitently degraded at (GSM8K).
+SampledKD is principled and inherits successes from RS-KD, but in our current setting it does not yet match full KD at equal wall-clock.
+We attribute the gap to: limited training budget (4M FineWeb-Edu tokens), predominantly zero-shot evaluation, low-precision training, and length filtering of documents above max\_seq\_len=256, which biases the data toward short documents relative to FineWeb-Edu (average length $\approx750$).
+FineWeb-Edu also mixes diverse domains, which is a poor match for math-reasoning tasks such as GSM8K, where degradation is most pronounced.
 
 \subsection{Future work}
 Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD: 
 (1) Curriculum learning based knowledge distillation for and stability, so that the model can gradually adapt to more challenging tasks, implemented according to token entropy; (2) a short speculative on-policy distillation phase after off-policy SampledKD---to re-balance calibration once accuracy has improved, leveraging SKD/GKD-style teacher feedback on student prefixes \citep{xu2024speculative}.
 
-From a computational point of view, applying token-selective KD that removes KLD steps, but keeping CE on all tokens (for stability), loses the main efficiency gain of the time steps selection idea.
-This is because CE requires softmax over all tokens, which as we have seen by the experiments, is the main performance bottleneck.
-SampledKD is one solution to this problem, but it is also possible to apply softmax elimination only on the CE term and keeping softmax for KLD, or alternatively dropping CE altogether.
-We have not explored these options yet, and leave them for future work.
-Normalizing selection tokens count in document lengths is another promising direction to explore.
+From a computational perspective, each student distillation step in TSKD still requires a full softmax and significant runtime, for both the KLD and CE.
+SampledKD, while reducing the computational overhead of each KLD, still does not eliminate the need for full-vocabulary softmax at the CE level, and additionally requires at least 1 full vocabulary pass for the KLD at both the student and the teacher.
+We have explored softmax approximation techniques, but they did not yield satisfactory accuracy.
+
+Similarly to GLS, normalizing selection tokens count in document lengths is another promising direction to explore in order to mitigate the influence of specific batch properties (e.g., length, averaged entropy) on the selection process.
 
 \section{Conclusion}
 \label{sec:conclusion}
-We introduced token-selective KD and its SampledKD extension that adds class-level RS-KD.
-TSKD achieves strong efficiency-accuracy trade-offs on our benchmarks.
-SampledKD achieves a much superior performance but, in our current small-scale, low-precision setting, shows an accuracy gap to full KD.
-Given its principled foundations and prior successes of sampled softmax and RS-KD, we view SampledKD as promising, especially at larger scales and without aggressive quantization.
-
+We introduced TSKD and SampledKD, which augments token selection with class-level RS-KD.
+TSKD provides strong efficiency-accuracy trade-offs and outperforms full KD in our benchmarks.
+SampledKD yields far larger logit-storage reductions with competitive accuracy, but in our small-scale, low-precision setting still lags behind the FullKD (and understandably behind TSKD).
+Given its unbiased foundations and the prior success of RS-KD, we expect SampledKD to become more impactful at larger scales.
 
 \bibliography{custom}
 \bibliographystyle{acl_natbib}
