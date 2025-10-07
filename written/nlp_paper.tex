@@ -404,7 +404,7 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 \begin{table*}[t]
 	\centering
 	\small
-	\setlength{\tabcolsep}{8pt}
+	\setlength{\textwidth}{8pt}
 	\begin{tabular}{lcccccc}
 		\toprule
 		Method                                     & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & \multicolumn{2}{c}{LAMBADA} & avg.                                    \\
@@ -443,6 +443,14 @@ We ablated token position selection for a 0.6B student across score functions (e
 On average, token-selective KD (TSKD) matches or exceeds both full KD and the no-KD baseline, with the clearest gains on LAMBADA (accuracy and perplexity) and competitive results on PIQA and HellaSwag; math benchmark GSM8K is understandably the most challenging, since Fineweb is not a Math dataset.
 Results show non-trivial variance across selection rules, but the strongest TSKD settings are consistently better than full KD at similar compute.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_pareto_acc_vs_ppl.pdf}
+\caption{Accuracy--perplexity trade-off across distillation settings. Token-selective KD (TSKD) achieves the best Pareto frontier, while SampledKD compresses storage at a modest accuracy cost.}
+\label{fig:acc-ppl}
+\end{figure}
+
+Figure~\ref{fig:acc-ppl} highlights the Pareto frontier we observe: SampledKD occupies the low-perplexity, high-efficiency region, whereas TSKD dominates the accuracy axis.
 SampledKD achieves large logit-storage reductions ($\sim8k-16k\times$) while maintaining competitive accuracy.
 In our small-scale setting it does not yet close the gap to FullKD, but we believe further tuning and scaling could help bridge this gap, since linearity across SampledKD and TSKD is observed.
 
