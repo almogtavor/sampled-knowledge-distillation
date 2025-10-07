@@ -263,9 +263,9 @@ $A\!\leftarrow\!A+x_tx_t^\top,\; b\!\leftarrow\!b+r_tx_t$.
 If too few have been selected, we take the highest-$s_t$ tokens up to the allowed budget.
 
 \subsection{GLS (Global-Level Selection) for Position Selection}
-We maintain a global FIFO queue of recent token scores across batches.  
-At each step we set a threshold $\tau$ at the $(1-\tfrac{k\%}{100})$ percentile of this history,  
-All current positions with score $\ge\tau$ are selected; during warm-up we fall back to per-example top-$k$.  
+We maintain a global FIFO queue of recent token scores across batches.
+At each step we set a threshold $\tau$ at the $(1-\tfrac{k\%}{100})$ percentile of this history,
+All current positions with score $\ge\tau$ are selected; during warm-up we fall back to per-example top-$k$.
 This way, roughly $k\%$ of tokens are always kept, giving a stable acceptance rate and reducing variance across batches, instead of selecting top-$k$ tokens per batch.
 
 % \section{Entropy Approximation and Gumbel Trick}
@@ -282,7 +282,7 @@ We compute entropy in nats (natural logarithm) and 8-bit quantization.
 Order indices so that $u_{(1)} \geq \cdots \geq u_{(m)}$ are the top-$m$ logits.
 Define the top-$m$ log-partition and an upper bound on the full log-partition by
 \begin{align*}
-	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},            \\
+	Z_m \;           & =\; \log \sum_{j \leq m} e^{u_{(j)}},           \\
 	Z_{\text{ub}} \; & =\; \log\Big(e^{Z_m} + (V-m)\,e^{u_{(m)}}\Big).
 \end{align*}
 i.e., pessimistically setting all tail logits to $u_{(m)}$. For $j\le m$ this yields conservative probabilities:
@@ -359,7 +359,7 @@ This yields $3.7$ TB for $N{=}10^{11}{=}100$B tokens. Compared to a vanilla RS-K
 If the selection strategy is fixed and deterministic (e.g., top-$k$ by entropy chosen offline), we can omit $\hat H$ entirely and retain only RS-KD samples at the selected positions. This slashes storage by the selection rate $k$: with $k{=}0.25$,
 \begin{align*}
 	\text{B}/\text{token} \; & =\; k \cdot U \cdot 3
-	\;=\; 0.25 \cdot 12 \cdot 3                                                               \\
+	\;=\; 0.25 \cdot 12 \cdot 3                                                              \\
 	\;                       & =\; 9~\text{B}/\text{token} \ \Longrightarrow\ 0.9~\text{TB}.
 \end{align*}
 We implemented this optimized layout, but retained the full cache for our ablations so that we can ablate different position-selection policies at training time without rebuilding the cache. The one-time offline preselection is straightforward and yields a major reduction when $k$ is small.
@@ -398,8 +398,7 @@ To address the high perplexity observed when training on longer sequences, we fu
 \subsection{Experimental setup}
 
 All experiments report pass@1 accuracy, measuring the percentage of problems solved correctly on the first attempt without sampling multiple outputs.
-We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd}.
-That said, \citep{wang2021selectivekd} focused on CE-based selection, and we found that GLS was a bit less successful for entropy-based selection than batch top-k, even though the results were fairly close and might change when scaled.
+We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd} (that have been focused on CE-based selection).
 \citep{wang2021selectivekd} have reported $50K$ to be successful too, which we did not test.
 
 \section{Main Results}
@@ -410,21 +409,20 @@ That said, \citep{wang2021selectivekd} focused on CE-based selection, and we fou
 	\setlength{\tabcolsep}{8pt}
 	\begin{tabular}{lcccccc}
 		\toprule
-		Method                                              & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & \multicolumn{2}{c}{LAMBADA} & avg. \\
+		Method                                     & GSM8K (\%) $\uparrow$ & HellaSwag (\%) $\uparrow$ & PIQA (\%) $\uparrow$ & \multicolumn{2}{c}{LAMBADA} & avg.                                    \\
 		\cmidrule(lr){5-6}
-        & & & & acc. (\%) $\uparrow$ & perplexity $\downarrow$ \\
+		                                           &                       &                           &                      & acc. (\%) $\uparrow$        & perplexity $\downarrow$                 \\
 		\midrule
-		Full KD (all tokens, full softmax)                  & 34.5                  & 34.7                      & 65.2                 & 40.8                    & 67.3 & 46.9 \\
-		Token-selective KD (entropy top-25\%)               & 38.4                  & 37.0                      & 67.1                 & \textbf{42.2}           & \textbf{23.4} & \textbf{48.8} \\
-		Token-selective KD (entropy top-75\%)               & ---                   & 34.7                      & 64.9                 & 41.0                    & 72.9 & --- \\
-		Token-selective KD (bucket of 5\%-25\%)             & 35.6                  & 34.5             			& 64.7                 & 40.3                    & 77.2 & 46.5 \\
-		Token-selective KD (random 25\%)                    & 31.6                  & 34.5                      & 65.3                 & 40.6                    & 69.4 & 46.8 \\
-		Token-selective KD (pos-rs-kd 25\%)                 & 32.5                  & 34.4                      & 65.5                 & 41.6           & 69.0 & 47.1 \\
-		Token-selective KD (entropy top-25\%, GLS)          & ----                  & 36.9                      & 67.1                 & ----           & ---- & ---- \\
+		Full KD (all tokens, full softmax)         & 34.5                  & 34.7                      & 65.2                 & 40.8                        & 67.3                    & 46.9          \\
+		Token-selective KD (entropy top-25\%)      & 38.4                  & 37.0                      & 67.1                 & 42.2                        & 23.4                    & 48.8          \\
+		Token-selective KD (entropy top-75\%)      & ---                   & 34.7                      & 64.9                 & 41.0                        & 72.9                    & ---           \\
+		Token-selective KD (bucket of 5\%-25\%)    & 35.6                  & 34.5                      & 64.7                 & 40.3                        & 77.2                    & 46.5          \\
+		Token-selective KD (random 25\%)           & 31.6                  & 34.5                      & 65.3                 & 40.6                        & 69.4                    & 46.8          \\
+		Token-selective KD (pos-rs-kd 25\%)        & 32.5                  & 34.4                      & 65.5                 & 41.6                        & 69.0                    & 47.1          \\
+		Token-selective KD (entropy top-25\%, GLS) & 37.9                  & 36.9                      & 67.1                 & \textbf{43.0}               & \textbf{21.8}           & \textbf{49.0} \\
 		\midrule
-		Sampled KD (entropy top-25\%)                 		& 26.3                  & 35.7                      & 60.0                 & \textit{41.2}           		 & 38.7 & \textit{45.6} \\
-		Sampled KD (entropy top-75\%)                 		& 35.7                  & 33.8                      & 62.2                 & 33.7           		 & 305.9 & 43.2 \\
-		\midrule
+		Sampled KD (entropy top-25\%)              & 26.3                  & 35.7                      & 60.0                 & \textit{41.2}               & 38.7                    & \textit{45.6} \\
+		Sampled KD (entropy top-75\%)              & 35.7                  & 33.8                      & 62.2                 & 33.7                        & 305.9                   & 43.2          \\
 		% Sampled KD (top-75\%), softmax-elim      			& 27.3                  & 31.2                      & 59.8                 & 24.5                  	 & 2029 & 38.5 \\
 		% Sampled KD (pos-rs-kd-25\%), softmax-elim			& 23.7                  & 31.4                      & 60.6                 & 23.1                  	 & 2336 & 38.4 \\
 
@@ -436,7 +434,7 @@ That said, \citep{wang2021selectivekd} focused on CE-based selection, and we fou
 		% \quad $k=25\%$, distilled on GSM8K train split      & \textbf{41.2}         & ---                       & ---                  & ---                   &---   & \\
 		% \quad LinUCB model as selector                      & 22.0                  & 27.1                      & 52.5                 & 7.6                   &---   & \\
 		\midrule
-		No KD baseline (untrained Qwen3-0.6B)               & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                    & 24.72 & 48.2\\
+		No KD baseline (untrained Qwen3-0.6B)      & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                        & 24.72                   & 48.2          \\
 		\bottomrule
 	\end{tabular}
 	\caption{Main reasoning results (zero-shot). Models are pretrained on FineWeb-Edu 4M tokens ($\sim 22K$ examples); we report pass@1 (\%) for GSM8K and HellaSwag, accuracy (\%) for PIQA and LAMBADA.
@@ -449,7 +447,7 @@ That said, \citep{wang2021selectivekd} focused on CE-based selection, and we fou
 
 \subsection{Discussion}
 \label{sec:discussion}
-We ablated token position selection for a 0.6B student across score functions (entropy and a combined score with teacher-student KL), top-$k$ and percentile rules, positional RS-KD, LinUCB and global/local selection (GLS). 
+We ablated token position selection for a 0.6B student across score functions (entropy and a combined score with teacher-student KL), top-$k$ and percentile rules, positional RS-KD, LinUCB and global/local selection (GLS).
 
 On average, token-selective KD (TSKD) matches or exceeds both full KD and the no-KD baseline, with the clearest gains on LAMBADA (accuracy and perplexity) and competitive results on PIQA and HellaSwag; math benchmark GSM8K is understandably the most challenging, since Fineweb is not a Math dataset.
 Results show non-trivial variance across selection rules, but the strongest TSKD settings are consistently better than full KD at similar compute.
@@ -505,7 +503,7 @@ We attribute the gap to: limited training budget (4M FineWeb-Edu tokens), predom
 FineWeb-Edu also mixes diverse domains, which is a poor match for math-reasoning tasks such as GSM8K, where degradation is most pronounced.
 
 \subsection{Future work}
-Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD: 
+Other than the said enhancements (larger scale, full precision), we see several additional promising directions to close the gap for SampledKD:
 (1) Curriculum learning based knowledge distillation for and stability, so that the model can gradually adapt to more challenging tasks, implemented according to token entropy; (2) a short speculative on-policy distillation phase after off-policy SampledKD---to re-balance calibration once accuracy has improved, leveraging SKD/GKD-style teacher feedback on student prefixes \citep{xu2024speculative}.
 
 From a computational perspective, each student distillation step in TSKD still requires a full softmax and significant runtime, for both the KLD and CE.
@@ -561,10 +559,10 @@ And taking \(\mathbb{E}_x\) over dataset distribution of \(x\) yields \(\mathcal
 	 & = \frac{1}{N K_{\text{pos}}}\sum_{k=1}^{K_{\text{pos}}}
 	\mathbb{E}_{t_k\sim q_{\text{pos}}}\!\left[
 		\frac{\mathrm{KL}(p_{t_k}\|s_{t_k})}{q_{\text{pos}}(t_k)}
-	\right]                                                     \\
+	\right]                                                    \\
 	 & = \frac{1}{N K_{\text{pos}}}\sum_{k=1}^{K_{\text{pos}}}
-	\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t)                        \\
-	 & = \frac{1}{N}\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t)        \\
+	\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t)                       \\
+	 & = \frac{1}{N}\sum_{t\in P_x}\mathrm{KL}(p_t\|s_t)       \\
 	 & =\mathcal{L}_{\text{KD}}.
 \end{align*}
 
@@ -584,7 +582,7 @@ Define the total tail probability mass $P_T=\sum_{v\in T}p_v$, and $q(v)=p_v/P_T
 Decompose with the uniform tail $u=\tfrac{P_T}{V-m}$:
 \begin{align*}
 	\sum_{v\in T} p_v \log p_v
-	 & = -P_T\log\!\frac{P_T}{V-m}                                               \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                              \\
 	 & + P_T\,\underset{v\sim q}{\mathbb{E}}\!\left[\log\!\frac{p_v}{u}\right].
 \end{align*}
 Thus, the entropy tail is
@@ -596,7 +594,7 @@ Thus, the entropy tail is
 With unbiased estimator (using $s$ samples):
 \begin{align*}
 	\widehat{H}_T^{\text{CV-IS}}
-	 & = -P_T\log\!\frac{P_T}{V-m}                                                 \\
+	 & = -P_T\log\!\frac{P_T}{V-m}                                                \\
 	 & \quad - P_T \cdot \frac{1}{s}\sum_{i=1}^s \Big(\log p_{v_i} - \log u\Big).
 \end{align*}
 In all cases, the head contribution $H_{\text{head}}=-\sum_{j\le m}p_{(j)}\log p_{(j)}$ is computed exactly; the final estimate is $H=H_{\text{head}}+\widehat{H}_T$.
