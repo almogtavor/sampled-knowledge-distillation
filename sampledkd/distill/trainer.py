@@ -812,11 +812,20 @@ class Distiller(
                 valid_range_mask = (flat_targets >= 0) & (flat_targets < V)
                 invalid_range_mask = ~(ignore_mask | valid_range_mask)
                 if invalid_range_mask.any():
-                    bad_count = int(invalid_range_mask.sum().item())
-                    flat_targets[invalid_range_mask] = -100
+                    bad_vals = flat_targets[invalid_range_mask].detach().to("cpu", non_blocking=True)
+                    bad_count = int(bad_vals.numel())
+                    flat_targets = flat_targets.masked_fill(invalid_range_mask, -100)
                     if bad_count > 0 and not self._warned_invalid_targets:
+                        min_bad = int(bad_vals.min().item()) if bad_vals.numel() else 0
+                        max_bad = int(bad_vals.max().item()) if bad_vals.numel() else 0
+                        sample_vals = bad_vals.unique()
+                        if sample_vals.numel() > 5:
+                            sample_vals = sample_vals[:5]
+                        sample_list = ", ".join(str(int(v.item())) for v in sample_vals)
                         print(
-                            f"[warn] CE targets out of range (count={bad_count}) → masking from loss.",
+                            "[warn] CE targets out of range (count="
+                            f"{bad_count}, min={min_bad}, max={max_bad}, sample=[{sample_list}])"
+                            " → masking from loss.",
                             flush=True,
                         )
                         self._warned_invalid_targets = True

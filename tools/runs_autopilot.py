@@ -101,6 +101,23 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "NO_OFFLINE": "1",
+            "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_OFFLINE": "1",
             "SCORE_TOKEN_SELECTION": 1,
             "SCORE_NORMALIZE": "z",
             "SCORE_ENTROPY_WEIGHT": 1.0,
@@ -311,7 +328,10 @@ def run_sbatch(
     cmd.extend(args)
     merged_env = os.environ.copy()
     if env:
-        merged_env.update(env)
+        for key, value in env.items():
+            if value is None:
+                continue
+            merged_env[key] = str(value)
     try:
         res = subprocess.run(cmd, check=True, capture_output=True, text=True, env=merged_env)
     except subprocess.CalledProcessError as exc:
@@ -424,10 +444,15 @@ class SchedulerContext:
         distill_type: Optional[str],
         k_percent: Optional[object],
     ) -> Tuple[Dict[str, str], Optional[str], Optional[int], bool]:
+        total_templates = len(self.train_sequence)
+        if total_templates == 0:
+            return {}, None, None, False
+
         cursor = int(self.state.get("train_sequence_idx", 0))
         distill_hint = distill_type
         k_hint = self._coerce_int(k_percent)
-        for idx in range(cursor, len(self.train_sequence)):
+        for offset in range(total_templates):
+            idx = (cursor + offset) % total_templates
             item = self.train_sequence[idx]
             item_distill = item.get("distill_type")
             item_k = self._coerce_int(item.get("k_percent"))
@@ -435,8 +460,9 @@ class SchedulerContext:
                 continue
             if item_k is not None and k_hint is not None and item_k != k_hint:
                 continue
-            self.state["train_sequence_idx"] = idx + 1
-            env = dict(item.get("env") or {})
+            self.state["train_sequence_idx"] = cursor + offset + 1
+            env_raw = dict(item.get("env") or {})
+            env = {key: str(value) for key, value in env_raw.items() if value is not None}
             resolved_distill = item_distill or distill_hint
             resolved_k = item_k if item_k is not None else k_hint
             log_distill = resolved_distill or "default"

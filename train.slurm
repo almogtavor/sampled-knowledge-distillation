@@ -231,7 +231,7 @@ MODEL_FOR_EVAL="$OUTPUT_DIR"
 set +e
 "$PY" run_distillation.py \
   --teacher_model "Qwen/Qwen3-8B" \
-  --student_model "Qwen/Qwen3-0.6B" \
+  --student_model "${STUDENT_MODEL:-Qwen/Qwen3-0.6B}" \
   --distill_type "$DISTILL_TYPE" \
   --k_percent "$K_PERCENT" \
   --datasets "${DATASETS:-fineweb}" \
