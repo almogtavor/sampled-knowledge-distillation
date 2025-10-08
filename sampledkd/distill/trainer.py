@@ -241,8 +241,14 @@ class Distiller(
         # Move inputs
         input_ids = batch["input_ids"] # [B, L]
         attn_mask = batch["attention_mask"]
+        kd_mask_tensor = batch.get("kd_mask")
         input_ids_s = input_ids.to(self.student_device)
         attn_mask_s = attn_mask.to(self.student_device)
+        kd_mask_s = None
+        if kd_mask_tensor is not None:
+            kd_mask_s = kd_mask_tensor.to(self.student_device)
+            if kd_mask_s.dtype != torch.bool:
+                kd_mask_s = kd_mask_s.bool()
 
         # Unified KD temperature (applies to both teacher and student log-softmax)
         T = float(getattr(self.config, "kd_temperature", 1.0))
@@ -263,6 +269,8 @@ class Distiller(
         # Align to next-token prediction
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
+        if kd_mask_s is not None:
+            valid_next = valid_next & kd_mask_s[:, 1:].bool()
         # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
         do_elim_softmax = bool(getattr(self.config, "eliminate_softmax", False))
         s_log_probs = None  # set to log_softmax on-demand when needed (only non-elimination paths)

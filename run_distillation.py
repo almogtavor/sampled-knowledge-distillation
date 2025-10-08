@@ -20,7 +20,7 @@ from sampledkd.run_registry import (
     normalize_params,
     get_entry,
 )
-from sampledkd.data.dataset import AIMEJsonl, DistillCollator
+from sampledkd.data.dataset import AIMEJsonl, DistillCollator, PackedTokenDataset
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
 from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
@@ -409,24 +409,32 @@ def main():
         tok.pad_token = tok.eos_token
 
     if all(p.endswith(".jsonl") for p in config.datasets):
-        dataset = AIMEJsonl([Path(p) for p in config.datasets])
+        aime = AIMEJsonl([Path(p) for p in config.datasets])
+        raw_texts = [aime[i]["prompt"] for i in range(len(aime))]
     else:
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
-            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
+            cached_examples = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
+            raw_texts = [ex["prompt"] for ex in cached_examples]
         else:
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")
             hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
                 else load_dataset(config.datasets[0])["train"]
-            print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-            examples = []
+            prompt_col = config.prompt_col or "prompt"
+            answer_col = config.answer_col
+            print(f"Using columns - prompt: '{prompt_col}', answer: '{answer_col}'")
+            raw_texts = []
             for ex in hf_dataset:
-                examples.append({
-                    "prompt": ex[config.prompt_col],
-                    "answer": ex[config.answer_col],
-                })
-            dataset = examples
+                prompt_text = ex[prompt_col]
+                if answer_col is not None and answer_col in ex and ex[answer_col] is not None:
+                    raw_texts.append(f"{prompt_text}\n{ex[answer_col]}")
+                else:
+                    raw_texts.append(prompt_text)
+
+    packed_dataset = PackedTokenDataset(raw_texts, tok, config.max_seq_len)
+    if len(packed_dataset) == 0:
+        raise RuntimeError("Packed dataset is empty. Reduce max_seq_len or provide longer input texts.")
 
     collate = DistillCollator(tok, config.max_seq_len)
     gen = torch.Generator()
@@ -440,7 +448,7 @@ def main():
     sampler = None
     if config.ddp_offline:
         sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
+            packed_dataset,
             num_replicas=config.ddp_world_size,
             rank=config.ddp_rank,
             shuffle=True,
@@ -449,7 +457,7 @@ def main():
         )
 
     dl = torch.utils.data.DataLoader(
-        dataset,
+        packed_dataset,
         batch_size=config.batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
@@ -461,7 +469,7 @@ def main():
         worker_init_fn=_seed_worker,
     )
 
-    dataset_size = len(dataset) if hasattr(dataset, "__len__") else -1
+    dataset_size = len(packed_dataset)
 
     cache_signature = None
     cache_ready = False
