@@ -11,6 +11,8 @@ class BanditMixin:
     def _init_bandit_manager(self):
         self.bandit_manager = None
         if self.config.distill_type == "linucb":
+            if getattr(self, "teacher", None) is None:
+                raise RuntimeError("LinUCB distillation requires a teacher model; offline cache-only runs are unsupported.")
             self.bandit_manager = LinUCBBanditController(
                 tokenizer=self.tok,
                 config=self.config,

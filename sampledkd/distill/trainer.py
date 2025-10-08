@@ -65,12 +65,26 @@ class Distiller(
             and dist.is_initialized()
         )
 
-        self.teacher = teacher_model.eval()  # frozen
+        self.teacher_rank0_only = bool(getattr(config, "_teacher_rank0_owner", False))
+        self.teacher_required = bool(getattr(config, "_teacher_required", teacher_model is not None))
+        if teacher_model is not None:
+            self.teacher = teacher_model.eval()
+        else:
+            self.teacher = None
+            if self.teacher_required and not self.teacher_rank0_only:
+                raise ValueError("Teacher model is required but unavailable for this rank.")
         self.student = student_model.to(student_device).train()
+        teacher_device_str = getattr(config, "_teacher_device_str", None)
+        if teacher_device_str is not None:
+            self.teacher_device = torch.device(teacher_device_str)
+        else:
+            self.teacher_device = teacher_device
+        self.teacher_available = self.teacher_required and (
+            self.teacher is not None or self.teacher_rank0_only
+        )
         self.tok = tokenizer
         self.dataloader = dataloader
 
-        self.teacher_device = teacher_device
         self.student_device = student_device
 
         self._wrap_student_for_ddp()
@@ -86,7 +100,6 @@ class Distiller(
             if self.ddp_rank == 0:
                 print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
 
-        self.teacher_device = teacher_device
         self._printed_cache_info = False
 
         # ===== OOM Reduction: Enable gradient checkpointing on student =====
@@ -173,6 +186,57 @@ class Distiller(
             return self.student.module
         return self.student
 
+    def _teacher_forward_logits(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
+        if not self.teacher_available:
+            raise RuntimeError("Teacher logits requested but no teacher is available on this rank.")
+        if self.teacher is not None and not self.teacher_rank0_only:
+            from torch.cuda.amp import autocast
+            input_ids_t = input_ids.to(self.teacher_device)
+            attn_t = attn_mask.to(self.teacher_device)
+            with torch.no_grad():
+                with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    logits = self.teacher(
+                        input_ids_t,
+                        attention_mask=attn_t,
+                        output_hidden_states=False,
+                    ).logits
+            return self._sanitize_logits(logits, "teacher").to(self.student_device)
+        return self._teacher_forward_distributed(input_ids, attn_mask, amp_enabled, amp_dtype)
+
+    def _teacher_forward_distributed(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
+        if not (self.teacher_rank0_only and self.ddp_enabled and dist.is_initialized()):
+            raise RuntimeError("Distributed teacher forwarding requested without active rank-0 ownership.")
+
+        payload = (input_ids.cpu(), attn_mask.cpu())
+        gather_list = [None] * self.ddp_world_size if self.ddp_rank == 0 else None
+        dist.gather_object(payload, gather_list, dst=0)
+
+        outputs = None
+        if self.ddp_rank == 0:
+            outputs = []
+            from torch.cuda.amp import autocast
+            with torch.no_grad():
+                for ids_cpu, mask_cpu in gather_list:
+                    if ids_cpu is None:
+                        outputs.append(None)
+                        continue
+                    ids = ids_cpu.to(self.teacher_device, non_blocking=True)
+                    mask = mask_cpu.to(self.teacher_device, non_blocking=True)
+                    with autocast(enabled=amp_enabled, dtype=amp_dtype):
+                        logits = self.teacher(
+                            ids,
+                            attention_mask=mask,
+                            output_hidden_states=False,
+                        ).logits
+                    outputs.append(self._sanitize_logits(logits, "teacher").detach().cpu())
+
+        recv = [None]
+        dist.scatter_object_list(recv, outputs if self.ddp_rank == 0 else None, src=0)
+        logits_cpu = recv[0]
+        if logits_cpu is None:
+            raise RuntimeError("Distributed teacher failed to return logits for current rank.")
+        return logits_cpu.to(self.student_device)
+
     def _forward_batch(self, batch):
         # Move inputs
         input_ids = batch["input_ids"] # [B, L]
@@ -205,11 +269,24 @@ class Distiller(
 
         # Decide path: cached RS-KD with softmax elimination vs. fallback
         cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
+        if not self.teacher_available:
+            if not bool(getattr(self.config, "offline_cache", False)):
+                raise RuntimeError("Teacher-less training requires offline_cache=True.")
+            if cached_items is None:
+                raise RuntimeError("Teacher is unavailable but the offline cache is missing entries for this batch. Rebuild the cache before training.")
         do_elim = bool(getattr(self.config, "eliminate_softmax", False)) and (cached_items is not None)
         # Whether we will use the cached RS-KD vocabulary estimator path at all
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
+        if not self.teacher_available and not use_vocab_rs_kd:
+            raise RuntimeError("Teacher-less training currently requires offline cache enabled.")
         distill_type = getattr(self.config, "distill_type", "vanilla")
         score_enabled_flag = bool(getattr(self.config, "score_token_selection", False))
+        if not self.teacher_available:
+            allowed_distill = {"vanilla", "top-k-tok", "bucket", "random"}
+            if distill_type not in allowed_distill:
+                raise RuntimeError(
+                    f"distill_type='{distill_type}' requires a teacher; supported cache-only modes: {sorted(allowed_distill)}."
+                )
 
         supports_cached_no_elim = (
             use_vocab_rs_kd
@@ -226,12 +303,11 @@ class Distiller(
             self._printed_cache_info = True
 
         if not do_elim and not supports_cached_no_elim:
-            input_ids_t = input_ids.to(self.teacher_device)
-            attn_t = attn_mask.to(self.teacher_device)
-            with torch.no_grad():
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-                t_logits = self._sanitize_logits(t_logits, "teacher")  # [B, L, V]
+            if not self.teacher_available:
+                raise RuntimeError(
+                    "Offline cache must provide logits for the configured distillation mode; teacher is not available for fallback."
+                )
+            t_logits = self._teacher_forward_logits(input_ids, attn_mask, amp_enabled, amp_dtype)
             t_pred = t_logits[:, :-1, :]
             t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
             if not self._printed_cache_info:
@@ -1338,32 +1414,38 @@ class Distiller(
         rank_is_zero = (not self.ddp_enabled) or (self.ddp_rank == 0)
         build_cache_on_rank = (not self.ddp_enabled) or (self.ddp_rank == 0)
         if getattr(self.config, "offline_cache", False):
+            cache_ready_flag = bool(getattr(self.config, "_cache_is_ready", False))
             if build_cache_on_rank:
                 if self.cache is None:
                     self.cache = init_offline_cache_for_trainer(
                         getattr(self.config, "offline_cache_dir", None),
                         self.compute_cache_signature()
                     )
-                try:
-                    from torch.utils.data import DataLoader
-                    dl_for_cache = DataLoader(
-                        self.dataloader.dataset,
-                        batch_size=self.config.batch_size,
-                        shuffle=False,
-                        collate_fn=self.dataloader.collate_fn,
-                        num_workers=0,
-                        pin_memory=False,
-                        persistent_workers=False,
-                    )
-                except Exception:
-                    dl_for_cache = self.dataloader
+                if self.teacher_available:
+                    try:
+                        from torch.utils.data import DataLoader
+                        dl_for_cache = DataLoader(
+                            self.dataloader.dataset,
+                            batch_size=self.config.batch_size,
+                            shuffle=False,
+                            collate_fn=self.dataloader.collate_fn,
+                            num_workers=0,
+                            pin_memory=False,
+                            persistent_workers=False,
+                        )
+                    except Exception:
+                        dl_for_cache = self.dataloader
 
-                self.cache = build_offline_cache_if_needed(
-                    cache=self.cache,
-                    teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
-                    config=self.config, teacher_device=self.teacher_device,
-                    sanitize_logits_fn=self._sanitize_logits,
-                )
+                    self.cache = build_offline_cache_if_needed(
+                        cache=self.cache,
+                        teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
+                        config=self.config, teacher_device=self.teacher_device,
+                        sanitize_logits_fn=self._sanitize_logits,
+                    )
+                elif not cache_ready_flag:
+                    raise RuntimeError(
+                        "Teacherless run requires an existing offline cache. Provide a cache built with the same signature."
+                    )
 
             if self.ddp_enabled and dist.is_available() and dist.is_initialized():
                 dist.barrier()
@@ -1372,6 +1454,8 @@ class Distiller(
                         getattr(self.config, "offline_cache_dir", None),
                         self.compute_cache_signature()
                     )
+                    if not self.teacher_available and not cache_ready_flag:
+                        raise RuntimeError("Offline cache not ready on non-building rank and teacher unavailable.")
 
         if self.bandit_manager is not None:
             # Guard against stale pending batches when resuming training or restarting loops.
@@ -1505,7 +1589,7 @@ class Distiller(
                         if self.logger and rank_is_zero:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
                     reward_metrics = None
-                    if self.bandit_manager is not None:
+                    if self.bandit_manager is not None and self.teacher_available:
                         # Consume queued actions collected during forward passes and update the bandit.
                         reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
                     if reward_metrics:

@@ -24,6 +24,12 @@ from sampledkd.data.dataset import AIMEJsonl, DistillCollator
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
 from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
+from sampledkd.training.offline_cache import (
+    init_offline_cache_for_trainer,
+    ID_BITS,
+    PROB_BITS,
+    S_SAMPLES_DEFAULT,
+)
 
 # Import logging utils with fallback
 try:
@@ -31,6 +37,19 @@ try:
 except ImportError:
     def create_training_combined_logger(*args, **kwargs):
         return None
+
+
+def is_rank0() -> bool:
+    """Utility to identify the process that should own rank-0 responsibilities."""
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except RuntimeError:
+        # Fallback to environment inspection if the process group isn't ready yet.
+        pass
+    rank = int(os.environ.get("RANK", "0") or 0)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
+    return rank == 0 or local_rank == 0
 
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
@@ -373,53 +392,24 @@ def main():
     print(f"[rank {ddp_rank}] Student GPU (local): {student_local}")
     print(f"[rank {ddp_rank}] Teacher GPUs (local): {teacher_locals}")
 
-    if is_main_rank or not config.ddp_offline:
-        print("Loading teacher with GPU-first fallback...", flush=True)
-    teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
-        model_name=config.teacher_model,
-        prefer_gpus=teacher_locals,
-        student_gpu=teacher_student_exclusion,
+    # ---- Tokenizer and dataset preparation (before teacher load) ----
+    tok = AutoTokenizer.from_pretrained(
+        config.teacher_model,
+        use_fast=False,
+        trust_remote_code=True,
+        local_files_only=False,
     )
-
-    print("Loading student on its own GPU...", flush=True)
-    student = load_model(  # your existing helper is fine for student
-        config.student_model,
-        device_map=student_local,     # {'': 1} but using local index
-        quant_bits=config.student_quant_bits,
-    )
-
-    # Freeze teacher, no grads (redundant but safe)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    # Reduce memory footprint during forward
-    teacher.config.use_cache = False
-
-    # Ensure student is in training mode - keep parameters in FP32 for gradient computation
-    student.train()
-    student.config.use_cache = False
-        
-    print(f"Teacher device: {teacher_inputs_device}")
-    print(f"Student device: {student_device}")
-    
-    if student_device.type == "cuda":
-        print(f"Using GPU: {torch.cuda.get_device_name(student_device.index)} (device {student_device.index})")
-        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
-        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
-    else:
-        print(f"Using device: {student_device}")
+    if tok.pad_token_id is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
 
     if all(p.endswith(".jsonl") for p in config.datasets):
-        # Use local JSONL if paths are given TODO: make this generic
         dataset = AIMEJsonl([Path(p) for p in config.datasets])
     else:
-        # Special-case: FineWeb-Edu streaming with token budget
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
             dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
         else:
-            # Load from Hugging Face dataset if user passes HF dataset name
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")
             hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
                 else load_dataset(config.datasets[0])["train"]
@@ -432,12 +422,10 @@ def main():
                 })
             dataset = examples
 
-    # (Removed) special-case subsampling for deprecated 'entropy-top-k-with-softmax'
-
     collate = DistillCollator(tok, config.max_seq_len)
-    # Seeded DataLoader generator for reproducible shuffling
     gen = torch.Generator()
     gen.manual_seed(config.seed)
+
     def _seed_worker(worker_id: int):
         base = int(config.seed)
         np.random.seed(base + worker_id)
@@ -466,6 +454,120 @@ def main():
         generator=gen,
         worker_init_fn=_seed_worker,
     )
+
+    dataset_size = len(dataset) if hasattr(dataset, "__len__") else -1
+
+    cache_signature = None
+    cache_ready = False
+    cache_manifest_items = None
+    if getattr(config, "offline_cache", False):
+        cache_signature = {
+            "teacher_name": config.teacher_model,
+            "tokenizer_name": getattr(tok, "name_or_path", "unknown"),
+            "max_seq_len": int(getattr(config, "max_seq_len", 0)),
+            "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
+            "kd_temperature": float(getattr(config, "kd_temperature", 1.0)),
+            "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
+            "rs_samples": int(getattr(config, "rs_samples", S_SAMPLES_DEFAULT)),
+            "id_bits": int(ID_BITS),
+            "prob_bits": int(PROB_BITS),
+            "dataset_len": int(dataset_size),
+            "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
+        }
+        setattr(config, "_expected_cache_signature", cache_signature)
+        cache_probe = init_offline_cache_for_trainer(
+            getattr(config, "offline_cache_dir", None),
+            cache_signature,
+        )
+        cache_manifest_items = len(cache_probe.manifest.get("items", {}))
+        setattr(config, "_expected_dataset_items", int(dataset_size))
+        setattr(config, "_probe_cache_items", int(cache_manifest_items))
+        setattr(config, "_resolved_cache_dir", str(cache_probe.cache_dir))
+        manifest_matches = cache_probe.signature_matches(cache_signature)
+        if manifest_matches and (dataset_size < 0 or cache_manifest_items >= dataset_size):
+            cache_ready = True
+            if is_main_rank:
+                print("[logits-cache] Matching cache found; skipping teacher load and reusing cached logits.")
+        elif manifest_matches and dataset_size >= 0 and cache_manifest_items < dataset_size:
+            if is_main_rank:
+                print(
+                    f"[logits-cache] Cache signature matches but items are incomplete "
+                    f"({cache_manifest_items}/{dataset_size}). Teacher will be loaded to refresh missing entries."
+                )
+
+    setattr(config, "_cache_is_ready", cache_ready)
+
+    teacherless_modes = {"vanilla", "top-k-tok", "bucket", "random"}
+    teacher_required = (
+        (not cache_ready)
+        or (not bool(getattr(config, "offline_cache", False)))
+        or bool(getattr(config, "eliminate_softmax", False))
+        or getattr(config, "distill_type", "vanilla") not in teacherless_modes
+    )
+
+    teacher_rank0_only = bool(
+        teacher_required and bool(getattr(config, "ddp_offline", False)) and config.ddp_world_size > 1
+    )
+
+    teacher = None
+    teacher_inputs_device = torch.device("cpu")
+    if teacher_required:
+        load_here = not teacher_rank0_only or is_rank0()
+        if load_here:
+            if is_main_rank or not config.ddp_offline:
+                print("Loading teacher with GPU-first fallback...", flush=True)
+            teacher, _, teacher_inputs_device = load_teacher_with_fallback(
+                model_name=config.teacher_model,
+                prefer_gpus=teacher_locals,
+                student_gpu=teacher_student_exclusion,
+            )
+        elif is_main_rank:
+            print("Teacher will be hosted on rank 0; skipping local load on this rank.")
+
+    teacher_device_str = str(teacher_inputs_device)
+
+    if config.ddp_offline and dist.is_available() and dist.is_initialized():
+        obj = [teacher_device_str] if is_rank0() else [None]
+        dist.broadcast_object_list(obj, src=0)
+        teacher_device_str = obj[0] or "cpu"
+        teacher_inputs_device = torch.device(teacher_device_str)
+        dist.barrier()
+    else:
+        teacher_inputs_device = torch.device(teacher_device_str)
+
+    setattr(config, "_teacher_device_str", teacher_device_str)
+    setattr(config, "_teacher_rank0_owner", teacher_rank0_only)
+    setattr(config, "_teacher_required", teacher_required)
+
+    print("Loading student on its own GPU...", flush=True)
+    student = load_model(
+        config.student_model,
+        device_map=student_local,
+        quant_bits=config.student_quant_bits,
+    )
+
+    if teacher is not None:
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        teacher.config.use_cache = False
+
+    student.train()
+    student.config.use_cache = False
+
+    if teacher is not None or teacher_required:
+        print(f"Teacher device: {teacher_inputs_device}")
+    else:
+        if is_main_rank:
+            print("Teacher load skipped; using offline cache exclusively for teacher signals.")
+    print(f"Student device: {student_device}")
+
+    if student_device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(student_device.index)} (device {student_device.index})")
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
+    else:
+        print(f"Using device: {student_device}")
 
     # Initialize logging with experiment name (built above)
     
