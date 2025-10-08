@@ -246,7 +246,7 @@ LinUCB maintains
 A\in\mathbb{R}^{d\times d}, b\in\mathbb{R}^d,
 \theta=A^{-1}b,
 \)
-where $A\!\leftarrow\!\lambda I+\sum x x^\top$ and $b\!\leftarrow\!\sum r x$ accumulate past contexts $x$ and rewards $r$.
+where $A\!\leftarrow\!\lambda I+\sum x x^\top$ and $b\!\leftarrow\!b+r_tx_t$ accumulate past contexts $x$ and rewards $r$.
 
 We predict the mean reward (expected KL drop) as $\mu_t=\theta^\top x_t$ ($\theta$ is the weight vector) and its uncertainty as
 $\sigma_t=\sqrt{x_t^\top A^{-1}x_t}$. The score
@@ -255,6 +255,7 @@ $\sigma_t=\sqrt{x_t^\top A^{-1}x_t}$. The score
 	+\underbrace{\alpha\,\sqrt{x_t^\top A^{-1}x_t}}_{\text{UCB: optimism for uncertain }x_t}
 \]
 balances exploitation (favoring tokens with high predicted gain \(\mu_t\)) and exploration (favoring uncertain tokens via \(\sigma_t\)). A larger \(\alpha\) shifts the balance toward exploration.
+When we operate fully offline (teacher-free), LinUCB switches to a 4-D context $x_t=[H_t,\text{CE}_s(t),\widehat{\text{KL}}(t),\text{pos\_norm}(t)]$; if the teacher is accessible, we retain the original six features $[H_t,\text{CE}_t(t),\text{CE}_s(t),\text{KL}(t),\text{pos\_code}(t),\text{pos\_norm}(t)]$.
 After the optimizer step we compute $r_t=\mathrm{KL}_{\text{before}}(t)-\mathrm{KL}_{\text{after}}(t)$ and update
 $A\!\leftarrow\!A+x_tx_t^\top,\; b\!\leftarrow\!b+r_tx_t$.
 If too few have been selected, we take the highest-$s_t$ tokens up to the allowed budget.
@@ -325,7 +326,7 @@ During training the teacher is out of the loop, and all KD terms scale only as $
 	\setlength{\tabcolsep}{6pt}
 	\begin{tabular}{rcccccc}
 		\toprule
-		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$}                                                   \\
+		$m$ & \multicolumn{3}{c}{Avg. Overlap $\uparrow$} & \multicolumn{3}{c}{Avg. Corr. $\uparrow$                                                   } \\
 		\cmidrule(lr){2-4}\cmidrule(lr){5-7}
 		    & Mid                                         & IS                                        & CV-IS & Mid   & IS             & CV-IS          \\
 		\midrule
@@ -399,6 +400,9 @@ Additional training hyperparameters are detailed in Appendix~\ref{app:hyperparam
 We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd} (that have been focused on CE-based selection).
 \citep{wang2021selectivekd} have reported $50K$ to be successful too, which we did not test.
 
+Data pipeline. We use a standard concatenate-and-chunk pretraining pipeline: documents are tokenized with an <eos> separator and packed into fixed-length windows (768 tokens).
+We exclude <eos> and the first token after each <eos> from the loss (and KD loss) to avoid modeling cross-document transitions.
+In a control experiment with boundary masking vs. none, results were indistinguishable within run-to-run variance, while packing substantially reduced padding and wall-clock.
 \section{Main Results}
 \label{sec:main-results}
 \begin{table*}[t]
@@ -412,20 +416,35 @@ We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported 
 		                                           &                       &                           &                      & acc. (\%) $\uparrow$        & perplexity $\downarrow$                 \\
 		\midrule
 		Full KD (all tokens, full softmax)         & 34.5                  & 34.7                      & 65.2                 & 40.8                        & 67.3                    & 46.9          \\
+		Token-selective KD (entropy top-15\%)      & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Token-selective KD (entropy top-20\%)      & 37.7                  & 37.1                      & 66.7                 & 42.2                        & 23.0                    & 48.7          \\
 		Token-selective KD (entropy top-25\%)      & 38.4                  & 37.0                      & 67.1                 & 42.2                        & 23.4                    & 48.8          \\
+		Token-selective KD (entropy top-30\%)      & 39.3                  & 36.9                      & 66.9                 & 41.9                        & 23.7                    & 48.6          \\
 		Token-selective KD (entropy top-75\%)      & ---                   & 34.7                      & 64.9                 & 41.0                        & 72.9                    & ---           \\
-		Token-selective KD (bucket of 5\%-25\%)    & 35.6                  & 34.5                      & 64.7                 & 40.3                        & 77.2                    & 46.5          \\
+		Token-selective KD (bucket of 5\%-20\%)    & 35.6                  & 34.5                      & 64.7                 & 40.3                        & 77.2                    & 46.5          \\
 		Token-selective KD (random 25\%)           & 31.6                  & 34.5                      & 65.3                 & 40.6                        & 69.4                    & 46.8          \\
 		Token-selective KD (pos-rs-kd 25\%)        & 32.5                  & 34.4                      & 65.5                 & 41.6                        & 69.0                    & 47.1          \\
 		Token-selective KD (entropy top-25\%, GLS) & 37.9                  & 36.9                      & 67.1                 & \textbf{43.0}               & \textbf{21.8}           & \textbf{49.0} \\
+		Token-selective KD (entropy top-25\%, norm)& ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Token-selective KD (score top-25\%)        & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Token-selective KD (LinUCB)			       & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		\midrule
-		Sampled KD (entropy top-25\%)              & 26.3                  & 35.7                      & 60.0                 & \textit{41.2}               & 38.7                    & \textit{45.6} \\
+		RS-KD (distill all tokens)	               & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (entropy top-15\%)              & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (entropy top-20\%)              & 25.5                  & 36.0                      & 59.6                 & \textit{43.3}               & 23.5                    & \textit{46.3} \\
+		Sampled KD (entropy top-25\%)              & 26.3                  & 35.7                      & 60.0                 & 41.2                        & 38.7                    & 45.6          \\
+		Sampled KD (entropy top-30\%)              & 25.9                  & 34.7                      & 60.0                 & 35.6                        & 132.5                   & 43.4          \\
 		Sampled KD (entropy top-75\%)              & 35.7                  & 33.8                      & 62.2                 & 33.7                        & 305.9                   & 43.2          \\
+		Sampled KD (bucket of 5\%-20\%)  		   & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (random 25\%)         		   & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Sampled KD (pos-rs-kd top-25\%)            & 33.6                  & 33.9                      & 62.2                 & 32.9                        & 287.0                   & 43.0          \\
-		Sampled KD (LinUCB top-25\%)               & 33.5                  & 33.9                      & 62.3                 & 32.9                        & 287.0                   & 43.0          \\
+		Sampled KD (entropy top-25\%, GLS) 		   & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (entropy top-25\%, norm)		   & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (score top-25\%)         	   & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		Sampled KD (LinUCB)			               & 33.5                  & 33.9                      & 62.3                 & 32.9                        & 287.0                   & 43.0          \\
 		\midrule
 		No KD baseline (Qwen3-0.6B)      & \textbf{47.6}         & \textbf{37.5}             & \textbf{67.6}        & 40.4                        & 24.72                   & 48.2          \\
+		Teacher baseline (Qwen3-8B)      & ----                  & ---                       & ---                 	& ----                        & ----                    & ----          \\
 		\bottomrule
 	\end{tabular}
 	} % end resizebox
@@ -512,6 +531,8 @@ SampledKD, while reducing the computational overhead of each KLD, still does not
 We have explored softmax approximation techniques, but they did not yield satisfactory accuracy.
 
 Similarly to GLS, normalizing selection tokens count in document lengths is another promising direction to explore in order to mitigate the influence of specific batch properties (e.g., length, averaged entropy) on the selection process.
+It might also be interesting to explore hybrid TSKD--SampledKD variants, where selected tokens are split between full KLD and RS-KD where we can apply full KD with online teacher on the most important tokens subset.
+Another direction is to compare this method with a variant that in addition to the selection, also reweights the KD loss by an uncertainty score (entropy or KL).
 
 \section{Conclusion}
 \label{sec:conclusion}
