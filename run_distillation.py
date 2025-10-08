@@ -1,4 +1,5 @@
 import argparse
+import gc
 import os
 import random
 import sys
@@ -23,9 +24,11 @@ from sampledkd.run_registry import (
 from sampledkd.data.dataset import AIMEJsonl, DistillCollator, PackedTokenDataset
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
+from sampledkd.distill._mixins.amp_oom import AmpOomMixin
 from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
 from sampledkd.training.offline_cache import (
     init_offline_cache_for_trainer,
+    build_offline_cache_if_needed,
     ID_BITS,
     PROB_BITS,
     S_SAMPLES_DEFAULT,
@@ -537,6 +540,75 @@ def main():
             )
         elif is_main_rank:
             print("Teacher will be hosted on rank 0; skipping local load on this rank.")
+
+    # Optionally pre-build offline cache before loading students to free teacher VRAM
+    prebuilt_cache = None
+    if (
+        getattr(config, "offline_cache", False)
+        and not cache_ready
+        and teacher is not None
+    ):
+        if is_rank0():
+            print("[logits-cache] Building offline cache on rank 0 before loading students...", flush=True)
+            prebuilt_cache = init_offline_cache_for_trainer(
+                getattr(config, "offline_cache_dir", None),
+                cache_signature,
+            )
+            builder_dl = torch.utils.data.DataLoader(
+                packed_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                collate_fn=collate,
+                num_workers=0,
+                pin_memory=False,
+                persistent_workers=False,
+            )
+
+            prebuilt_cache = build_offline_cache_if_needed(
+                cache=prebuilt_cache,
+                teacher=teacher,
+                tok=tok,
+                dataloader=builder_dl,
+                config=config,
+                teacher_device=teacher_inputs_device,
+                sanitize_logits_fn=AmpOomMixin._sanitize_logits,
+            )
+
+            cache_manifest_items = len(prebuilt_cache.manifest.get("items", {}))
+            cache_ready = cache_manifest_items >= dataset_size
+
+        if config.ddp_offline and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            if not is_rank0():
+                prebuilt_cache = init_offline_cache_for_trainer(
+                    getattr(config, "offline_cache_dir", None),
+                    cache_signature,
+                )
+                cache_manifest_items = len(prebuilt_cache.manifest.get("items", {}))
+                cache_ready = cache_manifest_items >= dataset_size
+
+        if prebuilt_cache is not None:
+            setattr(config, "_resolved_cache_dir", str(prebuilt_cache.cache_dir))
+            setattr(config, "_probe_cache_items", int(cache_manifest_items))
+        setattr(config, "_cache_is_ready", bool(cache_ready))
+
+        if cache_ready:
+            if teacher_rank0_only and teacher is not None and is_rank0():
+                try:
+                    del teacher
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.set_device(teacher_inputs_device)
+                        torch.cuda.empty_cache()
+                        if hasattr(torch.cuda, "reset_max_memory_allocated"):
+                            torch.cuda.reset_max_memory_allocated()
+                        if hasattr(torch.cuda, "reset_max_memory_cached"):
+                            torch.cuda.reset_max_memory_cached()
+                        gc.collect()
+            teacher = None
+            teacher_inputs_device = torch.device("cpu")
+            teacher_required = False
+            teacher_rank0_only = False
 
     teacher_device_str = str(teacher_inputs_device)
 
