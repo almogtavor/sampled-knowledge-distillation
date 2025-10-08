@@ -54,6 +54,7 @@ SCORE_NORMALIZE=${SCORE_NORMALIZE:-}
 SCORE_ENTROPY_WEIGHT=${SCORE_ENTROPY_WEIGHT:-}
 SCORE_CE_WEIGHT=${SCORE_CE_WEIGHT:-}
 SCORE_KL_WEIGHT=${SCORE_KL_WEIGHT:-}
+DDP_OFFLINE=${DDP_OFFLINE:-}
 
 EXTRA_ARGS=()
 if [[ "$SCORE_TOKEN_SELECTION" == "1" ]]; then
@@ -80,6 +81,10 @@ if [[ "$DISTILL_TYPE" == "bucket" ]]; then
   if [[ -n "${BUCKET_UPPER_PERCENT:-}" ]]; then
     EXTRA_ARGS+=(--bucket_upper_percent "${BUCKET_UPPER_PERCENT}")
   fi
+fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  EXTRA_ARGS+=(--ddp_offline)
 fi
 
 # ---------- caches / env ----------
@@ -213,6 +218,33 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   echo "=============================="
 fi
 
+AVAILABLE_GPUS=1
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a _DDP_GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
+  AVAILABLE_GPUS=${#_DDP_GPU_LIST[@]}
+elif [[ "${SLURM_GPUS:-}" =~ ^[0-9]+$ ]]; then
+  AVAILABLE_GPUS=$SLURM_GPUS
+fi
+
+DDP_OFFLINE=${DDP_OFFLINE:-1}
+if [[ "$DDP_OFFLINE" == "1" && "$AVAILABLE_GPUS" -lt 2 ]]; then
+  echo "Requested DDP but only $AVAILABLE_GPUS GPU(s) visible; running single-process."
+  DDP_OFFLINE=0
+fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  DDP_NPROC=${DDP_NPROC:-$AVAILABLE_GPUS}
+  if [[ "$DDP_NPROC" -lt 2 ]]; then
+    DDP_NPROC=2
+  fi
+  export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+  export MASTER_PORT=${MASTER_PORT:-$((20000 + RANDOM % 20000))}
+else
+  DDP_NPROC=1
+fi
+
+echo "Distributed offline DDP = $DDP_OFFLINE (nproc_per_node=$DDP_NPROC)"
+
 # ---------- quick sanity ----------
 $PY - <<'PY' || true
 import sys
@@ -228,8 +260,14 @@ unset PYTHONPATH PYTHONHOME
 TRAIN_LOG=$(mktemp)
 trap 'rm -f "$TRAIN_LOG"' EXIT
 MODEL_FOR_EVAL="$OUTPUT_DIR"
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  echo "Launching in DDP offline mode with $DDP_NPROC processes"
+  LAUNCH_CMD=("$PY" -m torch.distributed.run --standalone --nproc_per_node="$DDP_NPROC")
+else
+  LAUNCH_CMD=("$PY")
+fi
 set +e
-"$PY" run_distillation.py \
+"${LAUNCH_CMD[@]}" run_distillation.py \
   --teacher_model "Qwen/Qwen3-8B" \
   --student_model "${STUDENT_MODEL:-Qwen/Qwen3-0.6B}" \
   --distill_type "$DISTILL_TYPE" \

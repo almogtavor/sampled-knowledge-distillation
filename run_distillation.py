@@ -7,7 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from datasets import load_dataset
+from transformers import AutoTokenizer
 
 from sampledkd.config import TrainingConfig
 from sampledkd.run_registry import (
@@ -141,13 +143,15 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
     # Sampled softmax elimination (only in cached RS-KD path)
-    parser.add_argument("--eliminate_softmax", action="store_true", default=True,
+    parser.add_argument("--eliminate_softmax", action="store_true", default=False,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     parser.add_argument("--no_eliminate_softmax", dest="eliminate_softmax", action="store_false",
                         help="Disable softmax elimination (force full-vocab softmax).")
 
     parser.add_argument("--sampled_softmax_negatives", type=int, default=1500,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
+    parser.add_argument("--ddp_offline", action="store_true", default=True,
+                        help="Enable distributed (torchrun) offline-mode training across multiple GPUs")
     # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
     parser.add_argument("--gls_enabled", action="store_true", default=False,
                         help="Enable global-level selection FIFO queue (only impacts top-k-tok)")
@@ -175,27 +179,63 @@ def parse_args_to_config() -> TrainingConfig:
 def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
+
+    ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed_env = ddp_world_size > 1
+    ddp_rank = int(os.environ.get("RANK", "0")) if distributed_env else 0
+    ddp_local_rank = int(os.environ.get("LOCAL_RANK", "0")) if distributed_env else 0
+
+    if distributed_env and not config.ddp_offline:
+        config.ddp_offline = True
+
+    if config.ddp_offline and not distributed_env:
+        raise RuntimeError(
+            "--ddp_offline requires launching with torchrun (e.g., torchrun --standalone --nproc_per_node=2)."
+        )
+
+    if config.ddp_offline:
+        torch.cuda.set_device(ddp_local_rank)
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+    else:
+        ddp_world_size = 1
+        ddp_rank = 0
+        ddp_local_rank = 0
+
+    is_main_rank = ddp_rank == 0
+
+    # Persist distributed context back into config for downstream components
+    config.ddp_world_size = ddp_world_size
+    config.ddp_rank = ddp_rank
+    config.ddp_local_rank = ddp_local_rank
     
     # Print all CLI parameters at startup
-    print("=" * 80)
-    print("TRAINING CONFIGURATION")
-    print("=" * 80)
-    try:
-        params_dict = config.model_dump()
-    except Exception:
-        params_dict = vars(config)
-    
-    for key, value in sorted(params_dict.items()):
-        print(f"  {key:30s} = {value}")
-    print("=" * 80)
-    print()
+    if is_main_rank:
+        print("=" * 80)
+        print("TRAINING CONFIGURATION")
+        print("=" * 80)
+        try:
+            params_dict = config.model_dump()
+        except Exception:
+            params_dict = vars(config)
+        
+        for key, value in sorted(params_dict.items()):
+            print(f"  {key:30s} = {value}")
+        print("=" * 80)
+        print()
+    else:
+        try:
+            params_dict = config.model_dump()
+        except Exception:
+            params_dict = vars(config)
 
     # global seeding
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
+    seed_offset = config.seed + ddp_rank
+    random.seed(seed_offset)
+    np.random.seed(seed_offset)
+    torch.manual_seed(seed_offset)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+        torch.cuda.manual_seed_all(seed_offset)
 
     # Optional deterministic mode
     if getattr(config, "deterministic", False):
@@ -232,94 +272,113 @@ def main():
 
     # ----------------- runs registry preflight -----------------
     registry_path = Path(getattr(config, "runs_registry", "results/runs.json"))
-    # Build a stable hash over parameters (exclude dates/job ids)
     try:
         params_dict = config.model_dump()
     except Exception:
-        # Fallback for older Pydantic versions
         params_dict = vars(config)
     params_hash = compute_params_hash(params_dict)
 
-    if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
-        entry = get_entry(registry_path, params_hash)
-        completed_eval = bool(entry and entry.get("completed_eval"))
-        runs_info = entry.get("runs", {}) if entry else {}
-        existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
-        print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
-        needs_eval = not completed_eval
-        meta_output_dir = existing_output_dir or ""
-        print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
-        sys.exit(11 if needs_eval else 10)
+    if is_main_rank:
+        if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+            entry = get_entry(registry_path, params_hash)
+            completed_eval = bool(entry and entry.get("completed_eval"))
+            runs_info = entry.get("runs", {}) if entry else {}
+            existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
+            print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
+            needs_eval = not completed_eval
+            meta_output_dir = existing_output_dir or ""
+            print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
+            sys.exit(11 if needs_eval else 10)
 
-    # Create experiment name early (not part of the hash)
-    current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random":
-        experiment_name += f"_k={config.k_percent}"
-    elif config.distill_type == "bucket":
-        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+        current_date = datetime.now().strftime("%Y%m%d_%H%M")
+        job_id = os.getenv("SLURM_JOB_ID", "local")
+        experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+        if config.distill_type in {"top-k-tok", "random"}:
+            experiment_name += f"_k={config.k_percent}"
+        elif config.distill_type == "bucket":
+            experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
-    upsert_run_start(
-        registry_path,
-        params_dict,
-        experiment_name=experiment_name,
-        job_id=job_id,
-        model_output_dir=config.output_dir,
-    )
+        upsert_run_start(
+            registry_path,
+            params_dict,
+            experiment_name=experiment_name,
+            job_id=job_id,
+            model_output_dir=config.output_dir,
+        )
+    else:
+        current_date = datetime.now().strftime("%Y%m%d_%H%M")
+        job_id = os.getenv("SLURM_JOB_ID", "local")
+        experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+        if config.distill_type in {"top-k-tok", "random"}:
+            experiment_name += f"_k={config.k_percent}"
+        elif config.distill_type == "bucket":
+            experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
     # Persist normalized params and hash alongside model outputs for downstream eval
-    try:
-        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-        params_out = Path(config.output_dir) / "run_params.json"
-        with open(params_out, "w", encoding="utf-8") as f:
-            import json as _json
-            _json.dump({
-                "id": params_hash,
-                "params": normalize_params(params_dict),
-            }, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[registry] Warning: failed to write run_params.json: {e}")
+    if is_main_rank:
+        try:
+            Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+            params_out = Path(config.output_dir) / "run_params.json"
+            with open(params_out, "w", encoding="utf-8") as f:
+                import json as _json
+                _json.dump({
+                    "id": params_hash,
+                    "params": normalize_params(params_dict),
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[registry] Warning: failed to write run_params.json: {e}")
 
     # ----------------- teacher / student device planning -----------------
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if device_count == 0:
         raise RuntimeError("No CUDA devices available.")
 
-    # Calculate total VRAM across all GPUs
     total_vram_gb = 0
     for i in range(device_count):
         vram_bytes = torch.cuda.get_device_properties(i).total_memory
-        total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
-    print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
+        total_vram_gb += vram_bytes / (1024**3)
+    if is_main_rank:
+        print(
+            "Success: Detected "
+            + str(device_count)
+            + " GPUs with "
+            + str(round(total_vram_gb, 1))
+            + " GB total VRAM available."
+        )
 
-    # Dynamic GPU allocation normalized to local indices [0..N-1]
-    # When CUDA_VISIBLE_DEVICES=1,3,4,5, local torch sees devices as [0,1,2,3]
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if cvd:
         physical = [int(x) for x in cvd.split(",") if x != ""]
-        # local indices are 0..len(physical)-1
         local_avail = list(range(len(physical)))
     else:
         physical = list(range(device_count))
         local_avail = list(range(device_count))
 
-    # Reserve one local GPU for student (pick 1 if exists else 0)
-    student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
-    student_device = torch.device(f"cuda:{student_local}")
-    # Teacher uses remaining local indices
-    teacher_locals = [g for g in local_avail if g != student_local]
+    if config.ddp_offline:
+        if ddp_local_rank >= len(local_avail):
+            raise RuntimeError(f"LOCAL_RANK={ddp_local_rank} exceeds available GPUs {local_avail}")
+        student_local = ddp_local_rank
+        student_device = torch.device(f"cuda:{student_local}")
+        teacher_locals = local_avail  # allow teacher to shard across visible GPUs when needed
+        teacher_student_exclusion = None
+    else:
+        student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
+        student_device = torch.device(f"cuda:{student_local}")
+        teacher_locals = [g for g in local_avail if g != student_local]
+        teacher_student_exclusion = student_local
     
-    print(f"CUDA_VISIBLE_DEVICES: {cvd}")
-    print(f"Available GPUs (local indices): {local_avail}")
-    print(f"Student GPU (local): {student_local}")
-    print(f"Teacher GPUs (local): {teacher_locals}")
+    if is_main_rank:
+        print(f"CUDA_VISIBLE_DEVICES: {cvd}")
+        print(f"Available GPUs (local indices): {local_avail}")
+    print(f"[rank {ddp_rank}] Student GPU (local): {student_local}")
+    print(f"[rank {ddp_rank}] Teacher GPUs (local): {teacher_locals}")
 
-    print("Loading teacher with GPU-first fallback...", flush=True)
+    if is_main_rank or not config.ddp_offline:
+        print("Loading teacher with GPU-first fallback...", flush=True)
     teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
         model_name=config.teacher_model,
         prefer_gpus=teacher_locals,
-        student_gpu=student_local,
+        student_gpu=teacher_student_exclusion,
     )
 
     print("Loading student on its own GPU...", flush=True)
@@ -384,10 +443,22 @@ def main():
         np.random.seed(base + worker_id)
         random.seed(base + worker_id)
 
+    sampler = None
+    if config.ddp_offline:
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=config.ddp_world_size,
+            rank=config.ddp_rank,
+            shuffle=True,
+            seed=seed_offset,
+            drop_last=False,
+        )
+
     dl = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         collate_fn=collate,
         num_workers=min(8, os.cpu_count() or 1),
         pin_memory=True,
@@ -399,9 +470,11 @@ def main():
     # Initialize logging with experiment name (built above)
     
     # Initialize combined logger (W&B + TensorBoard)
-    combined_logger = create_training_combined_logger(
-        config, experiment_name, tensorboard_dir=config.tensorboard_dir
-    )
+    combined_logger = None
+    if is_main_rank:
+        combined_logger = create_training_combined_logger(
+            config, experiment_name, tensorboard_dir=config.tensorboard_dir
+        )
 
     distiller = Distiller(
         teacher_model=teacher,
@@ -416,23 +489,32 @@ def main():
 
     distiller.train(epochs=config.epochs)
 
-    # Close logging  
-    if combined_logger:
+    if config.ddp_offline:
+        dist.barrier()
+
+    if is_main_rank:
+        if combined_logger:
+            try:
+                combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
+                combined_logger.finish()
+            except Exception:
+                pass
+
+        model_to_save = getattr(distiller, "student", student)
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+        print("Saving student to", config.output_dir)
+        model_to_save.save_pretrained(config.output_dir)
+        tok.save_pretrained(config.output_dir)
+
         try:
-            combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
-            combined_logger.finish()
-        except Exception:
-            pass
+            mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
+        except Exception as e:
+            print(f"[registry] Failed to mark trained: {e}")
 
-    print("Saving student to", config.output_dir)
-    student.save_pretrained(config.output_dir)
-    tok.save_pretrained(config.output_dir)
-
-    # Mark trained in registry
-    try:
-        mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
-    except Exception as e:
-        print(f"[registry] Failed to mark trained: {e}")
+    if config.ddp_offline and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

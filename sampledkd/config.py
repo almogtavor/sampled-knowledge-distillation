@@ -98,6 +98,12 @@ class TrainingConfig(BaseModel):
     checkpoint_steps: int = Field(default=500, description="Save checkpoint every N steps (0 to disable)")
     keep_checkpoints: int = Field(default=3, description="Number of recent checkpoints to keep")
 
+    # Distributed training (offline DDP) context
+    ddp_offline: bool = Field(default=False, description="Enable offline-mode DDP across multiple GPUs")
+    ddp_world_size: int = Field(default=1, description="World size for DDP runs")
+    ddp_rank: int = Field(default=0, description="Global rank for DDP runs")
+    ddp_local_rank: int = Field(default=0, description="Local rank for DDP runs")
+
 
 class CheckpointData(BaseModel):
     """Structure for training checkpoint data."""

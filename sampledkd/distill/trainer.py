@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import device
 from torch.optim import AdamW
@@ -53,46 +54,67 @@ class Distiller(
             student_device: device = "cuda",
             logger=None,  # Combined logger for W&B + TensorBoard
     ):
+        self.config = config
+        self.ddp_world_size = int(getattr(self.config, "ddp_world_size", 1))
+        self.ddp_rank = int(getattr(self.config, "ddp_rank", 0))
+        self.ddp_local_rank = int(getattr(self.config, "ddp_local_rank", 0))
+        self.ddp_enabled = bool(
+            getattr(self.config, "ddp_offline", False)
+            and self.ddp_world_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
         self.teacher = teacher_model.eval()  # frozen
-        self.student = student_model.train()
+        self.student = student_model.to(student_device).train()
         self.tok = tokenizer
         self.dataloader = dataloader
-        self.config = config
-        
+
+        self.teacher_device = teacher_device
+        self.student_device = student_device
+
+        self._wrap_student_for_ddp()
+
         # ===== OOM Reduction: 8-bit optimizer to save ~2-3x memory =====
         try:
             from bitsandbytes.optim import Adam8bit
             self.opt = Adam8bit(self.student.parameters(), lr=config.lr)
-            print("[OOM-opt] Using 8-bit Adam optimizer to reduce memory.")
+            if self.ddp_rank == 0:
+                print("[OOM-opt] Using 8-bit Adam optimizer to reduce memory.")
         except Exception:
             self.opt = AdamW(self.student.parameters(), lr=config.lr)
-            print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
-        
+            if self.ddp_rank == 0:
+                print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
+
         self.teacher_device = teacher_device
-        self.student_device = student_device
         self._printed_cache_info = False
-        
+
         # ===== OOM Reduction: Enable gradient checkpointing on student =====
-        if hasattr(self.student, "gradient_checkpointing_enable"):
+        student_base = self._student_base
+        if hasattr(student_base, "gradient_checkpointing_enable"):
             try:
-                self.student.gradient_checkpointing_enable()
-                print("[OOM-opt] Enabled gradient checkpointing on student model.")
+                student_base.gradient_checkpointing_enable()
+                if self.ddp_rank == 0:
+                    print("[OOM-opt] Enabled gradient checkpointing on student model.")
             except Exception as e:
-                print(f"[OOM-opt] Could not enable gradient checkpointing: {e}")
+                if self.ddp_rank == 0:
+                    print(f"[OOM-opt] Could not enable gradient checkpointing: {e}")
         
         # ===== OOM Reduction: Enable memory-efficient attention =====
         try:
             torch.backends.cuda.enable_mem_efficient_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
-            print("[OOM-opt] Enabled memory-efficient SDPA backends.")
+            if self.ddp_rank == 0:
+                print("[OOM-opt] Enabled memory-efficient SDPA backends.")
         except Exception:
             pass
         
         # Try Flash Attention 2 on student if supported
-        if hasattr(self.student, "config") and hasattr(self.student.config, "use_flash_attention_2"):
+        if hasattr(student_base, "config") and hasattr(student_base.config, "use_flash_attention_2"):
             try:
-                self.student.config.use_flash_attention_2 = True
-                print("[OOM-opt] Enabled Flash Attention 2 on student model.")
+                student_base.config.use_flash_attention_2 = True
+                if self.ddp_rank == 0:
+                    print("[OOM-opt] Enabled Flash Attention 2 on student model.")
             except Exception:
                 pass
         
@@ -103,10 +125,12 @@ class Distiller(
         if self._amp_dtype == torch.float16:
             from torch.cuda.amp import GradScaler
             self._scaler = GradScaler(enabled=True)
-            print(f"[OOM-opt] Using AMP with {self._amp_dtype} and GradScaler.")
+            if self.ddp_rank == 0:
+                print(f"[OOM-opt] Using AMP with {self._amp_dtype} and GradScaler.")
         else:
             self._scaler = None
-            print(f"[OOM-opt] Using AMP with {self._amp_dtype} (no scaler needed).")
+            if self.ddp_rank == 0:
+                print(f"[OOM-opt] Using AMP with {self._amp_dtype} (no scaler needed).")
         
         # Logging setup
         self.logger = logger
@@ -133,6 +157,22 @@ class Distiller(
         # LinUCB contextual bandit setup
         self._init_bandit_manager()
 
+    def _wrap_student_for_ddp(self) -> None:
+        if self.ddp_enabled:
+            device_ids = [self.ddp_local_rank]
+            self.student = torch.nn.parallel.DistributedDataParallel(
+                self.student,
+                device_ids=device_ids,
+                output_device=device_ids[0],
+                find_unused_parameters=False,
+            )
+
+    @property
+    def _student_base(self):
+        if hasattr(self.student, "module"):
+            return self.student.module
+        return self.student
+
     def _forward_batch(self, batch):
         # Move inputs
         input_ids = batch["input_ids"] # [B, L]
@@ -149,6 +189,8 @@ class Distiller(
         amp_enabled = getattr(self, "_use_amp", False)
         amp_dtype = getattr(self, "_amp_dtype", torch.float32)
         
+        rank_is_zero = (not self.ddp_enabled) or (self.ddp_rank == 0)
+
         # --- student forward (always) ---
         with autocast(enabled=amp_enabled, dtype=amp_dtype):
             s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
@@ -179,7 +221,8 @@ class Distiller(
         # Only run teacher forward if we are NOT in elimination mode or cache is missing/unsupported
         t_pred = t_log_probs = None
         if supports_cached_no_elim and not self._printed_cache_info:
-            print("[logits-cache] Using offline cache without elimination → computing KD from cache.", flush=True)
+            if rank_is_zero:
+                print("[logits-cache] Using offline cache without elimination → computing KD from cache.", flush=True)
             self._printed_cache_info = True
 
         if not do_elim and not supports_cached_no_elim:
@@ -192,14 +235,16 @@ class Distiller(
             t_pred = t_logits[:, :-1, :]
             t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
             if not self._printed_cache_info:
-                if getattr(self.config, "offline_cache", False) and cached_items is None:
-                    print("[logits-cache] Cache miss or not available → running online teacher forward.")
-                else:
-                    print("[logits-cache] Running online teacher forward (elimination off).")
+                if rank_is_zero:
+                    if getattr(self.config, "offline_cache", False) and cached_items is None:
+                        print("[logits-cache] Cache miss or not available → running online teacher forward.")
+                    else:
+                        print("[logits-cache] Running online teacher forward (elimination off).")
                 self._printed_cache_info = True
         else:
             if not self._printed_cache_info:
-                print("[logits-cache] Softmax elimination active with cache → skipping online teacher forward.")
+                if rank_is_zero:
+                    print("[logits-cache] Softmax elimination active with cache → skipping online teacher forward.")
                 self._printed_cache_info = True
 
         # --- KD loss ---
@@ -1290,36 +1335,43 @@ class Distiller(
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
         overall_train_start = time.time()
-        # make the offline pass once, if requested (no hidden side effects)
+        rank_is_zero = (not self.ddp_enabled) or (self.ddp_rank == 0)
+        build_cache_on_rank = (not self.ddp_enabled) or (self.ddp_rank == 0)
         if getattr(self.config, "offline_cache", False):
-            if self.cache is None:
-                self.cache = init_offline_cache_for_trainer(
-                    getattr(self.config, "offline_cache_dir", None),
-                    self.compute_cache_signature()
-                )
-            # Build cache with a single-worker DataLoader to avoid multiprocessing/fork hangs
-            # after CUDA initialization on HPC nodes.
-            try:
-                from torch.utils.data import DataLoader
-                dl_for_cache = DataLoader(
-                    self.dataloader.dataset,
-                    batch_size=self.config.batch_size,
-                    shuffle=False,
-                    collate_fn=self.dataloader.collate_fn,
-                    num_workers=0,
-                    pin_memory=False,
-                    persistent_workers=False,
-                )
-            except Exception:
-                # Fallback: use the existing dataloader
-                dl_for_cache = self.dataloader
+            if build_cache_on_rank:
+                if self.cache is None:
+                    self.cache = init_offline_cache_for_trainer(
+                        getattr(self.config, "offline_cache_dir", None),
+                        self.compute_cache_signature()
+                    )
+                try:
+                    from torch.utils.data import DataLoader
+                    dl_for_cache = DataLoader(
+                        self.dataloader.dataset,
+                        batch_size=self.config.batch_size,
+                        shuffle=False,
+                        collate_fn=self.dataloader.collate_fn,
+                        num_workers=0,
+                        pin_memory=False,
+                        persistent_workers=False,
+                    )
+                except Exception:
+                    dl_for_cache = self.dataloader
 
-            self.cache = build_offline_cache_if_needed(
-                cache=self.cache,
-                teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
-                config=self.config, teacher_device=self.teacher_device,
-                sanitize_logits_fn=self._sanitize_logits,
-            )
+                self.cache = build_offline_cache_if_needed(
+                    cache=self.cache,
+                    teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
+                    config=self.config, teacher_device=self.teacher_device,
+                    sanitize_logits_fn=self._sanitize_logits,
+                )
+
+            if self.ddp_enabled and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+                if not build_cache_on_rank:
+                    self.cache = init_offline_cache_for_trainer(
+                        getattr(self.config, "offline_cache_dir", None),
+                        self.compute_cache_signature()
+                    )
 
         if self.bandit_manager is not None:
             # Guard against stale pending batches when resuming training or restarting loops.
@@ -1354,6 +1406,15 @@ class Distiller(
             bandit_steps = 0
             last_reward_metrics: Optional[Dict[str, float]] = None
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
+
+            if self.ddp_enabled:
+                sampler = getattr(self.dataloader, "sampler", None)
+                if sampler is not None and hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+                else:
+                    batch_sampler = getattr(self.dataloader, "batch_sampler", None)
+                    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+                        batch_sampler.set_epoch(epoch)
             
             step = 0  # Manual step counter that only increments on success
             for batch in self.dataloader:
@@ -1395,20 +1456,23 @@ class Distiller(
                         pass
                     
                     oom_rate = (total_oom_failures / batches_attempted) * 100
-                    print(f"[OOM] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
-                          f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
-                          f"Total: {total_oom_failures}/{batches_attempted} ({oom_rate:.1f}%). "
-                          f"Skipping batch...")
+                    if rank_is_zero:
+                        print(
+                            f"[OOM][rank {self.ddp_rank}] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
+                            f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
+                            f"Total: {total_oom_failures}/{batches_attempted} ({oom_rate:.1f}%). "
+                            f"Skipping batch..."
+                        )
                     
                     # Exit if too many consecutive OOMs
-                    if consecutive_oom_failures >= max_consecutive_ooms:
+                    if consecutive_oom_failures >= max_consecutive_ooms and rank_is_zero:
                         print(f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures. "
                               f"Sleeping {oom_failure_sleep_s}s before exiting...")
                         time.sleep(oom_failure_sleep_s)
                         raise RuntimeError(f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures.")
                     
                     # Exit if OOM rate is too high (only check after seeing enough batches)
-                    if batches_attempted >= 20 and oom_rate > max_total_oom_percent:
+                    if batches_attempted >= 20 and oom_rate > max_total_oom_percent and rank_is_zero:
                         print(f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
                               f"Sleeping {oom_failure_sleep_s}s before exiting...")
                         time.sleep(oom_failure_sleep_s)
@@ -1438,7 +1502,7 @@ class Distiller(
                     if bool(getattr(self.config, "anneal_kd_temperature", False)):
                         self.config.kd_temperature = kd_T_at(self.global_step)
                         # Log the current KD temperature to visualize the annealing schedule
-                        if self.logger:
+                        if self.logger and rank_is_zero:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
                     reward_metrics = None
                     if self.bandit_manager is not None:
@@ -1446,12 +1510,12 @@ class Distiller(
                         reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
                     if reward_metrics:
                         last_reward_metrics = reward_metrics
-                        if self.logger:
+                        if self.logger and rank_is_zero:
                             self.logger.log(reward_metrics, self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 
-                        self.global_step % self.config.checkpoint_steps == 0):
+                        self.global_step % self.config.checkpoint_steps == 0 and rank_is_zero):
                         self.save_checkpoint(epoch, step)
 
                 # logging
@@ -1475,7 +1539,7 @@ class Distiller(
                 )
                 
                 # Log metrics
-                if self.logger:
+                if self.logger and rank_is_zero:
                     log_metrics = {**metrics.to_dict(), "train/step": step + 1, "train/global_step": self.global_step}
                     if bandit_metrics:
                         log_metrics.update(bandit_metrics)
@@ -1501,11 +1565,12 @@ class Distiller(
                     if last_reward_metrics:
                         avg_reward = last_reward_metrics.get("bandit/avg_reward", 0.0)
                         reward_str = f" | bandit_reward={avg_reward:.4f}"
-                    print(
-                        f"ep{epoch + 1} step{step + 1} | "
-                        f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
-                        f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
-                    )
+                    if rank_is_zero:
+                        print(
+                            f"ep{epoch + 1} step{step + 1} | "
+                            f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
+                            f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
+                        )
                     
                     # Log averages using new combined logger or legacy loggers
                     avg_metrics = {
@@ -1521,7 +1586,7 @@ class Distiller(
                         avg_metrics.update(last_reward_metrics)
                     
                     # Log averages
-                    if self.logger:
+                    if self.logger and rank_is_zero:
                         self.logger.log(avg_metrics, self.global_step)
                         self.logger.flush()
                         
@@ -1530,12 +1595,13 @@ class Distiller(
                     bandit_steps = 0
         
         # Final checkpoint and cleanup at the end
-        if self.config.checkpoint_steps > 0:
+        if self.config.checkpoint_steps > 0 and rank_is_zero:
             print("Training completed. Performing final cleanup of old checkpoints...")
             self._cleanup_old_checkpoints()
 
         overall_train_elapsed = time.time() - overall_train_start
-        print(f"[distill] Total training duration: {overall_train_elapsed:.2f}s for {epochs} epoch(s)")
+        if rank_is_zero:
+            print(f"[distill] Total training duration: {overall_train_elapsed:.2f}s for {epochs} epoch(s)")
 
 
 __all__ = ["Distiller", "kl_from_vocab_samples"]
