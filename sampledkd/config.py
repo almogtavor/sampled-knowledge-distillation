@@ -13,6 +13,10 @@ class TrainingConfig(BaseModel):
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
     distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
+    normalize_topk_by_length: bool = Field(
+        default=False,
+        description="When true, top-k selection uses a shared quota derived from the batch average length",
+    )
     enable_ce: bool = Field(default=True, description="Enable cross-entropy loss in addition to KD loss")
     alpha_ce: float = Field(default=0.1, description="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")    
     kd_temperature: float = Field(default=1.0, description="Unified KD temperature used for teacher/student log-softmax and loss scaling")

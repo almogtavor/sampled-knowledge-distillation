@@ -472,6 +472,12 @@ class Distiller(
                                 kd_loss = kd_rows_exact.mean() if kd_rows_exact.numel() > 0 else s_pred.sum() * 0.0
                             elif distill == "top-k-tok":
                                 pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
+                                shared_quota = None
+                                if normalize_topk:
+                                    total_valid = int(valid_next.sum().item())
+                                    avg_valid = total_valid / max(1, valid_next.size(0))
+                                    shared_quota = max(1, math.ceil(pct * avg_valid))
                                 if score_enabled and score_ctx is not None:
                                     stat = torch.full_like(ent_cached, float('-inf'))
                                     for i in range(valid_next.size(0)):
@@ -483,7 +489,7 @@ class Distiller(
                                 else:
                                     stat = ent_cached.masked_fill(~valid_next, float('-inf'))
 
-                                use_gls = bool(getattr(self.config, "gls_enabled", False))
+                                use_gls = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
                                 keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                 sel_topk_count = 0
                                 sel_gls_count = 0
@@ -493,7 +499,10 @@ class Distiller(
                                         n_valid = int(mask_i.sum().item())
                                         if n_valid < 3:
                                             continue
-                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        if normalize_topk and shared_quota is not None:
+                                            k = min(n_valid, shared_quota)
+                                        else:
+                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                         sel_topk_count += int(k)
                                         valid_idx_i = torch.where(mask_i)[0]
                                         scores = stat[i][mask_i].float()
@@ -505,13 +514,16 @@ class Distiller(
                                 else:
                                     self._gls_init_if_needed()
                                     thr = self._gls_threshold(top_percent=self.config.k_percent)
-                                    if thr is None:
+                                    if thr is None or normalize_topk:
                                         for i in range(valid_next.size(0)):
                                             mask_i = valid_next[i]
                                             n_valid = int(mask_i.sum().item())
                                             if n_valid < 3:
                                                 continue
-                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                            if normalize_topk and shared_quota is not None:
+                                                k = min(n_valid, shared_quota)
+                                            else:
+                                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                             sel_topk_count += int(k)
                                             valid_idx_i = torch.where(mask_i)[0]
                                             scores = stat[i][mask_i].float()
@@ -645,19 +657,28 @@ class Distiller(
                             else:
                                 stat_elim = ent_cached.masked_fill(~valid_next, float('-inf'))
 
-                            use_gls = bool(getattr(self.config, "gls_enabled", False))
+                            normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
+                            use_gls = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
                             sel_topk_count = 0
                             sel_gls_count = 0
                             if not use_gls:
                                 # Original per-example top-k
                                 pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                shared_quota = None
+                                if normalize_topk:
+                                    total_valid = int(valid_next.sum().item())
+                                    avg_valid = total_valid / max(1, valid_next.size(0))
+                                    shared_quota = max(1, math.ceil(pct * avg_valid))
                                 keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                 for i in range(valid_next.size(0)):
                                     mask_i = valid_next[i]
                                     n_valid = int(mask_i.sum().item())
                                     if n_valid < 3:
                                         continue
-                                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                    if normalize_topk and shared_quota is not None:
+                                        k = min(n_valid, shared_quota)
+                                    else:
+                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                     sel_topk_count += int(k)
                                     valid_idx_i = torch.where(mask_i)[0]
                                     scores = stat_elim[i][mask_i].float()
@@ -672,13 +693,21 @@ class Distiller(
                                 thr = self._gls_threshold(top_percent=self.config.k_percent)
                                 if thr is None:
                                     pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                    shared_quota = None
+                                    if normalize_topk:
+                                        total_valid = int(valid_next.sum().item())
+                                        avg_valid = total_valid / max(1, valid_next.size(0))
+                                        shared_quota = max(1, math.ceil(pct * avg_valid))
                                     keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                     for i in range(valid_next.size(0)):
                                         mask_i = valid_next[i]
                                         n_valid = int(mask_i.sum().item())
                                         if n_valid < 3:
                                             continue
-                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        if normalize_topk and shared_quota is not None:
+                                            k = min(n_valid, shared_quota)
+                                        else:
+                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                         sel_topk_count += int(k)
                                         valid_idx_i = torch.where(mask_i)[0]
                                         scores = stat_elim[i][mask_i].float()

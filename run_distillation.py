@@ -67,6 +67,12 @@ def parse_args_to_config() -> TrainingConfig:
         "linucb",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
+    parser.add_argument(
+        "--normalize_topk_by_length",
+        action="store_true",
+        default=False,
+        help="When set, top-k token quota is based on the batch-average valid length instead of per-example length",
+    )
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
     parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
     # KD temperature annealing controls
