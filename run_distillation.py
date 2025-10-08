@@ -503,7 +503,7 @@ def main():
 
     setattr(config, "_cache_is_ready", cache_ready)
 
-    teacherless_modes = {"vanilla", "top-k-tok", "bucket", "random"}
+    teacherless_modes = {"vanilla", "top-k-tok", "bucket", "random", "linucb"}
     teacher_required = (
         (not cache_ready)
         or (not bool(getattr(config, "offline_cache", False)))
