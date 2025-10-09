@@ -388,6 +388,9 @@ def _build_cache_pass(
     k_approx: int,
     S_vocab: int,
     beta: float,
+    *,
+    rank: int | None = None,
+    expected_total: int | None = None,
 ):
     """Internal: run a single offline teacher pass to populate cache. Returns (maybe_cache, V_last).
 
@@ -398,6 +401,9 @@ def _build_cache_pass(
     build_start_time = time.time()
     last_log_time = build_start_time
     maybe_cache = 0
+    prefix = "[logits-cache]"
+    if rank is not None:
+        prefix = f"{prefix}[rank {rank}]"
     V_last = None
     with torch.no_grad():
         for batch in dataloader:
@@ -493,8 +499,11 @@ def _build_cache_pass(
                     now = time.time()
                     total_elapsed = now - build_start_time
                     delta_elapsed = now - last_log_time
+                    count_repr = (
+                        f"{maybe_cache}/{int(expected_total)}" if expected_total and expected_total > 0 else f"{maybe_cache}"
+                    )
                     print(
-                        f"[logits-cache] Progress: cached {maybe_cache} new items so far... "
+                        f"{prefix} Progress: cached {count_repr} new items so far... "
                         f"total={total_elapsed:.2f}s, since_prev={delta_elapsed:.2f}s"
                     )
                     last_log_time = now
@@ -587,6 +596,8 @@ def build_offline_cache_if_needed(
     config,
     teacher_device,
     sanitize_logits_fn,
+    *,
+    force_refresh: bool = False,
 ) -> TeacherOfflineCache:
     """
     One pass over the dataset with the TEACHER to compute:
@@ -617,16 +628,37 @@ def build_offline_cache_if_needed(
         "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
     }
 
-    if cache.signature_matches(sig):
-        print(
-            f"[logits-cache] Cache found with matching signature - using existing cache at {cache.cache_dir}."
-        )
-        return cache
+    expected_items = sig.get("dataset_len", -1)
+    current_items = len(cache.manifest.get("items", {}))
 
-    print(
-        f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {cache.cache_dir}..."
-    )
-    cache.set_signature(sig)
+    rank = getattr(config, "ddp_rank", None)
+    prefix = "[logits-cache]"
+    if rank is not None:
+        prefix = f"{prefix}[rank {rank}]"
+
+    if cache.signature_matches(sig):
+        if force_refresh and expected_items > 0 and current_items < expected_items:
+            print(
+                f"{prefix} Cache signature matches but only {current_items}/{expected_items} items present; refreshing missing entries at {cache.cache_dir}."
+            )
+        elif expected_items > 0 and current_items < expected_items:
+            print(
+                f"{prefix} Cache signature matches but items are incomplete ({current_items}/{expected_items}); refreshing."
+            )
+            force_refresh = True
+        else:
+            print(
+                f"{prefix} Cache found with matching signature - using existing cache at {cache.cache_dir}."
+            )
+            return cache
+
+    if not cache.signature_matches(sig):
+        print(
+            f"{prefix} No cache found or signature changed - building teacher cache (one pass over dataset) at {cache.cache_dir}..."
+        )
+        cache.set_signature(sig)
+    else:
+        cache.set_signature(sig)
 
     # S_vocab, beta are no-ops for Gumbel RS-KD
     k_approx = int(getattr(config, "entropy_approx_m", 12))
@@ -643,6 +675,8 @@ def build_offline_cache_if_needed(
         k_approx=k_approx,
         S_vocab=S_vocab,
         beta=beta,
+        rank=rank,
+        expected_total=expected_items,
     )
     # Flush any pending shard so that subsequent reads during stats pass are valid
     finalize = getattr(cache, "finalize", None)
@@ -678,10 +712,10 @@ def build_offline_cache_if_needed(
         pass
 
     saved_bytes = max(0, stats.get("baseline_full_logits_bytes", 0) - stats.get("cache_bytes", 0))
-    print(f"[logits-cache] Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")
-    print(f"[logits-cache] Cache build duration: {build_wall_elapsed:.2f}s")
+    print(f"{prefix} Done. Cached {maybe_cache} new items. Total items in cache: {total_items}.")
+    print(f"{prefix} Cache build duration: {build_wall_elapsed:.2f}s")
     print(
-        "[logits-cache] Stats: "
+        f"{prefix} Stats: "
         f"approx_entropy_logits_saved={stats['approx_entropy_logits_saved']}, "
         f"rs_ids={stats['rs_kd_ids_saved']}, "
         f"rs_probs={stats['rs_kd_probs_saved']}, "

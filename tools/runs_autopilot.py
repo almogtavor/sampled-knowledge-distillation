@@ -160,22 +160,6 @@ CUSTOM_TRAIN_SEQUENCE = [
         },
     },
 
-    # Sampled KD (entropy top-25%, norm)
-    # Use the score path but weight entropy only, with z-normalization.
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "5000000",
-            "SCORE_TOKEN_SELECTION": "1",
-            "SCORE_NORMALIZE": "z",
-            "SCORE_ENTROPY_WEIGHT": "1.0",
-            "SCORE_CE_WEIGHT": "0.0",
-            "SCORE_KL_WEIGHT": "0.0",
-        },
-    },
-
     # Sampled KD (score top-25%)
     # Combined score with z-normalization (entropy + CE + KL).
     {
@@ -539,6 +523,9 @@ class SchedulerContext:
             job_id = str(meta.get("job_id", ""))
             if job_id and job_id in active_train_ids:
                 continue
+            if meta.get("pseudo"):
+                to_delete.append(run_id)
+                continue
             # Remove once training completed OR job disappeared and delay passed
             entry = next((r for r in self.registry if r.get("id") == run_id), None)
             if entry and entry.get("completed_train"):
@@ -626,6 +613,7 @@ class SchedulerContext:
         if available_slots <= 0:
             return
 
+        base_params: dict = {}
         for entry in self.registry:
             run_id = entry.get("id")
             if not run_id:
@@ -641,6 +629,8 @@ class SchedulerContext:
                 continue
 
             params = entry.get("params", {})
+            if not base_params:
+                base_params = params
             distill_type_param = params.get("distill_type")
             distill_type = distill_type_param or "top-k-tok"
             k_param = params.get("k_percent")
@@ -691,6 +681,58 @@ class SchedulerContext:
                     available_slots -= 1
                     if available_slots <= 0:
                         break
+
+        if available_slots <= 0:
+            return
+
+        if not base_params and self.registry:
+            base_params = self.registry[0].get("params", {})
+
+        base_env = self.build_training_env(base_params)
+        default_distill = base_params.get("distill_type", "top-k-tok") if base_params else "top-k-tok"
+        default_k = self._coerce_int(base_params.get("k_percent")) if base_params else None
+
+        while available_slots > 0:
+            template_env, template_distill, template_k, matched_template = self.consume_sequence_env(
+                None,
+                None,
+            )
+            if not matched_template:
+                break
+
+            distill_type = template_distill or default_distill or "top-k-tok"
+            k_percent = template_k if template_k is not None else (default_k if default_k is not None else 0)
+
+            env = dict(base_env)
+            env.update(template_env)
+
+            job_seq_idx = int(self.state.get("train_sequence_idx", 0)) - 1
+            job_name = f"{TRAIN_JOB_PREFIX}seq{job_seq_idx:05d}"
+            final_k_percent = k_percent if k_percent is not None else 0
+            args = [
+                distill_type,
+                str(final_k_percent),
+                self.eval_suite,
+                self.tag_default,
+            ]
+            if self.dry_run:
+                print(f"[dry-run] Would submit sequence job idx={job_seq_idx} -> {job_name} env={env}")
+            else:
+                job_id = run_sbatch(self.train_script, args, env=env, job_name=job_name)
+                if job_id:
+                    print(f"[submit] Sequence job idx={job_seq_idx} job={job_id} ({distill_type} k={k_percent})")
+                    key = f"sequence::{job_id}"
+                    self.state["train_jobs"][key] = {
+                        "job_id": job_id,
+                        "submitted_at": _now().isoformat(),
+                        "distill_type": distill_type,
+                        "k_percent": final_k_percent,
+                        "template_idx": job_seq_idx,
+                        "pseudo": True,
+                    }
+                    available_slots -= 1
+                else:
+                    break
 
     def build_training_env(self, params: dict) -> dict:
         env: Dict[str, str] = {}
@@ -810,6 +852,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train", type=int, default=4, help="Maximum concurrent train jobs (states R/PD) to allow")
     parser.add_argument("--max-eval", type=int, default=3, help="Maximum concurrent eval jobs")
     parser.add_argument("--interval", type=int, default=900, help="Polling interval in seconds (default 15 minutes)")
+    parser.add_argument(
+        "--min-interval",
+        type=int,
+        default=60,
+        help="Minimum interval to use when free slots are available (default 60 seconds)",
+    )
     parser.add_argument("--retry-minutes", type=int, default=30, help="Delay before requeueing a failed job")
     parser.add_argument("--tag", default=None, help="Fallback KD_SWEEP_TAG when none can be inferred")
     parser.add_argument("--user", default=os.environ.get("USER"), help="SLURM account/user to monitor (default: $USER)")
@@ -903,7 +951,12 @@ def main() -> int:
 
         if args.once:
             break
-        time.sleep(args.interval)
+
+        sleep_seconds = args.interval
+        if (args.max_train - len(ctx.active_train_jobs()) > 0) or (args.max_eval - len(ctx.active_eval_jobs()) > 0):
+            sleep_seconds = min(args.interval, max(args.min_interval, 1))
+
+        time.sleep(sleep_seconds)
     return 0
 
 
