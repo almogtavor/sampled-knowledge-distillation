@@ -140,30 +140,6 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--fineweb_tokens", type=int, default=50_000_000,
                         help="Token budget when streaming FineWeb-Edu (used when datasets[0] == 'fineweb')")
     parser.add_argument(
-        "--filter_short_docs",
-        action="store_true",
-        default=False,
-        help="Filter documents shorter than max_seq_len tokens when building datasets/caches",
-    )
-    parser.add_argument(
-        "--no_filter_short_docs",
-        dest="filter_short_docs",
-        action="store_false",
-        help="Disable filtering of documents shorter than max_seq_len",
-    )
-    parser.add_argument(
-        "--filter_long_docs",
-        action="store_true",
-        default=False,
-        help="Filter documents longer than max_seq_len tokens when building datasets/caches",
-    )
-    parser.add_argument(
-        "--no_filter_long_docs",
-        dest="filter_long_docs",
-        action="store_false",
-        help="Disable filtering of documents longer than max_seq_len (default).",
-    )
-    parser.add_argument(
         "--disable_packing",
         dest="enable_packing",
         action="store_false",
@@ -460,8 +436,6 @@ def main():
                 max_tokens=budget,
                 seed=config.seed,
                 max_seq_len=config.max_seq_len,
-                filter_short_docs=bool(getattr(config, "filter_short_docs", False)),
-                filter_long_docs=bool(getattr(config, "filter_long_docs", False)),
                 packing_enabled=bool(getattr(config, "enable_packing", True)),
             )
             raw_texts = [ex["prompt"] for ex in cached_examples]
@@ -479,37 +453,6 @@ def main():
                     raw_texts.append(f"{prompt_text}\n{ex[answer_col]}")
                 else:
                     raw_texts.append(prompt_text)
-
-    if getattr(config, "filter_long_docs", False):
-        kept = []
-        removed = 0
-        for text in raw_texts:
-            n_tokens = len(tok.encode(text, add_special_tokens=False))
-            if n_tokens <= config.max_seq_len:
-                kept.append(text)
-            else:
-                removed += 1
-        if removed > 0:
-            print(
-                f"[data-filter] Removed {removed} documents longer than {config.max_seq_len} tokens; {len(kept)} remain"
-            )
-        raw_texts = kept
-
-    if getattr(config, "filter_short_docs", False):
-        filtered = []
-        removed = 0
-        for text in raw_texts:
-            n_tokens = len(tok.encode(text, add_special_tokens=False))
-            if n_tokens >= config.max_seq_len:
-                filtered.append(text)
-            else:
-                removed += 1
-        if removed > 0:
-            print(
-                f"[data-filter] Removed {removed} documents shorter than {config.max_seq_len} tokens;"
-                f" {len(filtered)} remain"
-            )
-        raw_texts = filtered
 
     if getattr(config, "enable_packing", True):
         dataset = PackedTokenDataset(raw_texts, tok, config.max_seq_len)
@@ -571,8 +514,6 @@ def main():
             "prob_bits": int(PROB_BITS),
             "dataset_len": int(dataset_size),
             "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
-            "filter_short_docs": bool(getattr(config, "filter_short_docs", False)),
-            "filter_long_docs": bool(getattr(config, "filter_long_docs", False)),
             "packing_enabled": bool(getattr(config, "enable_packing", True)),
         }
         setattr(config, "_expected_cache_signature", cache_signature)

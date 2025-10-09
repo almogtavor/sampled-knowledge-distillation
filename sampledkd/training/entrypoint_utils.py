@@ -364,15 +364,12 @@ def load_fineweb_subset(
     max_tokens: int,
     seed: int = 1337,
     max_seq_len: int = 512,
-    filter_short_docs: bool = False,
-    filter_long_docs: bool = False,
     packing_enabled: bool = True,
 ):
     """
     Load FineWeb-Edu subset with automatic caching.
-    First run: streams, filters, and caches to disk.
-    Subsequent runs: loads from cache instantly.
-    
+    The first run streams data, tokenizes, and caches to disk; later runs reuse the cache.
+
     Returns a list of {prompt, answer} examples.
     """
     from sampledkd.data.cache import load_or_create_fineweb_cache
@@ -383,7 +380,5 @@ def load_fineweb_subset(
         max_seq_len=max_seq_len,
         seed=seed,
         batch_size=512,
-        filter_short_docs=filter_short_docs,
-        filter_long_docs=filter_long_docs,
         packing_enabled=packing_enabled,
     )
