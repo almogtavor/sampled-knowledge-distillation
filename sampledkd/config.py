@@ -58,6 +58,18 @@ class TrainingConfig(BaseModel):
     dataset_config: Optional[str] = None
     # FineWeb streaming token budget (used when datasets[0] == "fineweb")
     fineweb_tokens: int = Field(default=50_000_000, description="Token budget when streaming FineWeb-Edu")
+    filter_short_docs: bool = Field(
+        default=False,
+        description="Filter documents shorter than max_seq_len tokens during dataset preparation",
+    )
+    filter_long_docs: bool = Field(
+        default=False,
+        description="Filter documents longer than max_seq_len tokens during dataset preparation",
+    )
+    enable_packing: bool = Field(
+        default=True,
+        description="Pack concatenated documents into fixed-length token windows before training",
+    )
     
     # Training hyperparameters
     epochs: int = 1

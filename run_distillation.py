@@ -21,7 +21,7 @@ from sampledkd.run_registry import (
     normalize_params,
     get_entry,
 )
-from sampledkd.data.dataset import AIMEJsonl, DistillCollator, PackedTokenDataset
+from sampledkd.data.dataset import AIMEJsonl, DistillCollator, PackedTokenDataset, PromptDataset
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
 from sampledkd.distill._mixins.amp_oom import AmpOomMixin
@@ -139,6 +139,43 @@ def parse_args_to_config() -> TrainingConfig:
                         help="name of answer column for HF datasets")
     parser.add_argument("--fineweb_tokens", type=int, default=50_000_000,
                         help="Token budget when streaming FineWeb-Edu (used when datasets[0] == 'fineweb')")
+    parser.add_argument(
+        "--filter_short_docs",
+        action="store_true",
+        default=False,
+        help="Filter documents shorter than max_seq_len tokens when building datasets/caches",
+    )
+    parser.add_argument(
+        "--no_filter_short_docs",
+        dest="filter_short_docs",
+        action="store_false",
+        help="Disable filtering of documents shorter than max_seq_len",
+    )
+    parser.add_argument(
+        "--filter_long_docs",
+        action="store_true",
+        default=False,
+        help="Filter documents longer than max_seq_len tokens when building datasets/caches",
+    )
+    parser.add_argument(
+        "--no_filter_long_docs",
+        dest="filter_long_docs",
+        action="store_false",
+        help="Disable filtering of documents longer than max_seq_len (default).",
+    )
+    parser.add_argument(
+        "--disable_packing",
+        dest="enable_packing",
+        action="store_false",
+        help="Disable sequence packing into fixed-length windows",
+    )
+    parser.add_argument(
+        "--enable_packing",
+        dest="enable_packing",
+        action="store_true",
+        help="Enable sequence packing into fixed-length windows",
+    )
+    parser.set_defaults(enable_packing=True)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
@@ -418,7 +455,15 @@ def main():
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
-            cached_examples = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
+            cached_examples = load_fineweb_subset(
+                tok,
+                max_tokens=budget,
+                seed=config.seed,
+                max_seq_len=config.max_seq_len,
+                filter_short_docs=bool(getattr(config, "filter_short_docs", False)),
+                filter_long_docs=bool(getattr(config, "filter_long_docs", False)),
+                packing_enabled=bool(getattr(config, "enable_packing", True)),
+            )
             raw_texts = [ex["prompt"] for ex in cached_examples]
         else:
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")
@@ -435,9 +480,45 @@ def main():
                 else:
                     raw_texts.append(prompt_text)
 
-    packed_dataset = PackedTokenDataset(raw_texts, tok, config.max_seq_len)
-    if len(packed_dataset) == 0:
-        raise RuntimeError("Packed dataset is empty. Reduce max_seq_len or provide longer input texts.")
+    if getattr(config, "filter_long_docs", False):
+        kept = []
+        removed = 0
+        for text in raw_texts:
+            n_tokens = len(tok.encode(text, add_special_tokens=False))
+            if n_tokens <= config.max_seq_len:
+                kept.append(text)
+            else:
+                removed += 1
+        if removed > 0:
+            print(
+                f"[data-filter] Removed {removed} documents longer than {config.max_seq_len} tokens; {len(kept)} remain"
+            )
+        raw_texts = kept
+
+    if getattr(config, "filter_short_docs", False):
+        filtered = []
+        removed = 0
+        for text in raw_texts:
+            n_tokens = len(tok.encode(text, add_special_tokens=False))
+            if n_tokens >= config.max_seq_len:
+                filtered.append(text)
+            else:
+                removed += 1
+        if removed > 0:
+            print(
+                f"[data-filter] Removed {removed} documents shorter than {config.max_seq_len} tokens;"
+                f" {len(filtered)} remain"
+            )
+        raw_texts = filtered
+
+    if getattr(config, "enable_packing", True):
+        dataset = PackedTokenDataset(raw_texts, tok, config.max_seq_len)
+        if len(dataset) == 0:
+            raise RuntimeError("Packed dataset is empty. Reduce max_seq_len or provide longer input texts.")
+    else:
+        dataset = PromptDataset(raw_texts)
+        if len(dataset) == 0:
+            raise RuntimeError("Dataset is empty. Provide non-empty input texts.")
 
     collate = DistillCollator(tok, config.max_seq_len)
     gen = torch.Generator()
@@ -451,7 +532,7 @@ def main():
     sampler = None
     if config.ddp_offline:
         sampler = torch.utils.data.distributed.DistributedSampler(
-            packed_dataset,
+            dataset,
             num_replicas=config.ddp_world_size,
             rank=config.ddp_rank,
             shuffle=True,
@@ -460,7 +541,7 @@ def main():
         )
 
     dl = torch.utils.data.DataLoader(
-        packed_dataset,
+        dataset,
         batch_size=config.batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
@@ -472,7 +553,7 @@ def main():
         worker_init_fn=_seed_worker,
     )
 
-    dataset_size = len(packed_dataset)
+    dataset_size = len(dataset)
 
     cache_signature = None
     cache_ready = False
@@ -490,6 +571,9 @@ def main():
             "prob_bits": int(PROB_BITS),
             "dataset_len": int(dataset_size),
             "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
+            "filter_short_docs": bool(getattr(config, "filter_short_docs", False)),
+            "filter_long_docs": bool(getattr(config, "filter_long_docs", False)),
+            "packing_enabled": bool(getattr(config, "enable_packing", True)),
         }
         setattr(config, "_expected_cache_signature", cache_signature)
         cache_probe = init_offline_cache_for_trainer(
@@ -592,7 +676,14 @@ def main():
             setattr(config, "_probe_cache_items", int(cache_manifest_items))
         setattr(config, "_cache_is_ready", bool(cache_ready))
 
-        if cache_ready:
+        teacher_required = (
+            (not cache_ready)
+            or (not bool(getattr(config, "offline_cache", False)))
+            or bool(getattr(config, "eliminate_softmax", False))
+            or getattr(config, "distill_type", "vanilla") not in teacherless_modes
+        )
+
+        if cache_ready and not teacher_required:
             if teacher_rank0_only and teacher is not None and is_rank0():
                 try:
                     del teacher
@@ -607,7 +698,6 @@ def main():
                         gc.collect()
             teacher = None
             teacher_inputs_device = torch.device("cpu")
-            teacher_required = False
             teacher_rank0_only = False
 
     teacher_device_str = str(teacher_inputs_device)

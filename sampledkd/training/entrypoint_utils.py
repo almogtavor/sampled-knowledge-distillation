@@ -359,7 +359,15 @@ def load_teacher_with_fallback(
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
-def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
+def load_fineweb_subset(
+    tokenizer,
+    max_tokens: int,
+    seed: int = 1337,
+    max_seq_len: int = 512,
+    filter_short_docs: bool = False,
+    filter_long_docs: bool = False,
+    packing_enabled: bool = True,
+):
     """
     Load FineWeb-Edu subset with automatic caching.
     First run: streams, filters, and caches to disk.
@@ -375,4 +383,7 @@ def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_le
         max_seq_len=max_seq_len,
         seed=seed,
         batch_size=512,
+        filter_short_docs=filter_short_docs,
+        filter_long_docs=filter_long_docs,
+        packing_enabled=packing_enabled,
     )

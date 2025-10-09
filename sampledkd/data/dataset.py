@@ -36,40 +36,77 @@ class AIMEJsonl(Dataset):
         return self.examples[idx]
 
 
+class PromptDataset(Dataset):
+    """Simple dataset of raw text prompts (no packing)."""
+
+    def __init__(self, texts: List[str]):
+        self.texts = list(texts)
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int) -> Dict[str, str]:
+        return {"prompt": self.texts[idx]}
+
+
 class DistillCollator:
-    """Collates packed token windows into batched tensors."""
+    """Collates packed or unpacked batches into tensors for training."""
 
     def __init__(self, tokenizer, max_len: int):
         self.tok = tokenizer
         self.max_len = max_len
 
     def __call__(self, batch):
-        def _to_tensor(values, dtype):
-            if torch.is_tensor(values):
-                return values.to(dtype=dtype)
-            return torch.tensor(values, dtype=dtype)
+        first = batch[0]
+        if isinstance(first, dict) and "input_ids" in first:
+            def _to_tensor(values, dtype):
+                if torch.is_tensor(values):
+                    return values.to(dtype=dtype)
+                return torch.tensor(values, dtype=dtype)
 
-        input_ids = torch.stack([_to_tensor(item["input_ids"], torch.long) for item in batch])
-        attention_mask = torch.stack([
-            _to_tensor(item.get("attention_mask", torch.ones(self.max_len)), torch.long)
-            for item in batch
-        ])
+            input_ids = torch.stack([_to_tensor(item["input_ids"], torch.long) for item in batch])
+            attention_mask = torch.stack([
+                _to_tensor(item.get("attention_mask", torch.ones(self.max_len)), torch.long)
+                for item in batch
+            ])
 
-        labels = torch.stack([
-            _to_tensor(item.get("labels", item["input_ids"]), torch.long)
-            for item in batch
-        ])
+            labels = torch.stack([
+                _to_tensor(item.get("labels", item["input_ids"]), torch.long)
+                for item in batch
+            ])
 
-        kd_mask = torch.stack([
-            _to_tensor(item.get("kd_mask"), torch.bool)
-            for item in batch
-        ])
+            kd_mask_values = []
+            has_kd_mask = "kd_mask" in first
+            if has_kd_mask:
+                kd_mask_values = [
+                    _to_tensor(item.get("kd_mask"), torch.bool)
+                    for item in batch
+                ]
+
+            result = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
+            if has_kd_mask:
+                result["kd_mask"] = torch.stack(kd_mask_values)
+            return result
+
+        prompts = [item["prompt"] if isinstance(item, dict) else str(item) for item in batch]
+        enc = self.tok(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.max_len,
+        )
+        labels = enc["input_ids"].clone()
+        labels[enc["attention_mask"] == 0] = -100
 
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
             "labels": labels,
-            "kd_mask": kd_mask,
         }
 
 

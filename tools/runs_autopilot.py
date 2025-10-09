@@ -56,131 +56,276 @@ EVAL_NAME_FALLBACKS = ("ekd-eval",)
 # sbatch lines used in kd_sweep.sh so you can copy/paste the combos you care
 # about. Remove or comment out entries you don't need.
 CUSTOM_TRAIN_SEQUENCE = [
+        # RS-KD (distill all tokens)
     {
         "distill_type": "top-k-tok",
         "k_percent": 100,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "4000000",
+            "FINEWEB_TOKENS": "5000000",
         },
     },
+
+    # Sampled KD (entropy top-15%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 15,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (entropy top-20%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (entropy top-25%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (entropy top-30%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 30,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (entropy top-75%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 75,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (bucket of 5%-20%)
+    {
+        "distill_type": "bucket",
+        "k_percent": 0,  # ignored by bucket; env below defines the band
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "BUCKET_LOWER_PERCENT": "5",
+            "BUCKET_UPPER_PERCENT": "20",
+        },
+    },
+
+    # Sampled KD (random 25%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
+        },
+    },
+
+    # Sampled KD (pos-rs-kd top-25%)
+    {
+        "distill_type": "pos-rs-kd",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # Sampled KD (entropy top-25%, GLS)
     {
         "distill_type": "top-k-tok",
         "k_percent": 25,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "GLS_ENABLED": "1",
-            "FINEWEB_TOKENS": "10000000",
+            "FINEWEB_TOKENS": "5000000",
         },
     },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 30,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 20,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 30,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-        },
-    },
+
+    # Sampled KD (entropy top-25%, norm)
+    # Use the score path but weight entropy only, with z-normalization.
     {
         "distill_type": "top-k-tok",
         "k_percent": 25,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "SCORE_TOKEN_SELECTION": 1,
+            "FINEWEB_TOKENS": "5000000",
+            "SCORE_TOKEN_SELECTION": "1",
             "SCORE_NORMALIZE": "z",
-            "SCORE_ENTROPY_WEIGHT": 1.0,
-            "SCORE_CE_WEIGHT": 1.0,
-            "SCORE_KL_WEIGHT": 1.0
+            "SCORE_ENTROPY_WEIGHT": "1.0",
+            "SCORE_CE_WEIGHT": "0.0",
+            "SCORE_KL_WEIGHT": "0.0",
         },
     },
+
+    # Sampled KD (score top-25%)
+    # Combined score with z-normalization (entropy + CE + KL).
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "SCORE_TOKEN_SELECTION": "1",
+            "SCORE_NORMALIZE": "z",
+            "SCORE_ENTROPY_WEIGHT": "1.0",
+            "SCORE_CE_WEIGHT": "1.0",
+            "SCORE_KL_WEIGHT": "1.0",
+        },
+    },
+
+    # Sampled KD (LinUCB)
+    {
+        "distill_type": "linucb",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 100,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "4000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "GLS_ENABLED": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 30,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 20,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 30,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #     },
+    # },
     # {
     #     "distill_type": "top-k-tok",
     #     "k_percent": 25,
     #     "env": {
     #         "NO_ELIMINATE_SOFTMAX": "1",
     #         "NO_OFFLINE": "1",
-    #         "DATASETS": "gsm8k",
-    #         "DATASET_CONFIG": "main",
-    #         "PROMPT_COL": "question",
-    #         "ANSWER_COL": "answer",
+    #         "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
     #     },
     # },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "pos-rs-kd",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "GLS_ENABLED": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "pos-rs-kd",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "SCORE_TOKEN_SELECTION": 1,
+    #         "SCORE_NORMALIZE": "z",
+    #         "SCORE_ENTROPY_WEIGHT": 1.0,
+    #         "SCORE_CE_WEIGHT": 1.0,
+    #         "SCORE_KL_WEIGHT": 1.0
+    #     },
+    # },
+    # # {
+    # #     "distill_type": "top-k-tok",
+    # #     "k_percent": 25,
+    # #     "env": {
+    # #         "NO_ELIMINATE_SOFTMAX": "1",
+    # #         "NO_OFFLINE": "1",
+    # #         "DATASETS": "gsm8k",
+    # #         "DATASET_CONFIG": "main",
+    # #         "PROMPT_COL": "question",
+    # #         "ANSWER_COL": "answer",
+    # #     },
+    # # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "pos-rs-kd",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "GLS_ENABLED": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "pos-rs-kd",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
 ]
 
 

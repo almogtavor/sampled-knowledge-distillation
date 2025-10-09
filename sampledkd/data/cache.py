@@ -70,16 +70,22 @@ def load_or_create_fineweb_cache(
     max_seq_len: int,
     seed: int = 1337,
     batch_size: int = 512,
+    filter_short_docs: bool = False,
+    filter_long_docs: bool = False,
+    packing_enabled: bool = True,
 ) -> List[Dict[str, str]]:
     """
     Load FineWeb-Edu subset from cache if available, otherwise create it.
     
     Args:
-        tokenizer: HuggingFace tokenizer
-        max_tokens: Token budget
-        max_seq_len: Maximum sequence length (filters longer docs)
+    tokenizer: HuggingFace tokenizer
+    max_tokens: Token budget
+    max_seq_len: Maximum sequence length used to report/document filtering stats
         seed: Random seed for shuffling
-        batch_size: Batch size for tokenization
+    batch_size: Batch size for tokenization
+    filter_short_docs: Drop documents shorter than max_seq_len when True
+    filter_long_docs: Drop documents longer than max_seq_len when True (default False)
+    packing_enabled: Whether downstream training packs sequences; used in cache key only
     
     Returns:
         List of {"prompt": str, "answer": str} dicts
@@ -94,7 +100,10 @@ def load_or_create_fineweb_cache(
         max_tokens=max_tokens,
         max_seq_len=max_seq_len,
         seed=seed,
-        split="train"
+        split="train",
+        filter_short_docs=filter_short_docs,
+        filter_long_docs=filter_long_docs,
+        packing_enabled=packing_enabled,
     )
     
     cache_dir = _get_cache_dir()
@@ -116,7 +125,15 @@ def load_or_create_fineweb_cache(
                 meta = json.load(f)
             
             print(f"[data-cache] Loaded {len(examples):,} docs, {meta['total_tokens']:,} tokens from cache")
-            print(f"[data-cache] Cache params: max_seq_len={meta['max_seq_len']}, seed={meta['seed']}")
+            print(
+                "[data-cache] Cache params: max_seq_len={}, seed={}, filter_short_docs={}, filter_long_docs={}, packing_enabled={}".format(
+                    meta.get("max_seq_len"),
+                    meta.get("seed"),
+                    meta.get("filter_short_docs", False),
+                    meta.get("filter_long_docs", False),
+                    meta.get("packing_enabled", True),
+                )
+            )
             return examples
         except Exception as e:
             print(f"[data-cache] Cache load failed ({e}), regenerating...")
@@ -150,6 +167,9 @@ def load_or_create_fineweb_cache(
                     "num_docs": len(examples),
                     "salvaged": True,
                     "cache_file": str(cache_file),
+                    "filter_short_docs": filter_short_docs,
+                    "filter_long_docs": filter_long_docs,
+                    "packing_enabled": packing_enabled,
                 }
                 with open(metadata_file, "w") as f:
                     json.dump(metadata, f, indent=2)
@@ -167,7 +187,16 @@ def load_or_create_fineweb_cache(
     
     # Cache miss - create from scratch with batched tokenization
     print(f"[data-cache] Creating FineWeb-Edu cache: {cache_file.name}")
-    print(f"[data-cache] Params: max_tokens={max_tokens:,}, max_seq_len={max_seq_len}, seed={seed}")
+    print(
+        "[data-cache] Params: max_tokens={:,}, max_seq_len={}, seed={}, filter_short_docs={}, filter_long_docs={}, packing_enabled={}".format(
+            max_tokens,
+            max_seq_len,
+            seed,
+            filter_short_docs,
+            filter_long_docs,
+            packing_enabled,
+        )
+    )
     
     # Load streaming dataset (num_proc not supported for streaming)
     ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
@@ -176,7 +205,10 @@ def load_or_create_fineweb_cache(
     total_tokens = 0
     examples = []
     docs_seen = 0
-    docs_filtered = 0
+    docs_filtered_long = 0
+    docs_long_total = 0
+    docs_filtered_short = 0
+    docs_short_total = 0
     batches_processed = 0
     budget_reached = False
     write_buffer = []  # Buffer for batched writes (faster disk I/O)
@@ -207,8 +239,16 @@ def load_or_create_fineweb_cache(
                 
                 # Filter by length
                 if n_tokens > max_seq_len:
-                    docs_filtered += 1
-                    continue
+                    docs_long_total += 1
+                    if filter_long_docs:
+                        docs_filtered_long += 1
+                        continue
+
+                if n_tokens < max_seq_len:
+                    docs_short_total += 1
+                    if filter_short_docs:
+                        docs_filtered_short += 1
+                        continue
                 
                 # Check token budget - stop AFTER we've reached the budget
                 if total_tokens >= max_tokens:
@@ -246,18 +286,64 @@ def load_or_create_fineweb_cache(
         "total_tokens": total_tokens,
         "num_docs": len(examples),
         "docs_seen": docs_seen,
-        "docs_filtered": docs_filtered,
-        "filter_rate": docs_filtered / docs_seen if docs_seen > 0 else 0.0,
+        "docs_filtered_long": docs_filtered_long,
+        "docs_long_total": docs_long_total,
+        "docs_filtered_short": docs_filtered_short,
+        "docs_short_total": docs_short_total,
+        "filter_short_docs": filter_short_docs,
+        "filter_long_docs": filter_long_docs,
+        "packing_enabled": packing_enabled,
+        "filter_rate_long": docs_filtered_long / docs_seen if (docs_seen > 0 and filter_long_docs) else 0.0,
+        "long_doc_rate": docs_long_total / docs_seen if docs_seen > 0 else 0.0,
+        "filter_rate_short": docs_filtered_short / docs_seen if (docs_seen > 0 and filter_short_docs) else 0.0,
+        "short_doc_rate": docs_short_total / docs_seen if docs_seen > 0 else 0.0,
         "cache_file": str(cache_file),
     }
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
     
     file_size_mb = cache_file.stat().st_size / 1024**2
-    filter_pct = (docs_filtered / docs_seen * 100) if docs_seen > 0 else 0.0
-    
     print(f"[data-cache] ✓ Cache created: {file_size_mb:.1f} MB")
-    print(f"[data-cache] Filtered {docs_filtered}/{docs_seen} docs ({filter_pct:.1f}%) exceeding {max_seq_len} tokens")
+    if docs_seen > 0:
+        long_rate_pct = docs_long_total / docs_seen * 100
+        short_rate_pct = docs_short_total / docs_seen * 100
+        if filter_long_docs:
+            filtered_long_pct = (docs_filtered_long / docs_seen * 100) if docs_seen else 0.0
+            print(
+                "[data-cache] Filtered long: {}/{} ({:.1f}%)".format(
+                    docs_filtered_long,
+                    docs_seen,
+                    filtered_long_pct,
+                )
+            )
+        else:
+            print(
+                "[data-cache] Long docs encountered: {}/{} ({:.1f}%) — kept (filter_long_docs=False)".format(
+                    docs_long_total,
+                    docs_seen,
+                    long_rate_pct,
+                )
+            )
+
+        if filter_short_docs:
+            filtered_short_pct = (docs_filtered_short / docs_seen * 100) if docs_seen else 0.0
+            print(
+                "[data-cache] Filtered short: {}/{} ({:.1f}%)".format(
+                    docs_filtered_short,
+                    docs_seen,
+                    filtered_short_pct,
+                )
+            )
+        else:
+            print(
+                "[data-cache] Short docs encountered: {}/{} ({:.1f}%) — kept (filter_short_docs=False)".format(
+                    docs_short_total,
+                    docs_seen,
+                    short_rate_pct,
+                )
+            )
+    else:
+        print("[data-cache] Dataset stream was empty; no filtering stats available")
     
     # Return without 'tokens' field (just prompt/answer)
     return [{"prompt": ex["prompt"], "answer": ex["answer"]} for ex in examples]

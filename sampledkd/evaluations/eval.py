@@ -422,6 +422,11 @@ def run_lmeval_suite(
     results_dir: Path,
     gpu_ids: List[int],
     suite: str,
+    batch_size: str = "auto",
+    generate_batch_size: str = "1",
+    max_batch_size: int = 0,
+    generate_max_batch_size: int = 4,
+    fallback_batch_size: int = 1,
 ) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
     """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
@@ -481,6 +486,27 @@ def run_lmeval_suite(
     # Per-sample logging (needed for ECE)
     _has_log_samples = _help_code == 0 and ("--log_samples" in _help_out)
 
+    def _detect_flag(help_blob: str, *candidates: str) -> Optional[str]:
+        if help_blob is None:
+            return None
+        for cand in candidates:
+            if cand in help_blob:
+                return cand
+        return None
+
+    _max_batch_flag = _detect_flag(_help_out, "--max_batch_size", "--max-batch-size")
+    _generate_max_batch_flag = _detect_flag(
+        _help_out,
+        "--generate_max_batch_size",
+        "--generate-max-batch-size",
+    )
+
+    default_batch_size = str(batch_size)
+    default_generate_batch_size = str(generate_batch_size)
+    effective_max_batch_size = max(0, int(max_batch_size))
+    effective_generate_max_batch_size = max(0, int(generate_max_batch_size))
+    effective_fallback_batch_size = max(0, int(fallback_batch_size))
+
     base_args = [
         "lm-eval",
         "--model", "hf",
@@ -499,16 +525,39 @@ def run_lmeval_suite(
         base_args += ["--fewshot-seed", str(seed)]
 
     _warned_no_random_limit = False
+    _warned_no_max_batch_flag = False
+    _warned_no_generate_max_batch_flag = False
 
-    def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
-        nonlocal _warned_no_random_limit
+    def _task_cmd(
+        task: str,
+        limit: Optional[int],
+        device: str,
+        override_batch: Optional[str] = None,
+    ) -> Tuple[List[str], str, bool]:
+        nonlocal _warned_no_random_limit, _warned_no_max_batch_flag, _warned_no_generate_max_batch_flag
         cmd = base_args + ["--tasks", task, "--device", device]
-        # Some generate_until tasks stall when probing batch_size=auto; force bs=1
         GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
-        if task in GENERATE_BS1:
-            cmd += ["--batch_size", "1"]
-        else:
-            cmd += ["--batch_size", "auto"]
+        is_generate = task in GENERATE_BS1
+        batch_value = str(override_batch) if override_batch is not None else (
+            default_generate_batch_size if is_generate else default_batch_size
+        )
+        cmd += ["--batch_size", batch_value]
+        target_max = effective_generate_max_batch_size if is_generate else effective_max_batch_size
+        if target_max > 0:
+            flag = None
+            if is_generate and _generate_max_batch_flag:
+                flag = _generate_max_batch_flag
+            elif _max_batch_flag:
+                flag = _max_batch_flag
+            if flag:
+                cmd += [flag, str(target_max)]
+            else:
+                if is_generate and not _warned_no_generate_max_batch_flag:
+                    print("[lm-eval] Warning: CLI lacks a generate max batch size flag; skipping cap.")
+                    _warned_no_generate_max_batch_flag = True
+                elif not is_generate and not _warned_no_max_batch_flag:
+                    print("[lm-eval] Warning: CLI lacks a max batch size flag; skipping cap.")
+                    _warned_no_max_batch_flag = True
         if isinstance(limit, (int, float)):
             cmd += ["--limit", str(limit)]
             # Prefer randomized subset selection when supported by this lm-eval version
@@ -520,7 +569,7 @@ def run_lmeval_suite(
                 if not _warned_no_random_limit:
                     print("[lm-eval] Warning: CLI lacks a random subset flag; using first-N for --limit.")
                     _warned_no_random_limit = True
-        return cmd
+        return cmd, batch_value, is_generate
 
     # Parallel across physical GPUs (mask each process to one GPU)
     task_status: Dict[str, str] = {}
@@ -544,17 +593,40 @@ def run_lmeval_suite(
             env.setdefault("PYTHONHASHSEED", str(seed))
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             env.setdefault("EVAL_SEED", str(seed))
-            cmd = _task_cmd(task, limit, "cuda:0")
+            device = "cuda:0"
+            cmd, bs_used, _ = _task_cmd(task, limit, device)
             start = time.time()
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
-            procs.append((task, p, timeout, start))
-        for task, p, to, start in procs:
+            procs.append((task, p, timeout, start, env, limit, device, bs_used))
+        for task, p, to, start, env, limit, device, bs_used in procs:
             rc, out = wait_with_timeout(p, timeout=to)
             duration = max(0.0, time.time() - start)
+            fallback_used = False
+            if (
+                rc not in (0, 124)
+                and effective_fallback_batch_size > 0
+                and "auto" in str(bs_used).lower()
+            ):
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Retrying {task} with fallback batch size {effective_fallback_batch_size} after failure at batch_size={bs_used}"
+                )
+                fallback_cmd, fb_batch, _ = _task_cmd(
+                    task,
+                    limit,
+                    device,
+                    override_batch=str(effective_fallback_batch_size),
+                )
+                fb_start = time.time()
+                p_fb = run_async(fallback_cmd, env=env)
+                rc, out = wait_with_timeout(p_fb, timeout=to)
+                duration += max(0.0, time.time() - fb_start)
+                bs_used = fb_batch
+                fallback_used = True
             timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
-                print(f"[{timestamp}] ✅ Task {task} completed successfully in {duration:.1f}s")
+                status_suffix = " (fallback)" if fallback_used else ""
+                print(f"[{timestamp}] ✅ Task {task} completed successfully in {duration:.1f}s{status_suffix}")
                 task_status[task] = "ok"
                 good_any = True
             elif rc == 124:
@@ -1120,6 +1192,37 @@ def main():
                         help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
     # Source override: treat positional model arg as HF hub ID
     parser.add_argument("--from_hf", action="store_true", help="Interpret 'model' as a HF hub ID even if it is not a local path.")
+    # LM-Eval batching controls
+    parser.add_argument(
+        "--lm_eval_batch_size",
+        type=str,
+        default="auto",
+        help="Default batch size passed to lm-eval (--batch_size). Use 'auto' to probe GPU capacity.",
+    )
+    parser.add_argument(
+        "--lm_eval_generate_batch_size",
+        type=str,
+        default="1",
+        help="Batch size for long-form generation tasks (gsm8k, svamp, aime25).",
+    )
+    parser.add_argument(
+        "--lm_eval_max_batch_size",
+        type=int,
+        default=0,
+        help="Cap auto-detected batch sizes when lm-eval supports --max_batch_size (0 disables the cap).",
+    )
+    parser.add_argument(
+        "--lm_eval_generate_max_batch_size",
+        type=int,
+        default=4,
+        help="Cap auto-detected batch sizes on generation tasks when supported (0 disables the cap).",
+    )
+    parser.add_argument(
+        "--lm_eval_fallback_batch_size",
+        type=int,
+        default=1,
+        help="Fallback batch size to retry with if an auto batch run fails or times out.",
+    )
     # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
     
@@ -1222,6 +1325,11 @@ def main():
             results_dir=results_dir,
             gpu_ids=gpu_pool,
             suite=args.suite,
+            batch_size=args.lm_eval_batch_size,
+            generate_batch_size=args.lm_eval_generate_batch_size,
+            max_batch_size=args.lm_eval_max_batch_size,
+            generate_max_batch_size=args.lm_eval_generate_max_batch_size,
+            fallback_batch_size=args.lm_eval_fallback_batch_size,
         )
         lmeval_wall = time.time() - lmeval_start
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
