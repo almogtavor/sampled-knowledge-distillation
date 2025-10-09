@@ -1,19 +1,54 @@
+import gc
 import os
 import json
 import hashlib
 import time
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+
 from .entropy_utils import truncated_entropy_topk_tail_midpoint
+from .distributed import (
+    create_distributed_sampler,
+    distributed_barrier,
+    distributed_broadcast_object_list,
+    is_rank0,
+)
 
 # ---- Gumbel-based RS-KD packing (fixed-U entries per position) ----
 ID_BITS = 17
 PROB_BITS = 7
 PROB_QMAX = (1 << PROB_BITS) - 1  # 127
 S_SAMPLES_DEFAULT = 50  # draws per position
+
+
+@dataclass
+class CachePlan:
+    signature: Dict[str, Any]
+    cache: Optional["TeacherOfflineCache"]
+    cache_ready: bool
+    cache_manifest_items: int
+    expected_items: int
+    cache_dir: Optional[str]
+    parallel_cache_build: bool
+    teacher_required: bool
+    teacher_rank0_only: bool
+
+
+@dataclass
+class CacheBuildResult:
+    cache_ready: bool
+    cache_manifest_items: int
+    teacher_required: bool
+    teacher_rank0_only: bool
+    teacher_inputs_device: torch.device
+    teacher: Optional[torch.nn.Module]
+    cache: Optional["TeacherOfflineCache"]
 
 
 def gumbel_like(x: torch.Tensor) -> torch.Tensor:
@@ -586,6 +621,307 @@ def _recompute_and_persist_stats(
     cache.save_manifest()
 
     return stats, total_items
+
+
+def plan_offline_cache(
+    config,
+    tok,
+    dataset_size: int,
+    *,
+    is_main_rank: bool,
+    teacherless_modes: set[str],
+) -> CachePlan:
+    expected_items = int(dataset_size)
+    eliminate_softmax = bool(getattr(config, "eliminate_softmax", False))
+    distill_type = getattr(config, "distill_type", "vanilla")
+
+    if not getattr(config, "offline_cache", False):
+        teacher_required = eliminate_softmax or distill_type not in teacherless_modes
+        return CachePlan(
+            signature={},
+            cache=None,
+            cache_ready=False,
+            cache_manifest_items=0,
+            expected_items=expected_items,
+            cache_dir=None,
+            parallel_cache_build=False,
+            teacher_required=teacher_required,
+            teacher_rank0_only=False,
+        )
+
+    signature = {
+        "teacher_name": config.teacher_model,
+        "tokenizer_name": getattr(tok, "name_or_path", "unknown"),
+        "max_seq_len": int(getattr(config, "max_seq_len", 0)),
+        "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
+        "kd_temperature": float(getattr(config, "kd_temperature", 1.0)),
+        "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
+        "rs_samples": int(getattr(config, "rs_samples", S_SAMPLES_DEFAULT)),
+        "id_bits": int(ID_BITS),
+        "prob_bits": int(PROB_BITS),
+        "dataset_len": expected_items,
+        "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
+        "packing_enabled": bool(getattr(config, "enable_packing", True)),
+    }
+
+    cache = init_offline_cache_for_trainer(
+        getattr(config, "offline_cache_dir", None),
+        signature,
+    )
+    cache_manifest_items = len(cache.manifest.get("items", {}))
+    manifest_matches = cache.signature_matches(signature)
+    cache_ready = manifest_matches and (expected_items < 0 or cache_manifest_items >= expected_items)
+
+    if manifest_matches:
+        if cache_ready:
+            if is_main_rank:
+                print("[logits-cache] Matching cache found; skipping teacher load and reusing cached logits.")
+        elif expected_items >= 0 and is_main_rank:
+            print(
+                f"[logits-cache] Cache signature matches but items are incomplete "
+                f"({cache_manifest_items}/{expected_items}). Teacher will be loaded to refresh missing entries."
+            )
+    elif is_main_rank:
+        print(
+            f"[logits-cache] No cache found or signature changed - building teacher cache (one pass over dataset) at {cache.cache_dir}..."
+        )
+
+    parallel_cache_build = (
+        getattr(config, "offline_cache", False)
+        and not cache_ready
+        and bool(getattr(config, "ddp_offline", False))
+        and getattr(config, "ddp_world_size", 1) > 1
+    )
+
+    teacher_required = (
+        (not cache_ready)
+        or (not bool(getattr(config, "offline_cache", False)))
+        or eliminate_softmax
+        or distill_type not in teacherless_modes
+    )
+    teacher_rank0_only = bool(
+        teacher_required and bool(getattr(config, "ddp_offline", False)) and getattr(config, "ddp_world_size", 1) > 1
+    )
+    if parallel_cache_build:
+        teacher_rank0_only = False
+
+    setattr(config, "_expected_cache_signature", signature)
+    setattr(config, "_expected_dataset_items", expected_items)
+    setattr(config, "_probe_cache_items", int(cache_manifest_items))
+    setattr(config, "_resolved_cache_dir", str(cache.cache_dir))
+    setattr(config, "_cache_is_ready", bool(cache_ready))
+
+    return CachePlan(
+        signature=signature,
+        cache=cache,
+        cache_ready=bool(cache_ready),
+        cache_manifest_items=int(cache_manifest_items),
+        expected_items=expected_items,
+        cache_dir=str(cache.cache_dir),
+        parallel_cache_build=parallel_cache_build,
+        teacher_required=teacher_required,
+        teacher_rank0_only=teacher_rank0_only,
+    )
+
+
+def _release_teacher(teacher, teacher_device: torch.device):
+    if teacher is None:
+        return None, teacher_device
+    try:
+        del teacher
+    finally:
+        if torch.cuda.is_available() and teacher_device.type == "cuda":
+            torch.cuda.set_device(teacher_device)
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "reset_max_memory_allocated"):
+                torch.cuda.reset_max_memory_allocated()  # type: ignore[attr-defined]
+            if hasattr(torch.cuda, "reset_max_memory_cached"):
+                torch.cuda.reset_max_memory_cached()  # type: ignore[attr-defined]
+        gc.collect()
+    return None, torch.device("cpu")
+
+
+def execute_cache_plan(
+    plan: CachePlan,
+    *,
+    config,
+    tok,
+    packed_dataset,
+    collate_fn,
+    teacher,
+    teacher_inputs_device: torch.device,
+    seed_offset: int,
+    sanitize_logits_fn,
+    is_main_rank: bool,
+    teacherless_modes: set[str],
+) -> CacheBuildResult:
+    cache = plan.cache
+    cache_ready = plan.cache_ready
+    cache_manifest_items = plan.cache_manifest_items
+    expected_items = plan.expected_items
+    teacher_required = plan.teacher_required
+    teacher_rank0_only = plan.teacher_rank0_only
+
+    if not getattr(config, "offline_cache", False) or cache is None:
+        setattr(config, "_cache_is_ready", bool(cache_ready))
+        return CacheBuildResult(
+            cache_ready=bool(cache_ready),
+            cache_manifest_items=int(cache_manifest_items),
+            teacher_required=teacher_required,
+            teacher_rank0_only=teacher_rank0_only,
+            teacher_inputs_device=teacher_inputs_device,
+            teacher=teacher,
+            cache=cache,
+        )
+
+    if cache_ready:
+        setattr(config, "_cache_is_ready", True)
+        setattr(config, "_probe_cache_items", int(cache_manifest_items))
+        return CacheBuildResult(
+            cache_ready=True,
+            cache_manifest_items=int(cache_manifest_items),
+            teacher_required=teacher_required,
+            teacher_rank0_only=teacher_rank0_only,
+            teacher_inputs_device=teacher_inputs_device,
+            teacher=teacher,
+            cache=cache,
+        )
+
+    if plan.parallel_cache_build:
+        print(
+            f"[logits-cache][rank {getattr(config, 'ddp_rank', 0)}] Parallel cache build in progress...",
+            flush=True,
+        )
+    elif is_rank0():
+        print("[logits-cache] Building offline cache before loading students...", flush=True)
+
+    builder_sampler = create_distributed_sampler(
+        packed_dataset,
+        config=config,
+        seed=seed_offset,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    builder_dl = DataLoader(
+        packed_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        sampler=builder_sampler,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+    )
+
+    cache = build_offline_cache_if_needed(
+        cache=cache,
+        teacher=teacher,
+        tok=tok,
+        dataloader=builder_dl,
+        config=config,
+        teacher_device=teacher_inputs_device,
+        sanitize_logits_fn=sanitize_logits_fn,
+        force_refresh=plan.parallel_cache_build,
+    )
+
+    cache_manifest_items = len(cache.manifest.get("items", {}))
+    cache_ready = expected_items < 0 or cache_manifest_items >= expected_items
+
+    if getattr(config, "ddp_offline", False) and dist.is_available() and dist.is_initialized():
+        distributed_barrier()
+        if is_rank0():
+            probe_cache = init_offline_cache_for_trainer(
+                getattr(config, "offline_cache_dir", None),
+                plan.signature,
+            )
+            cache_manifest_items = len(probe_cache.manifest.get("items", {}))
+            cache_ready_flag = expected_items < 0 or cache_manifest_items >= expected_items
+        else:
+            cache_ready_flag = None
+            cache_manifest_items = 0
+
+        sync_obj = [cache_ready_flag, cache_manifest_items]
+        sync_obj = distributed_broadcast_object_list(sync_obj, src=0)
+        cache_ready = bool(sync_obj[0])
+        cache_manifest_items = int(sync_obj[1])
+
+        if not cache_ready and plan.parallel_cache_build:
+            if is_rank0():
+                print(
+                    "[logits-cache][rank 0] Parallel build incomplete; falling back to rank-0 rebuild...",
+                    flush=True,
+                )
+                fallback_cache = init_offline_cache_for_trainer(
+                    getattr(config, "offline_cache_dir", None),
+                    plan.signature,
+                )
+                fallback_dl = DataLoader(
+                    packed_dataset,
+                    batch_size=config.batch_size,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    num_workers=0,
+                    pin_memory=False,
+                    persistent_workers=False,
+                )
+                fallback_cache = build_offline_cache_if_needed(
+                    cache=fallback_cache,
+                    teacher=teacher,
+                    tok=tok,
+                    dataloader=fallback_dl,
+                    config=config,
+                    teacher_device=teacher_inputs_device,
+                    sanitize_logits_fn=sanitize_logits_fn,
+                    force_refresh=True,
+                )
+                cache_manifest_items = len(fallback_cache.manifest.get("items", {}))
+                cache_ready = expected_items < 0 or cache_manifest_items >= expected_items
+                cache = fallback_cache
+            distributed_barrier()
+            if is_rank0():
+                sync_obj = [cache_ready, cache_manifest_items]
+            else:
+                sync_obj = [None, 0]
+            sync_obj = distributed_broadcast_object_list(sync_obj, src=0)
+            cache_ready = bool(sync_obj[0])
+            cache_manifest_items = int(sync_obj[1])
+
+            if not cache_ready:
+                raise RuntimeError(
+                    "[logits-cache] Offline cache incomplete after cache build; check write permissions or disk space."
+                )
+
+    setattr(config, "_resolved_cache_dir", plan.cache_dir or getattr(config, "_resolved_cache_dir", ""))
+    setattr(config, "_probe_cache_items", int(cache_manifest_items))
+    setattr(config, "_cache_is_ready", bool(cache_ready))
+
+    eliminate_softmax = bool(getattr(config, "eliminate_softmax", False))
+    distill_type = getattr(config, "distill_type", "vanilla")
+    teacher_required = (
+        (not cache_ready)
+        or (not bool(getattr(config, "offline_cache", False)))
+        or eliminate_softmax
+        or distill_type not in teacherless_modes
+    )
+    teacher_rank0_only = bool(
+        teacher_required and bool(getattr(config, "ddp_offline", False)) and getattr(config, "ddp_world_size", 1) > 1
+    )
+
+    updated_teacher = teacher
+    updated_device = teacher_inputs_device
+    if cache_ready and not teacher_required and teacher is not None:
+        updated_teacher, updated_device = _release_teacher(teacher, teacher_inputs_device)
+
+    return CacheBuildResult(
+        cache_ready=bool(cache_ready),
+        cache_manifest_items=int(cache_manifest_items),
+        teacher_required=teacher_required,
+        teacher_rank0_only=teacher_rank0_only,
+        teacher_inputs_device=updated_device,
+        teacher=updated_teacher,
+        cache=cache,
+    )
 
 
 def build_offline_cache_if_needed(

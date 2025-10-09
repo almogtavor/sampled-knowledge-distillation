@@ -1,5 +1,4 @@
 import argparse
-import gc
 import os
 import random
 import sys
@@ -9,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.distributed as dist
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
@@ -27,12 +25,17 @@ from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
 from sampledkd.distill._mixins.amp_oom import AmpOomMixin
 from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
+from sampledkd.training.distributed import (
+    create_distributed_sampler,
+    distributed_barrier,
+    distributed_broadcast_object_list,
+    destroy_distributed,
+    is_rank0,
+    setup_distributed_context,
+)
 from sampledkd.training.offline_cache import (
-    init_offline_cache_for_trainer,
-    build_offline_cache_if_needed,
-    ID_BITS,
-    PROB_BITS,
-    S_SAMPLES_DEFAULT,
+    execute_cache_plan,
+    plan_offline_cache,
 )
 
 # Import logging utils with fallback
@@ -41,20 +44,6 @@ try:
 except ImportError:
     def create_training_combined_logger(*args, **kwargs):
         return None
-
-
-def is_rank0() -> bool:
-    """Utility to identify the process that should own rank-0 responsibilities."""
-    try:
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank() == 0
-    except RuntimeError:
-        # Fallback to environment inspection if the process group isn't ready yet.
-        pass
-    rank = int(os.environ.get("RANK", "0") or 0)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0") or 0)
-    return rank == 0 or local_rank == 0
-
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
     parser = argparse.ArgumentParser(description="Entropy-guided KD for LLMs")
@@ -222,34 +211,11 @@ def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
 
-    ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    distributed_env = ddp_world_size > 1
-    ddp_rank = int(os.environ.get("RANK", "0")) if distributed_env else 0
-    ddp_local_rank = int(os.environ.get("LOCAL_RANK", "0")) if distributed_env else 0
-
-    if distributed_env and not config.ddp_offline:
-        config.ddp_offline = True
-
-    if config.ddp_offline and not distributed_env:
-        raise RuntimeError(
-            "--ddp_offline requires launching with torchrun (e.g., torchrun --standalone --nproc_per_node=2)."
-        )
-
-    if config.ddp_offline:
-        torch.cuda.set_device(ddp_local_rank)
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-    else:
-        ddp_world_size = 1
-        ddp_rank = 0
-        ddp_local_rank = 0
-
-    is_main_rank = ddp_rank == 0
-
-    # Persist distributed context back into config for downstream components
-    config.ddp_world_size = ddp_world_size
-    config.ddp_rank = ddp_rank
-    config.ddp_local_rank = ddp_local_rank
+    ddp_ctx = setup_distributed_context(config)
+    ddp_world_size = ddp_ctx.world_size
+    ddp_rank = ddp_ctx.rank
+    ddp_local_rank = ddp_ctx.local_rank
+    is_main_rank = ddp_ctx.is_main_rank
     
     # Print all CLI parameters at startup
     if is_main_rank:
@@ -475,16 +441,13 @@ def main():
         np.random.seed(base + worker_id)
         random.seed(base + worker_id)
 
-    sampler = None
-    if config.ddp_offline:
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=config.ddp_world_size,
-            rank=config.ddp_rank,
-            shuffle=True,
-            seed=seed_offset,
-            drop_last=False,
-        )
+    sampler = create_distributed_sampler(
+        dataset,
+        config=config,
+        seed=seed_offset,
+        shuffle=True,
+        drop_last=False,
+    )
 
     dl = torch.utils.data.DataLoader(
         dataset,
@@ -501,67 +464,17 @@ def main():
 
     dataset_size = len(dataset)
 
-    cache_signature = None
-    cache_ready = False
-    cache_manifest_items = None
-    if getattr(config, "offline_cache", False):
-        cache_signature = {
-            "teacher_name": config.teacher_model,
-            "tokenizer_name": getattr(tok, "name_or_path", "unknown"),
-            "max_seq_len": int(getattr(config, "max_seq_len", 0)),
-            "entropy_approx_m": int(getattr(config, "entropy_approx_m", 12)),
-            "kd_temperature": float(getattr(config, "kd_temperature", 1.0)),
-            "rs_vocab_samples": int(getattr(config, "rs_vocab_samples", 12)),
-            "rs_samples": int(getattr(config, "rs_samples", S_SAMPLES_DEFAULT)),
-            "id_bits": int(ID_BITS),
-            "prob_bits": int(PROB_BITS),
-            "dataset_len": int(dataset_size),
-            "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
-            "packing_enabled": bool(getattr(config, "enable_packing", True)),
-        }
-        setattr(config, "_expected_cache_signature", cache_signature)
-        cache_probe = init_offline_cache_for_trainer(
-            getattr(config, "offline_cache_dir", None),
-            cache_signature,
-        )
-        cache_manifest_items = len(cache_probe.manifest.get("items", {}))
-        setattr(config, "_expected_dataset_items", int(dataset_size))
-        setattr(config, "_probe_cache_items", int(cache_manifest_items))
-        setattr(config, "_resolved_cache_dir", str(cache_probe.cache_dir))
-        manifest_matches = cache_probe.signature_matches(cache_signature)
-        if manifest_matches and (dataset_size < 0 or cache_manifest_items >= dataset_size):
-            cache_ready = True
-            if is_main_rank:
-                print("[logits-cache] Matching cache found; skipping teacher load and reusing cached logits.")
-        elif manifest_matches and dataset_size >= 0 and cache_manifest_items < dataset_size:
-            if is_main_rank:
-                print(
-                    f"[logits-cache] Cache signature matches but items are incomplete "
-                    f"({cache_manifest_items}/{dataset_size}). Teacher will be loaded to refresh missing entries."
-                )
-
-    setattr(config, "_cache_is_ready", cache_ready)
-
     teacherless_modes = {"vanilla", "top-k-tok", "bucket", "random", "linucb"}
-    teacher_required = (
-        (not cache_ready)
-        or (not bool(getattr(config, "offline_cache", False)))
-        or bool(getattr(config, "eliminate_softmax", False))
-        or getattr(config, "distill_type", "vanilla") not in teacherless_modes
+    cache_plan = plan_offline_cache(
+        config,
+        tok,
+        dataset_size,
+        is_main_rank=is_main_rank,
+        teacherless_modes=teacherless_modes,
     )
-
-    teacher_rank0_only = bool(
-        teacher_required and bool(getattr(config, "ddp_offline", False)) and config.ddp_world_size > 1
-    )
-
-    parallel_cache_build = (
-        getattr(config, "offline_cache", False)
-        and not cache_ready
-        and bool(getattr(config, "ddp_offline", False))
-        and config.ddp_world_size > 1
-    )
-    if parallel_cache_build:
-        teacher_rank0_only = False
+    cache_ready = cache_plan.cache_ready
+    teacher_required = cache_plan.teacher_required
+    teacher_rank0_only = cache_plan.teacher_rank0_only
 
     teacher = None
     teacher_inputs_device = torch.device("cpu")
@@ -579,162 +492,35 @@ def main():
             print("Teacher will be hosted on rank 0; skipping local load on this rank.")
 
     # Optionally pre-build offline cache before loading students to free teacher VRAM
-    prebuilt_cache = None
-    if getattr(config, "offline_cache", False) and not cache_ready:
-        if parallel_cache_build:
-            print(
-                f"[logits-cache][rank {ddp_rank}] Parallel cache build in progress...",
-                flush=True,
-            )
-        elif is_rank0():
-            print("[logits-cache] Building offline cache before loading students...", flush=True)
+    cache_result = execute_cache_plan(
+        cache_plan,
+        config=config,
+        tok=tok,
+        packed_dataset=packed_dataset,
+        collate_fn=collate,
+        teacher=teacher,
+        teacher_inputs_device=teacher_inputs_device,
+        seed_offset=seed_offset,
+        sanitize_logits_fn=AmpOomMixin._sanitize_logits,
+        is_main_rank=is_main_rank,
+        teacherless_modes=teacherless_modes,
+    )
 
-        prebuilt_cache = init_offline_cache_for_trainer(
-            getattr(config, "offline_cache_dir", None),
-            cache_signature,
-        )
-
-        builder_sampler = None
-        if config.ddp_offline:
-            builder_sampler = torch.utils.data.distributed.DistributedSampler(
-                packed_dataset,
-                num_replicas=config.ddp_world_size,
-                rank=config.ddp_rank,
-                shuffle=False,
-                seed=seed_offset,
-                drop_last=False,
-            )
-
-        builder_dl = torch.utils.data.DataLoader(
-            packed_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            sampler=builder_sampler,
-            collate_fn=collate,
-            num_workers=0,
-            pin_memory=False,
-            persistent_workers=False,
-        )
-
-        prebuilt_cache = build_offline_cache_if_needed(
-            cache=prebuilt_cache,
-            teacher=teacher,
-            tok=tok,
-            dataloader=builder_dl,
-            config=config,
-            teacher_device=teacher_inputs_device,
-            sanitize_logits_fn=AmpOomMixin._sanitize_logits,
-            force_refresh=parallel_cache_build,
-        )
-
-        cache_manifest_items = len(prebuilt_cache.manifest.get("items", {}))
-        cache_ready = cache_manifest_items >= dataset_size
-
-        if config.ddp_offline and dist.is_available() and dist.is_initialized():
-            dist.barrier()
-
-            if is_rank0():
-                probe_cache = init_offline_cache_for_trainer(
-                    getattr(config, "offline_cache_dir", None),
-                    cache_signature,
-                )
-                cache_manifest_items = len(probe_cache.manifest.get("items", {}))
-                cache_ready_flag = cache_manifest_items >= dataset_size
-            else:
-                cache_ready_flag = None
-                cache_manifest_items = 0
-
-            sync_obj = [cache_ready_flag, cache_manifest_items]
-            dist.broadcast_object_list(sync_obj, src=0)
-            cache_ready = bool(sync_obj[0])
-            cache_manifest_items = int(sync_obj[1])
-
-            if not cache_ready and parallel_cache_build:
-                if is_rank0():
-                    print(
-                        "[logits-cache][rank 0] Parallel build incomplete; falling back to rank-0 rebuild...",
-                        flush=True,
-                    )
-                    fallback_cache = init_offline_cache_for_trainer(
-                        getattr(config, "offline_cache_dir", None),
-                        cache_signature,
-                    )
-                    fallback_dl = torch.utils.data.DataLoader(
-                        packed_dataset,
-                        batch_size=config.batch_size,
-                        shuffle=False,
-                        collate_fn=collate,
-                        num_workers=0,
-                        pin_memory=False,
-                        persistent_workers=False,
-                    )
-                    fallback_cache = build_offline_cache_if_needed(
-                        cache=fallback_cache,
-                        teacher=teacher,
-                        tok=tok,
-                        dataloader=fallback_dl,
-                        config=config,
-                        teacher_device=teacher_inputs_device,
-                        sanitize_logits_fn=AmpOomMixin._sanitize_logits,
-                        force_refresh=True,
-                    )
-                    cache_manifest_items = len(fallback_cache.manifest.get("items", {}))
-                    cache_ready = cache_manifest_items >= dataset_size
-                    prebuilt_cache = fallback_cache
-                dist.barrier()
-                if is_rank0():
-                    sync_obj = [cache_ready, cache_manifest_items]
-                else:
-                    sync_obj = [None, 0]
-                dist.broadcast_object_list(sync_obj, src=0)
-                cache_ready = bool(sync_obj[0])
-                cache_manifest_items = int(sync_obj[1])
-
-            if not cache_ready:
-                raise RuntimeError(
-                    "[logits-cache] Offline cache incomplete after cache build; check write permissions or disk space."
-                )
-
-        if prebuilt_cache is not None:
-            setattr(config, "_resolved_cache_dir", str(prebuilt_cache.cache_dir))
-        setattr(config, "_probe_cache_items", int(cache_manifest_items))
-        setattr(config, "_cache_is_ready", bool(cache_ready))
-
-        teacher_required = (
-            (not cache_ready)
-            or (not bool(getattr(config, "offline_cache", False)))
-            or bool(getattr(config, "eliminate_softmax", False))
-            or getattr(config, "distill_type", "vanilla") not in teacherless_modes
-        )
-
-        teacher_rank0_only = bool(
-            teacher_required and bool(getattr(config, "ddp_offline", False)) and config.ddp_world_size > 1
-        )
-
-        if cache_ready and not teacher_required and teacher is not None:
-            try:
-                del teacher
-            finally:
-                if torch.cuda.is_available() and teacher_inputs_device.type == "cuda":
-                    torch.cuda.set_device(teacher_inputs_device)
-                    torch.cuda.empty_cache()
-                    if hasattr(torch.cuda, "reset_max_memory_allocated"):
-                        torch.cuda.reset_max_memory_allocated()
-                    if hasattr(torch.cuda, "reset_max_memory_cached"):
-                        torch.cuda.reset_max_memory_cached()
-                gc.collect()
-            teacher = None
-            teacher_inputs_device = torch.device("cpu")
+    teacher = cache_result.teacher
+    teacher_inputs_device = cache_result.teacher_inputs_device
+    cache_ready = cache_result.cache_ready
+    teacher_required = cache_result.teacher_required
+    teacher_rank0_only = cache_result.teacher_rank0_only
 
 
     teacher_device_str = str(teacher_inputs_device)
 
-    if config.ddp_offline and dist.is_available() and dist.is_initialized():
+    if getattr(config, "ddp_offline", False):
         obj = [teacher_device_str] if is_rank0() else [None]
-        dist.broadcast_object_list(obj, src=0)
+        obj = distributed_broadcast_object_list(obj, src=0)
         teacher_device_str = obj[0] or "cpu"
         teacher_inputs_device = torch.device(teacher_device_str)
-        dist.barrier()
+        distributed_barrier()
     else:
         teacher_inputs_device = torch.device(teacher_device_str)
 
@@ -794,8 +580,8 @@ def main():
 
     distiller.train(epochs=config.epochs)
 
-    if config.ddp_offline:
-        dist.barrier()
+    if getattr(config, "ddp_offline", False):
+        distributed_barrier()
 
     if is_main_rank:
         if combined_logger:
@@ -817,9 +603,9 @@ def main():
         except Exception as e:
             print(f"[registry] Failed to mark trained: {e}")
 
-    if config.ddp_offline and dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+    if getattr(config, "ddp_offline", False):
+        distributed_barrier()
+        destroy_distributed()
 
 
 if __name__ == "__main__":
