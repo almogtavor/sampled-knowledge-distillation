@@ -1056,102 +1056,103 @@ class Distiller(
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens among valid positions; optionally global threshold via GLS
             # Select positions FIRST, then compute KL only on selected rows (efficient)
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-
-            # Build ranking statistic with two-stage selection when scoring enabled
+            normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
-            
-            if score_enabled:
-                # === Two-stage selection for efficiency ===
-                # Stage 1: Prefilter by entropy (cheap, no softmax needed)
-                prefilter_mult = float(getattr(self.config, "score_prefilter_multiplier", 3.0))
-                # Stage 2: Compute KL/CE only on prefiltered subset
-                
-                stat = torch.full_like(ent_raw, float('-inf'))
-                for i in range(valid_next.size(0)):
-                    mask_i = valid_next[i]
-                    n_valid = int(mask_i.sum().item())
-                    if n_valid < 3:
-                        continue
-                    
-                    # Stage 1: Select top (k * prefilter_mult) by entropy
-                    k_final = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                    k_pre = min(n_valid, max(k_final, int(k_final * prefilter_mult)))
-                    
-                    valid_idx = torch.where(mask_i)[0]
-                    ent_valid = ent_raw[i][mask_i]
-                    _, pre_rel_idx = torch.topk(ent_valid, k=k_pre, largest=True, sorted=False)
-                    prefilter_idx = valid_idx[pre_rel_idx]  # [k_pre] absolute indices
-                    
-                    # Stage 2: Compute KL/CE only on prefiltered positions (efficient!)
-                    # Create mask for prefiltered positions
-                    prefilter_mask = torch.zeros_like(mask_i, dtype=torch.bool)
-                    prefilter_mask[prefilter_idx] = True
-                    
-                    # Gather only prefiltered rows for KL computation
-                    # Ensure indices are on the same device as teacher log-probs
-                    pre_idx_t = prefilter_idx.to(t_log_probs.device)
-                    t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_pre, V]
-                    s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
-                    kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
-                    
-                    # Build full-size KL tensor with -inf for non-prefiltered
-                    kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
-                    kl_pos_partial[prefilter_idx] = kl_pre
-                    
-                    # Prepare score context with partial KL
-                    score_ctx_i = self._prepare_score_context(
-                        ent_raw[i:i+1],
-                        kl_pos_partial.unsqueeze(0),
-                        s_log_probs[i:i+1] if s_log_probs is not None else None,
-                        prefilter_mask.unsqueeze(0),
-                        input_ids[i:i+1]
-                    )
-                    combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask)
-                    if combined is not None:
-                        stat[i] = combined
-                
-                stat = stat.masked_fill(~valid_next, float('-inf'))
-            else:
-                # Entropy-only ranking (no softmax needed, fully efficient)
-                stat = ent_raw.masked_fill(~valid_next, float('-inf'))
+            gls_effective = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
 
-            use_gls = bool(getattr(self.config, "gls_enabled", False))
-            sel_topk_count = 0
+            skip_entropy = (
+                pct >= 0.9995
+                and not normalize_topk
+                and not gls_effective
+                and not score_enabled
+            )
+
             sel_gls_count = 0
-            
-            # Create boolean mask for positions to include in KD loss
-            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
-            
-            if not use_gls:
-                # Per-example top-k
-                for i in range(valid_next.size(0)):
-                    mask = valid_next[i]
-                    n_valid = int(mask.sum().item())
-                    if n_valid < 3:
-                        continue
-                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                    sel_topk_count += int(k)
-                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-                    scores = stat[i][mask]
-                    if scores.numel() == 0:
-                        continue
-                    _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
-                    sel = valid_idx[rel_idx]
-                    keep_mask[i, sel] = True
+            if skip_entropy:
+                keep_mask = valid_next.clone()
+                sel_topk_count = int(valid_next.sum().item())
             else:
-                # GLS: global threshold over history with warm-up fallback
-                self._gls_init_if_needed()
-                thr = self._gls_threshold(top_percent=self.config.k_percent)
-                if thr is None:
-                    # Warm-up: fallback to per-example top-k
+                ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+
+                if score_enabled:
+                    # === Two-stage selection for efficiency ===
+                    # Stage 1: Prefilter by entropy (cheap, no softmax needed)
+                    prefilter_mult = float(getattr(self.config, "score_prefilter_multiplier", 3.0))
+                    # Stage 2: Compute KL/CE only on prefiltered subset
+
+                    stat = torch.full_like(ent_raw, float('-inf'))
+                    for i in range(valid_next.size(0)):
+                        mask_i = valid_next[i]
+                        n_valid = int(mask_i.sum().item())
+                        if n_valid < 3:
+                            continue
+
+                        # Stage 1: Select top (k * prefilter_mult) by entropy
+                        k_final = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                        k_pre = min(n_valid, max(k_final, int(k_final * prefilter_mult)))
+
+                        valid_idx = torch.where(mask_i)[0]
+                        ent_valid = ent_raw[i][mask_i]
+                        _, pre_rel_idx = torch.topk(ent_valid, k=k_pre, largest=True, sorted=False)
+                        prefilter_idx = valid_idx[pre_rel_idx]  # [k_pre] absolute indices
+
+                        # Stage 2: Compute KL/CE only on prefiltered positions (efficient!)
+                        # Create mask for prefiltered positions
+                        prefilter_mask = torch.zeros_like(mask_i, dtype=torch.bool)
+                        prefilter_mask[prefilter_idx] = True
+
+                        # Gather only prefiltered rows for KL computation
+                        # Ensure indices are on the same device as teacher log-probs
+                        pre_idx_t = prefilter_idx.to(t_log_probs.device)
+                        t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_pre, V]
+                        s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
+                        kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
+
+                        # Build full-size KL tensor with -inf for non-prefiltered
+                        kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
+                        kl_pos_partial[prefilter_idx] = kl_pre
+
+                        # Prepare score context with partial KL
+                        score_ctx_i = self._prepare_score_context(
+                            ent_raw[i:i+1],
+                            kl_pos_partial.unsqueeze(0),
+                            s_log_probs[i:i+1] if s_log_probs is not None else None,
+                            prefilter_mask.unsqueeze(0),
+                            input_ids[i:i+1]
+                        )
+                        combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask)
+                        if combined is not None:
+                            stat[i] = combined
+
+                    stat = stat.masked_fill(~valid_next, float('-inf'))
+                else:
+                    # Entropy-only ranking (no softmax needed, fully efficient)
+                    stat = ent_raw.masked_fill(~valid_next, float('-inf'))
+
+                use_gls = gls_effective
+                sel_topk_count = 0
+
+                # Create boolean mask for positions to include in KD loss
+                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
+
+                shared_quota = None
+                if normalize_topk:
+                    total_valid = int(valid_next.sum().item())
+                    avg_valid = total_valid / max(1, valid_next.size(0))
+                    shared_quota = max(1, math.ceil(pct * avg_valid))
+
+                if not use_gls:
+                    # Per-example top-k
                     for i in range(valid_next.size(0)):
                         mask = valid_next[i]
                         n_valid = int(mask.sum().item())
                         if n_valid < 3:
                             continue
-                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                        if normalize_topk and shared_quota is not None:
+                            k = min(n_valid, shared_quota)
+                        else:
+                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                         sel_topk_count += int(k)
                         valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
                         scores = stat[i][mask]
@@ -1161,15 +1162,38 @@ class Distiller(
                         sel = valid_idx[rel_idx]
                         keep_mask[i, sel] = True
                 else:
-                    keep_mask = (stat >= thr) & valid_next
-                    sel_gls_count = int(keep_mask.sum().item())
-                # Push current batch stats and optionally log threshold
-                flat_vals = stat[valid_next].detach().float().to("cpu")
-                flat_vals = flat_vals[torch.isfinite(flat_vals)]
-                self._gls_push(flat_vals)
-                if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
-                    self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
-            
+                    # GLS: global threshold over history with warm-up fallback
+                    self._gls_init_if_needed()
+                    thr = self._gls_threshold(top_percent=self.config.k_percent)
+                    if thr is None:
+                        # Warm-up: fallback to per-example top-k
+                        for i in range(valid_next.size(0)):
+                            mask = valid_next[i]
+                            n_valid = int(mask.sum().item())
+                            if n_valid < 3:
+                                continue
+                            if normalize_topk and shared_quota is not None:
+                                k = min(n_valid, shared_quota)
+                            else:
+                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                            sel_topk_count += int(k)
+                            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                            scores = stat[i][mask]
+                            if scores.numel() == 0:
+                                continue
+                            _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
+                            sel = valid_idx[rel_idx]
+                            keep_mask[i, sel] = True
+                    else:
+                        keep_mask = (stat >= thr) & valid_next
+                        sel_gls_count = int(keep_mask.sum().item())
+                    # Push current batch stats and optionally log threshold
+                    flat_vals = stat[valid_next].detach().float().to("cpu")
+                    flat_vals = flat_vals[torch.isfinite(flat_vals)]
+                    self._gls_push(flat_vals)
+                    if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
+                        self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+
             # Compute KL only on selected positions (efficient)
             rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
             if rows.numel() == 0:

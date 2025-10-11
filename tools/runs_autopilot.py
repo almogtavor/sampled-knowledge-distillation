@@ -62,6 +62,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 100,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_DDP_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
         },
     },
@@ -72,6 +73,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "NO_DDP_OFFLINE": "1",
             "ALPHA_CE": "0.1",
         },
     },
@@ -248,6 +250,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 15,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_DDP_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
         },
     },
@@ -258,6 +261,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_DDP_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
         },
     },
@@ -278,6 +282,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 30,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_DDP_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
         },
     },
@@ -288,6 +293,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "k_percent": 75,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_DDP_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
         },
     },
@@ -301,6 +307,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "BUCKET_LOWER_PERCENT": "5",
             "BUCKET_UPPER_PERCENT": "20",
+            "NO_DDP_OFFLINE": "1",
         },
     },
 
@@ -312,6 +319,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
+            "NO_DDP_OFFLINE": "1",
         },
     },
 
@@ -322,6 +330,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "NO_DDP_OFFLINE": "1",
         },
     },
 
@@ -333,6 +342,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "GLS_ENABLED": "1",
             "FINEWEB_TOKENS": "5000000",
+            "NO_DDP_OFFLINE": "1",
         },
     },
 
@@ -349,6 +359,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "SCORE_ENTROPY_WEIGHT": "1.0",
             "SCORE_CE_WEIGHT": "1.0",
             "SCORE_KL_WEIGHT": "1.0",
+            "NO_DDP_OFFLINE": "1",
         },
     },
 
@@ -359,6 +370,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "NO_DDP_OFFLINE": "1",
         },
     },
     # {

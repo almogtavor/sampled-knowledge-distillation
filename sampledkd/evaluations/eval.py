@@ -350,7 +350,7 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     # ("arc_challenge", None),
-    # ("arc_easy", None),
+    ("arc_easy", None),
     # exact-match
     # ("aime25", None),
     # ("ifeval", None)
