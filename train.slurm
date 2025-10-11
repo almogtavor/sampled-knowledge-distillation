@@ -54,7 +54,26 @@ SCORE_NORMALIZE=${SCORE_NORMALIZE:-}
 SCORE_ENTROPY_WEIGHT=${SCORE_ENTROPY_WEIGHT:-}
 SCORE_CE_WEIGHT=${SCORE_CE_WEIGHT:-}
 SCORE_KL_WEIGHT=${SCORE_KL_WEIGHT:-}
-DDP_OFFLINE=${DDP_OFFLINE:-}
+
+# Offline cache defaults to enabled unless explicitly set or disabled via NO_OFFLINE
+if [[ -z "${OFFLINE_CACHE+x}" ]]; then
+  OFFLINE_CACHE=1
+fi
+
+if [[ -n "${NO_OFFLINE+1}" ]]; then
+  OFFLINE_CACHE=0
+fi
+
+# Determine DDP default: follow explicit overrides first, then mirror offline cache state
+if [[ -n "${NO_DDP_OFFLINE+1}" ]]; then
+  DDP_OFFLINE=0
+elif [[ -z "${DDP_OFFLINE+x}" ]]; then
+  if [[ "$OFFLINE_CACHE" == "1" ]]; then
+    DDP_OFFLINE=1
+  else
+    DDP_OFFLINE=0
+  fi
+fi
 
 EXTRA_ARGS=()
 if [[ "$SCORE_TOKEN_SELECTION" == "1" ]]; then
@@ -83,8 +102,39 @@ if [[ "$DISTILL_TYPE" == "bucket" ]]; then
   fi
 fi
 
+RUN_FLAGS=()
+if [[ "$OFFLINE_CACHE" == "0" ]]; then
+  RUN_FLAGS+=(--no_offline_cache)
+fi
 if [[ "$DDP_OFFLINE" == "1" ]]; then
-  EXTRA_ARGS+=(--ddp_offline)
+  RUN_FLAGS+=(--ddp_offline)
+else
+  RUN_FLAGS+=(--no_ddp_offline)
+fi
+
+if [[ "${GLS_ENABLED:-0}" == "1" ]]; then
+  RUN_FLAGS+=(--gls_enabled)
+fi
+if [[ -n "${NO_ELIMINATE_SOFTMAX+1}" ]]; then
+  RUN_FLAGS+=(--no_eliminate_softmax)
+fi
+if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then
+  RUN_FLAGS+=(--no_offline_cache --no_eliminate_softmax)
+fi
+if [[ "${DETERMINISTIC:-0}" == "1" ]]; then
+  RUN_FLAGS+=(--deterministic)
+fi
+if [[ "$ANNEAL_FLAG" == "anneal" ]]; then
+  RUN_FLAGS+=(--anneal_kd_temperature)
+fi
+if [[ -n "${DATASET_CONFIG:-}" ]]; then
+  RUN_FLAGS+=(--dataset_config "${DATASET_CONFIG}")
+fi
+if [[ -n "${PROMPT_COL:-}" ]]; then
+  RUN_FLAGS+=(--prompt_col "${PROMPT_COL}")
+fi
+if [[ -n "${ANSWER_COL:-}" ]]; then
+  RUN_FLAGS+=(--answer_col "${ANSWER_COL}")
 fi
 
 # ---------- caches / env ----------
@@ -282,15 +332,7 @@ set +e
   --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
   --output_dir "$OUTPUT_DIR" \
   --seed "${SEED:-1337}" \
-  $(if [[ -n "${NO_OFFLINE+1}" ]]; then echo "--no_offline_cache"; fi) \
-  $(if [[ "${GLS_ENABLED:-0}" == "1" ]]; then echo "--gls_enabled"; fi) \
-  $(if [[ -n "${NO_ELIMINATE_SOFTMAX+1}" ]]; then echo "--no_eliminate_softmax"; fi) \
-  $(if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then echo "--no_offline_cache --no_eliminate_softmax"; fi) \
-  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
-  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi) \
-  $(if [[ -n "${DATASET_CONFIG:-}" ]]; then echo "--dataset_config ${DATASET_CONFIG}"; fi) \
-  $(if [[ -n "${PROMPT_COL:-}" ]]; then echo "--prompt_col ${PROMPT_COL}"; fi) \
-  $(if [[ -n "${ANSWER_COL:-}" ]]; then echo "--answer_col ${ANSWER_COL}"; fi) \
+  "${RUN_FLAGS[@]}" \
   "${EXTRA_ARGS[@]}" |& tee "$TRAIN_LOG"
 TRAIN_EXIT=${PIPESTATUS[0]}
 set -e

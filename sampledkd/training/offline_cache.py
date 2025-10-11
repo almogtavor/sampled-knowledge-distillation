@@ -636,7 +636,9 @@ def plan_offline_cache(
     distill_type = getattr(config, "distill_type", "vanilla")
 
     if not getattr(config, "offline_cache", False):
-        teacher_required = eliminate_softmax or distill_type not in teacherless_modes
+        # Without an offline cache we must host a live teacher to provide logits
+        # even for modes that can operate teacher-less when cached signals exist.
+        teacher_required = True
         return CachePlan(
             signature={},
             cache=None,
@@ -1002,6 +1004,18 @@ def build_offline_cache_if_needed(
     beta = 1.0
 
     build_wall_start = time.time()
+    rank_expected_total: int | None = (
+        int(expected_items) if isinstance(expected_items, int) and expected_items > 0 else None
+    )
+    sampler = getattr(dataloader, "sampler", None)
+    if sampler is not None:
+        try:
+            sampler_len = len(sampler)  # type: ignore[arg-type]
+        except TypeError:
+            sampler_len = None
+        if sampler_len and sampler_len > 0:
+            rank_expected_total = int(sampler_len)
+
     maybe_cache, V_last = _build_cache_pass(
         cache=cache,
         teacher=teacher,
@@ -1012,7 +1026,7 @@ def build_offline_cache_if_needed(
         S_vocab=S_vocab,
         beta=beta,
         rank=rank,
-        expected_total=expected_items,
+        expected_total=rank_expected_total,
     )
     # Flush any pending shard so that subsequent reads during stats pass are valid
     finalize = getattr(cache, "finalize", None)

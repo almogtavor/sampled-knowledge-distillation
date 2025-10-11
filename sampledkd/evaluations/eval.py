@@ -1480,7 +1480,16 @@ def main():
                     params_blob = params_candidate.get("params") or params_candidate
                     if isinstance(params_candidate.get("id"), str):
                         params_hash = params_candidate["id"]
-                        upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+                        upsert_eval_results(
+                            Path(args.runs_registry),
+                            params_hash,
+                            args.suite,
+                            merged,
+                            averages,
+                            task_status,
+                            model_path=model_path_str,
+                            calibration=calibration,
+                        )
                         raise StopIteration
             else:
                 # Preferred: run_params.json saved by training
@@ -1493,7 +1502,16 @@ def main():
                             # If file already contains id, prefer to trust it
                             if isinstance(rp_blob.get("id"), str):
                                 params_hash = rp_blob["id"]
-                                upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+                                upsert_eval_results(
+                                    Path(args.runs_registry),
+                                    params_hash,
+                                    args.suite,
+                                    merged,
+                                    averages,
+                                    task_status,
+                                    model_path=model_path_str,
+                                    calibration=calibration,
+                                )
                                 raise StopIteration  # already upserted; skip remainder
                     except Exception:
                         pass
@@ -1528,7 +1546,16 @@ def main():
                 # As a last resort, attach an empty dict so the call still produces a stable id from empty params
                 params_blob = {}
             params_hash = compute_params_hash(params_blob)
-            upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+            upsert_eval_results(
+                Path(args.runs_registry),
+                params_hash,
+                args.suite,
+                merged,
+                averages,
+                task_status,
+                model_path=model_path_str,
+                calibration=calibration,
+            )
         except StopIteration:
             pass
         except Exception as e:

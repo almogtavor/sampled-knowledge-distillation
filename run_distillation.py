@@ -183,6 +183,8 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
     parser.add_argument("--ddp_offline", action="store_true", default=True,
                         help="Enable distributed (torchrun) offline-mode training across multiple GPUs")
+    parser.add_argument("--no_ddp_offline", dest="ddp_offline", action="store_false",
+                        help="Disable distributed offline mode (single-process run)")
     # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
     parser.add_argument("--gls_enabled", action="store_true", default=False,
                         help="Enable global-level selection FIFO queue (only impacts top-k-tok)")
@@ -373,7 +375,11 @@ def main():
         student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
         student_device = torch.device(f"cuda:{student_local}")
         teacher_locals = [g for g in local_avail if g != student_local]
-        teacher_student_exclusion = student_local
+        if teacher_locals:
+            teacher_student_exclusion = student_local
+        else:
+            teacher_locals = [student_local]
+            teacher_student_exclusion = None
     
     if is_main_rank:
         print(f"CUDA_VISIBLE_DEVICES: {cvd}")

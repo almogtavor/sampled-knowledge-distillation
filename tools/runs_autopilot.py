@@ -56,7 +56,7 @@ EVAL_NAME_FALLBACKS = ("ekd-eval",)
 # sbatch lines used in kd_sweep.sh so you can copy/paste the combos you care
 # about. Remove or comment out entries you don't need.
 CUSTOM_TRAIN_SEQUENCE = [
-        # RS-KD (distill all tokens)
+    # RS-KD (distill all tokens) - to create the cache
     {
         "distill_type": "top-k-tok",
         "k_percent": 100,
@@ -65,6 +65,172 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
         },
     },
+    # Without offline cache (TSKD):
+    # RS-KD (distill all tokens)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+
+    # TSKD (entropy top-15%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 15,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (entropy top-20%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (entropy top-25%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (entropy top-30%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 30,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (entropy top-75%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 75,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (bucket of 5%-20%)
+    {
+        "distill_type": "bucket",
+        "k_percent": 0,  # ignored by bucket; env below defines the band
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "BUCKET_LOWER_PERCENT": "5",
+            "BUCKET_UPPER_PERCENT": "20",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (random 25%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (pos-rs-kd top-25%)
+    {
+        "distill_type": "pos-rs-kd",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (entropy top-25%, GLS)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "GLS_ENABLED": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (score top-25%)
+    # Combined score with z-normalization (entropy + CE + KL).
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "SCORE_TOKEN_SELECTION": "1",
+            "SCORE_NORMALIZE": "z",
+            "SCORE_ENTROPY_WEIGHT": "1.0",
+            "SCORE_CE_WEIGHT": "1.0",
+            "SCORE_KL_WEIGHT": "1.0",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    # TSKD (LinUCB)
+    {
+        "distill_type": "linucb",
+        "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "NO_DDP_OFFLINE": "1",
+        },
+    },
+
+    
+    
+    # # RS-KD (distill all tokens)
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 100,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "5000000",
+    #     },
+    # },
 
     # Sampled KD (entropy top-15%)
     {

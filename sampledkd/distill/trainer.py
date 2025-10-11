@@ -200,7 +200,7 @@ class Distiller(
                         attention_mask=attn_t,
                         output_hidden_states=False,
                     ).logits
-            return self._sanitize_logits(logits, "teacher").to(self.student_device)
+            return self._sanitize_logits(logits, "teacher")
         return self._teacher_forward_distributed(input_ids, attn_mask, amp_enabled, amp_dtype)
 
     def _teacher_forward_distributed(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
@@ -1516,9 +1516,9 @@ class Distiller(
         consecutive_oom_failures = 0
         total_oom_failures = 0
         max_consecutive_ooms = 10
-        max_total_oom_percent = 50  # Abort if >50% of batches OOM
+        max_total_oom_percent = 50  # Abort if >50% of attempted forwards OOM
         oom_failure_sleep_s = 100
-        batches_attempted = 0
+        total_batch_attempts = 0
         
         for epoch in range(epochs):
             step_start = time.time()
@@ -1539,68 +1539,78 @@ class Distiller(
             
             step = 0  # Manual step counter that only increments on success
             for batch in self.dataloader:
-                batches_attempted += 1
-                # Per-batch forward/backward with CUDA OOM handling
-                try:
-                    loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
-                    # Scale loss by gradient accumulation steps
-                    loss = loss / self.config.gradient_accumulation_steps
-                    
-                    # ===== OOM Reduction: AMP backward pass =====
-                    scaler = getattr(self, "_scaler", None)
-                    if scaler is not None:
-                        # fp16: use scaler
-                        scaler.scale(loss).backward()
-                    else:
-                        # bfloat16 or no AMP: standard backward
-                        loss.backward()
-                    
-                    # Reset consecutive OOM counter on success
-                    consecutive_oom_failures = 0
-                    step += 1  # Only increment step on successful batch
-                except torch.cuda.OutOfMemoryError:
-                    consecutive_oom_failures += 1
-                    total_oom_failures += 1
-                    # Clear partial grads and GPU caches
+                attempt_retries = 0
+                while True:
+                    total_batch_attempts += 1
                     try:
-                        self.opt.zero_grad(set_to_none=True)
-                    except Exception:
-                        pass
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    try:
-                        import gc
-                        gc.collect()
-                    except Exception:
-                        pass
-                    
-                    oom_rate = (total_oom_failures / batches_attempted) * 100
-                    if rank_is_zero:
-                        print(
-                            f"[OOM][rank {self.ddp_rank}] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
-                            f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
-                            f"Total: {total_oom_failures}/{batches_attempted} ({oom_rate:.1f}%). "
-                            f"Skipping batch..."
-                        )
-                    
-                    # Exit if too many consecutive OOMs
-                    if consecutive_oom_failures >= max_consecutive_ooms and rank_is_zero:
-                        print(f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures. "
-                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
-                        time.sleep(oom_failure_sleep_s)
-                        raise RuntimeError(f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures.")
-                    
-                    # Exit if OOM rate is too high (only check after seeing enough batches)
-                    if batches_attempted >= 20 and oom_rate > max_total_oom_percent and rank_is_zero:
-                        print(f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
-                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
-                        time.sleep(oom_failure_sleep_s)
-                        raise RuntimeError(f"Training aborted: {total_oom_failures}/{batches_attempted} batches failed with OOM ({oom_rate:.1f}%).")
-                    
-                    # Skip this batch and continue to the next one (step counter doesn't increment)
-                    continue
+                        loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
+                        # Scale loss by gradient accumulation steps
+                        loss = loss / self.config.gradient_accumulation_steps
+
+                        # ===== OOM Reduction: AMP backward pass =====
+                        scaler = getattr(self, "_scaler", None)
+                        if scaler is not None:
+                            # fp16: use scaler
+                            scaler.scale(loss).backward()
+                        else:
+                            # bfloat16 or no AMP: standard backward
+                            loss.backward()
+
+                        # Reset consecutive OOM counter on success
+                        consecutive_oom_failures = 0
+                        step += 1  # Only increment step on successful batch
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        attempt_retries += 1
+                        consecutive_oom_failures += 1
+                        total_oom_failures += 1
+                        # Clear partial grads and GPU caches
+                        try:
+                            self.opt.zero_grad(set_to_none=True)
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        try:
+                            import gc
+                            gc.collect()
+                        except Exception:
+                            pass
+
+                        oom_rate = (total_oom_failures / total_batch_attempts) * 100 if total_batch_attempts > 0 else 0.0
+                        if rank_is_zero:
+                            print(
+                                f"[OOM][rank {self.ddp_rank}] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
+                                f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
+                                f"Total: {total_oom_failures}/{total_batch_attempts} ({oom_rate:.1f}%). "
+                                f"Retrying batch (attempt {attempt_retries + 1})..."
+                            )
+
+                        # Exit if too many retries for this batch or globally
+                        if attempt_retries >= max_consecutive_ooms and rank_is_zero:
+                            print(
+                                f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures on the same batch. "
+                                f"Sleeping {oom_failure_sleep_s}s before exiting..."
+                            )
+                            time.sleep(oom_failure_sleep_s)
+                            raise RuntimeError(
+                                f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures on one batch."
+                            )
+
+                        if total_batch_attempts >= 20 and oom_rate > max_total_oom_percent and rank_is_zero:
+                            print(
+                                f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
+                                f"Sleeping {oom_failure_sleep_s}s before exiting..."
+                            )
+                            time.sleep(oom_failure_sleep_s)
+                            raise RuntimeError(
+                                f"Training aborted: {total_oom_failures}/{total_batch_attempts} forward attempts failed with OOM ({oom_rate:.1f}%)."
+                            )
+
+                        # Retry the same batch with cleared caches
+                        continue
                 
                 # Only update weights after accumulation steps
                 if step % self.config.gradient_accumulation_steps == 0:
