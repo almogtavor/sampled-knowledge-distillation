@@ -172,6 +172,7 @@ def upsert_eval_results(
     averages: Dict[str, float],
     task_status: Dict[str, str],
     model_path: Optional[str] = None,
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> None:
     items = _load_registry(registry_path)
     idx = find_entry(items, params_hash)
@@ -184,6 +185,8 @@ def upsert_eval_results(
         }
         if model_path:
             eval_entry["model_evaluated"] = model_path
+        if calibration is not None:
+            eval_entry["calibration"] = calibration
         items.append({
             "id": params_hash,
             "params": {},
@@ -201,6 +204,8 @@ def upsert_eval_results(
         }
         if model_path:
             eval_entry["model_evaluated"] = model_path
+        if calibration is not None:
+            eval_entry["calibration"] = calibration
         items[idx].setdefault("evals", {})[suite] = eval_entry
         items[idx]["status"] = "evaluated"
         items[idx].setdefault("completed_train", False)

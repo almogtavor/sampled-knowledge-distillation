@@ -80,6 +80,7 @@ Each entry in `runs.json` has this structure:
 - **`results`**: Per-task metrics (nested dict)
 - **`averages`**: Aggregated metrics across tasks
 - **`task_status`**: Per-task execution status (`"ok"`, `"failed"`, etc.)
+- **`calibration`** *(optional)*: Summary of ECE/perplexity metrics, with per-task and average values
 
 ## How It Works
 

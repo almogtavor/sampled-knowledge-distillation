@@ -70,6 +70,7 @@ def load_or_create_fineweb_cache(
     max_seq_len: int,
     seed: int = 1337,
     batch_size: int = 512,
+    packing_enabled: bool = True,
 ) -> List[Dict[str, str]]:
     """
     Load FineWeb-Edu subset from cache if available, otherwise create it.
@@ -77,9 +78,10 @@ def load_or_create_fineweb_cache(
     Args:
         tokenizer: HuggingFace tokenizer
         max_tokens: Token budget
-        max_seq_len: Maximum sequence length (filters longer docs)
+        max_seq_len: Reference length for reporting corpus statistics (no filtering is applied)
         seed: Random seed for shuffling
         batch_size: Batch size for tokenization
+        packing_enabled: Whether downstream training packs sequences; used in cache key only
     
     Returns:
         List of {"prompt": str, "answer": str} dicts
@@ -94,7 +96,8 @@ def load_or_create_fineweb_cache(
         max_tokens=max_tokens,
         max_seq_len=max_seq_len,
         seed=seed,
-        split="train"
+        split="train",
+        packing_enabled=packing_enabled,
     )
     
     cache_dir = _get_cache_dir()
@@ -116,7 +119,13 @@ def load_or_create_fineweb_cache(
                 meta = json.load(f)
             
             print(f"[data-cache] Loaded {len(examples):,} docs, {meta['total_tokens']:,} tokens from cache")
-            print(f"[data-cache] Cache params: max_seq_len={meta['max_seq_len']}, seed={meta['seed']}")
+            print(
+                "[data-cache] Cache params: max_seq_len={}, seed={}, packing_enabled={}".format(
+                    meta.get("max_seq_len"),
+                    meta.get("seed"),
+                    meta.get("packing_enabled", True),
+                )
+            )
             return examples
         except Exception as e:
             print(f"[data-cache] Cache load failed ({e}), regenerating...")
@@ -150,6 +159,7 @@ def load_or_create_fineweb_cache(
                     "num_docs": len(examples),
                     "salvaged": True,
                     "cache_file": str(cache_file),
+                    "packing_enabled": packing_enabled,
                 }
                 with open(metadata_file, "w") as f:
                     json.dump(metadata, f, indent=2)
@@ -167,7 +177,14 @@ def load_or_create_fineweb_cache(
     
     # Cache miss - create from scratch with batched tokenization
     print(f"[data-cache] Creating FineWeb-Edu cache: {cache_file.name}")
-    print(f"[data-cache] Params: max_tokens={max_tokens:,}, max_seq_len={max_seq_len}, seed={seed}")
+    print(
+        "[data-cache] Params: max_tokens={:,}, max_seq_len={}, seed={}, packing_enabled={}".format(
+            max_tokens,
+            max_seq_len,
+            seed,
+            packing_enabled,
+        )
+    )
     
     # Load streaming dataset (num_proc not supported for streaming)
     ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
@@ -176,7 +193,8 @@ def load_or_create_fineweb_cache(
     total_tokens = 0
     examples = []
     docs_seen = 0
-    docs_filtered = 0
+    docs_long_total = 0
+    docs_short_total = 0
     batches_processed = 0
     budget_reached = False
     write_buffer = []  # Buffer for batched writes (faster disk I/O)
@@ -207,8 +225,9 @@ def load_or_create_fineweb_cache(
                 
                 # Filter by length
                 if n_tokens > max_seq_len:
-                    docs_filtered += 1
-                    continue
+                    docs_long_total += 1
+                elif n_tokens < max_seq_len:
+                    docs_short_total += 1
                 
                 # Check token budget - stop AFTER we've reached the budget
                 if total_tokens >= max_tokens:
@@ -246,18 +265,34 @@ def load_or_create_fineweb_cache(
         "total_tokens": total_tokens,
         "num_docs": len(examples),
         "docs_seen": docs_seen,
-        "docs_filtered": docs_filtered,
-        "filter_rate": docs_filtered / docs_seen if docs_seen > 0 else 0.0,
+        "docs_long_total": docs_long_total,
+        "docs_short_total": docs_short_total,
+        "packing_enabled": packing_enabled,
+        "long_doc_rate": docs_long_total / docs_seen if docs_seen > 0 else 0.0,
+        "short_doc_rate": docs_short_total / docs_seen if docs_seen > 0 else 0.0,
         "cache_file": str(cache_file),
     }
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
     
     file_size_mb = cache_file.stat().st_size / 1024**2
-    filter_pct = (docs_filtered / docs_seen * 100) if docs_seen > 0 else 0.0
-    
     print(f"[data-cache] ✓ Cache created: {file_size_mb:.1f} MB")
-    print(f"[data-cache] Filtered {docs_filtered}/{docs_seen} docs ({filter_pct:.1f}%) exceeding {max_seq_len} tokens")
+    if docs_seen > 0:
+        if docs_seen > 0:
+            long_rate_pct = docs_long_total / docs_seen * 100
+            short_rate_pct = docs_short_total / docs_seen * 100
+            print(
+                "[data-cache] Docs > max_seq_len: {}/{} ({:.1f}%), docs < max_seq_len: {}/{} ({:.1f}%)".format(
+                    docs_long_total,
+                    docs_seen,
+                    long_rate_pct,
+                    docs_short_total,
+                    docs_seen,
+                    short_rate_pct,
+                )
+            )
+    else:
+        print("[data-cache] Dataset stream was empty; no filtering stats available")
     
     # Return without 'tokens' field (just prompt/answer)
     return [{"prompt": ex["prompt"], "answer": ex["answer"]} for ex in examples]
@@ -274,7 +309,7 @@ def load_or_create_eval_cache(
 ) -> List[Dict[str, Any]]:
     """
     Load evaluation dataset from cache if available, otherwise create it.
-    Filters by max_seq_len to avoid truncation during eval.
+    No length-based filtering is applied; statistics about over-length examples are recorded instead.
     
     Args:
         dataset_name: HuggingFace dataset name (e.g., "gsm8k")
@@ -337,7 +372,7 @@ def load_or_create_eval_cache(
     
     # Filter by length (batch processing)
     examples = []
-    docs_filtered = 0
+    docs_long = 0
     
     for batch_start in range(0, len(ds), batch_size):
         batch = ds[batch_start:min(batch_start + batch_size, len(ds))]
@@ -364,14 +399,11 @@ def load_or_create_eval_cache(
         for (text, ex), ids in zip(texts, enc["input_ids"]):
             n_tokens = len(ids)
             
-            # Filter by length
-            if n_tokens > max_seq_len:
-                docs_filtered += 1
-                continue
-            
             # Store original example with token count
             ex["_tokens"] = n_tokens
             examples.append(ex)
+            if n_tokens > max_seq_len:
+                docs_long += 1
     
     # Save to cache
     print(f"[eval-cache] Saving {len(examples):,} examples to cache...")
@@ -388,15 +420,15 @@ def load_or_create_eval_cache(
         "max_seq_len": max_seq_len,
         "max_samples": max_samples,
         "num_examples": len(examples),
-        "total_before_filter": len(ds),
-        "docs_filtered": docs_filtered,
-        "filter_rate": docs_filtered / len(ds) if len(ds) > 0 else 0.0,
+        "total_examples": len(ds),
+        "docs_over_max_seq_len": docs_long,
+        "over_length_rate": docs_long / len(ds) if len(ds) > 0 else 0.0,
     }
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
     
-    filter_pct = (docs_filtered / len(ds) * 100) if len(ds) > 0 else 0.0
+    over_pct = (docs_long / len(ds) * 100) if len(ds) > 0 else 0.0
     print(f"[eval-cache] ✓ Cache created: {len(examples):,}/{len(ds):,} examples")
-    print(f"[eval-cache] Filtered {docs_filtered} ({filter_pct:.1f}%) exceeding {max_seq_len} tokens")
+    print(f"[eval-cache] Docs exceeding {max_seq_len} tokens: {docs_long} ({over_pct:.1f}%)")
     
     return examples
