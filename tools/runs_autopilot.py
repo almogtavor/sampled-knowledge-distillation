@@ -65,6 +65,16 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
         },
     },
+    # RS-KD (distill all tokens) with lower CE weight
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.1",
+        },
+    },
     # Without offline cache (TSKD):
     # RS-KD (distill all tokens)
     {

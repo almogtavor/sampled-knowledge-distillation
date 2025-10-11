@@ -91,6 +91,9 @@ fi
 if [[ -n "$SCORE_KL_WEIGHT" ]]; then
   EXTRA_ARGS+=(--score_kl_weight "$SCORE_KL_WEIGHT")
 fi
+if [[ -n "${ALPHA_CE:-}" ]]; then
+  EXTRA_ARGS+=(--alpha_ce "${ALPHA_CE}")
+fi
 
 # ---------- bucket selection overrides ----------
 if [[ "$DISTILL_TYPE" == "bucket" ]]; then
