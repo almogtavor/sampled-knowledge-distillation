@@ -152,7 +152,8 @@ class LinUCBBanditController:
                     components["kl"] = kl_pos[i, valid_idx].float()
 
             if "pos_code" in self._feature_order:
-                target_ids = input_ids[i, 1:][valid_idx].tolist()
+                valid_idx_cpu = valid_idx.to(input_ids.device)
+                target_ids = input_ids[i, 1:][valid_idx_cpu].tolist()
                 pos_codes = torch.tensor(
                     [self._token_pos_code(tok_id) for tok_id in target_ids],
                     device=ent_vals.device,

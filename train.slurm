@@ -94,6 +94,9 @@ fi
 if [[ -n "${ALPHA_CE:-}" ]]; then
   EXTRA_ARGS+=(--alpha_ce "${ALPHA_CE}")
 fi
+if [[ -n "${GLS_QUEUE_SIZE:-}" ]]; then
+  EXTRA_ARGS+=(--gls_queue_size "${GLS_QUEUE_SIZE}")
+fi
 
 # ---------- bucket selection overrides ----------
 if [[ "$DISTILL_TYPE" == "bucket" ]]; then
@@ -319,24 +322,34 @@ if [[ "$DDP_OFFLINE" == "1" ]]; then
 else
   LAUNCH_CMD=("$PY")
 fi
+RUN_CMD=("${LAUNCH_CMD[@]}")
+RUN_CMD+=(
+  "run_distillation.py"
+  "--teacher_model" "Qwen/Qwen3-8B"
+  "--student_model" "${STUDENT_MODEL:-Qwen/Qwen3-0.6B}"
+  "--distill_type" "$DISTILL_TYPE"
+  "--k_percent" "$K_PERCENT"
+  "--datasets" "${DATASETS:-fineweb}"
+  "--fineweb_tokens" "${FINEWEB_TOKENS:-4000000}"
+  "--epochs" "$EPOCHS"
+  "--batch_size" "1"
+  "--gradient_accumulation_steps" "16"
+  "--max_seq_len" "768"
+  "--lr" "1e-5"
+  "--tensorboard_dir" "tb/${DISTILL_TYPE}_experiment"
+  "--output_dir" "$OUTPUT_DIR"
+  "--seed" "${SEED:-1337}"
+)
+if (( ${#RUN_FLAGS[@]} )); then
+  RUN_CMD+=("${RUN_FLAGS[@]}")
+fi
+if (( ${#EXTRA_ARGS[@]} )); then
+  RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
 set +e
-"${LAUNCH_CMD[@]}" run_distillation.py \
-  --teacher_model "Qwen/Qwen3-8B" \
-  --student_model "${STUDENT_MODEL:-Qwen/Qwen3-0.6B}" \
-  --distill_type "$DISTILL_TYPE" \
-  --k_percent "$K_PERCENT" \
-  --datasets "${DATASETS:-fineweb}" \
-  --fineweb_tokens "${FINEWEB_TOKENS:-4000000}" \
-  --epochs "$EPOCHS" \
-  --batch_size 1 \
-  --gradient_accumulation_steps 16 \
-  --max_seq_len 768 \
-  --lr 1e-5 \
-  --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
-  --output_dir "$OUTPUT_DIR" \
-  --seed "${SEED:-1337}" \
-  "${RUN_FLAGS[@]}" \
-  "${EXTRA_ARGS[@]}" |& tee "$TRAIN_LOG"
+printf -v RUN_CMD_STR '%q ' "${RUN_CMD[@]}"
+echo "Executing training command: ${RUN_CMD_STR% }"
+"${RUN_CMD[@]}" |& tee "$TRAIN_LOG"
 TRAIN_EXIT=${PIPESTATUS[0]}
 set -e
 
@@ -383,9 +396,12 @@ else
   echo "No eval suite provided → skipping eval submission."
 fi
 
-# Also save a copy of the log with a descriptive filename
+# Also save a copy of the log with a descriptive filename (bucket per autopilot run)
+RUN_LABEL="${AUTOPILOT_RUN_LABEL:-run0000}"
 SAFE_TYPE="$DISTILL_TYPE_DIR"
-RICH_LOG="results/logs/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
+RICH_LOG_DIR="results/logs/${RUN_LABEL}"
+mkdir -p "$RICH_LOG_DIR"
+RICH_LOG="${RICH_LOG_DIR}/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
 SRC_LOG="logs/train.${SLURM_JOB_ID}.log"
 if [[ -f "$SRC_LOG" ]]; then
   cp -f "$SRC_LOG" "$RICH_LOG" || true

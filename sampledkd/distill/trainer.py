@@ -40,8 +40,7 @@ class Distiller(
     BanditMixin,
 ):
     """Main distillation trainer class.
-    It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation -
-    both EKD and both vanilla style."""
+    It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation ."""
 
     def __init__(
             self,
@@ -317,7 +316,7 @@ class Distiller(
                 )
             t_logits = self._teacher_forward_logits(input_ids, attn_mask, amp_enabled, amp_dtype)
             t_pred = t_logits[:, :-1, :]
-            t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
+            t_log_probs = torch.log_softmax((t_pred.float() / T), dim=-1)
             if not self._printed_cache_info:
                 if rank_is_zero:
                     if getattr(self.config, "offline_cache", False) and cached_items is None:
@@ -337,7 +336,7 @@ class Distiller(
         extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
             if s_log_probs is None: # compute softmax if cache not rs-kd
-                s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
             kd_loss, kd_extra = self._compute_kd_loss(
                 t_pred,
                 t_log_probs,
@@ -444,14 +443,14 @@ class Distiller(
 
                     # Scatter proxies back to [B, L-1]
                     Bsz, Lm1 = valid_next.size()
-                    kd_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
-                    ce_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
-                    kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows
-                    ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows
+                    kd_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=torch.float32)
+                    ce_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=torch.float32)
+                    kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows.float()
+                    ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows.float()
 
                     if not do_elim:
                         if s_log_probs is None:
-                            s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                            s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
                         s_rows_logp = s_log_probs[batch_idx, pos_idx]          # [P_total, V]
                         s_logp_on_U_exact = torch.gather(s_rows_logp, 1, ids_U)  # [P_total, U_max]
                         kd_rows_exact = -(probs_U * s_logp_on_U_exact).sum(dim=1)
@@ -884,12 +883,12 @@ class Distiller(
                             # Scatter keep_mask to full [B, L-1] if needed
                             if distill == "top-k-tok":
                                 # KD: masked loss over selected positions
-                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                kd_loss = (kd_pos_proxy.to(self.student_dtype) * keep_mask).sum() / keep_mask.sum().clamp_min(1)
                                 # CE: on ALL valid positions (standard practice for top-k-tok)
                                 ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
                             else:
                                 # bucket/random: KD and CE both on selected positions
-                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                kd_loss = (kd_pos_proxy.to(self.student_dtype) * keep_mask).sum() / keep_mask.sum().clamp_min(1)
                                 # For CE on selected positions, we need to mask ce_pos_proxy
                                 if self.config.enable_ce:
                                     keep_rows = keep_mask[batch_idx, pos_idx] if P_total > 0 else torch.zeros(
@@ -903,7 +902,7 @@ class Distiller(
                 assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"
                 # Move necessary teacher tensors to the student device for gathers with student log-probs
                 t_logp_Tkd = t_log_probs.to(self.student_device)           # [B, L-1, V]
-                t_logp_T1 = torch.log_softmax(t_pred.to(self.student_device) / 1.0, dim=-1)  # [B, L-1, V]
+                t_logp_T1 = torch.log_softmax(t_pred.to(self.student_device).float() / 1.0, dim=-1)  # [B, L-1, V]
                 p_Tkd = t_logp_Tkd.exp()                                   # [B, L-1, V]
 
                 mask = valid_next  # [B, L-1] bool
@@ -914,7 +913,7 @@ class Distiller(
                     # Gather all valid rows once: [P_total, V]
                     p_rows = p_Tkd[mask]
                     if s_log_probs is None:
-                        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                        s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
                     s_rows = s_log_probs[mask]
                     t1_rows = t_logp_T1[mask]
 
@@ -959,9 +958,12 @@ class Distiller(
             else:
                 targets = input_ids_s[:, 1:]  # [B, L-1]
                 # In the new mode, CE is on ALL valid tokens (standard masking)
+                # Clamp out-of-range teacher targets before masking to avoid device-side asserts
+                V = s_pred.size(-1)
+                targets = targets.clamp(min=-1, max=V - 1)
                 targets = targets.masked_fill(~valid_next, -100)
                 # CE loss should always be at T=1 (standard practice in KD)
-                s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+                s_log_probs_T1 = torch.log_softmax(s_pred.float(), dim=-1)
                 V = s_log_probs_T1.size(-1)
                 flat_log_probs = s_log_probs_T1.reshape(-1, V)
                 flat_targets = targets.reshape(-1).long().clone()

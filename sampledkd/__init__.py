@@ -1,5 +1,5 @@
 """
-Entropy-guided Knowledge-Distillation (EKD) for LLM reasoning.
+Entropy-guided Knowledge-Distillation for LLM reasoning.
 """
 
 __version__ = "0.1.0" 

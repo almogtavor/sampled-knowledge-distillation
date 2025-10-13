@@ -688,23 +688,65 @@ def _parse_sample_line_for_mc(line: Dict[str, Any]) -> Optional[Tuple[List[float
     Returns list of scores (higher is better, e.g., log-likelihoods) and gold index.
     Returns None if the line does not look like a multiple-choice sample with usable data.
     """
-    # Try common fields for label index
-    gold_idx = None
-    for k in ("label", "gold_idx", "gold_index"):
-        if isinstance(line.get(k), int):
-            gold_idx = int(line[k])
+
+    def _maybe_int(value: Any) -> Optional[int]:
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    def _maybe_score(entry: Any) -> Optional[float]:
+        if isinstance(entry, (int, float)):
+            return float(entry)
+        if isinstance(entry, str):
+            try:
+                return float(entry)
+            except ValueError:
+                return None
+        if isinstance(entry, dict):
+            for key in ("loglikelihood", "logprob", "score", "value"):
+                if key in entry:
+                    val = _maybe_score(entry[key])
+                    if val is not None:
+                        return val
+        if isinstance(entry, list) and entry:
+            for item in entry:
+                val = _maybe_score(item)
+                if val is not None:
+                    return val
+        return None
+
+    # Try common fields for label index, including modern lm-eval layouts
+    gold_idx: Optional[int] = None
+    for k in ("label", "gold_idx", "gold_index", "target"):
+        cand = _maybe_int(line.get(k))
+        if cand is not None:
+            gold_idx = cand
             break
     if gold_idx is None:
+        doc = line.get("doc")
+        if isinstance(doc, dict):
+            for k in ("label", "gold", "gold_idx"):
+                cand = _maybe_int(doc.get(k))
+                if cand is not None:
+                    gold_idx = cand
+                    break
+    if gold_idx is None:
         # Some tasks log gold as letter (A/B/C/D)
-        gold = line.get("gold") or line.get("answer")
+        gold = line.get("gold") or line.get("answer") or (line.get("doc") or {}).get("gold")
         if isinstance(gold, str) and len(gold) == 1 and gold in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
             gold_idx = ord(gold) - ord('A')
+
     # Collect choice scores
     scores: Optional[List[float]] = None
-    # Direct list of numbers
-    if isinstance(line.get("choice_scores"), list) and all(isinstance(x, (int, float)) for x in line["choice_scores"]):
-        scores = [float(x) for x in line["choice_scores"]]
-    # Choices as list of dicts with score-like fields
+    raw_choice_scores = line.get("choice_scores")
+    if isinstance(raw_choice_scores, list) and all(isinstance(x, (int, float)) for x in raw_choice_scores):
+        scores = [float(x) for x in raw_choice_scores]
+
     if scores is None and isinstance(line.get("choices"), list) and line["choices"]:
         cand_keys = ("loglikelihood", "logprob", "score")
         first = line["choices"][0]
@@ -713,6 +755,23 @@ def _parse_sample_line_for_mc(line: Dict[str, Any]) -> Optional[Tuple[List[float
                 if k in first and all(isinstance(c.get(k), (int, float)) for c in line["choices"]):
                     scores = [float(c[k]) for c in line["choices"]]
                     break
+
+    if scores is None:
+        # Modern lm-eval emits nested lists under filtered_resps/resps with stringified scores
+        for resp_key in ("filtered_resps", "resps"):
+            resp_blob = line.get(resp_key)
+            if isinstance(resp_blob, list) and resp_blob:
+                extracted: List[float] = []
+                for entry in resp_blob:
+                    val = _maybe_score(entry)
+                    if val is None:
+                        extracted = []
+                        break
+                    extracted.append(float(val))
+                if extracted:
+                    scores = extracted
+                    break
+
     if scores is None or gold_idx is None:
         return None
     if not (0 <= gold_idx < len(scores)):
@@ -744,6 +803,13 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
             stem = stem[: -len("_samples")]
         if stem.endswith(".samples"):
             stem = stem[: -len(".samples")]
+        if stem.startswith("samples_"):
+            stem = stem[len("samples_") :]
+        # Drop trailing ISO-like timestamps that lm-eval appends after the task name
+        if "_" in stem:
+            prefix, suffix = stem.rsplit("_", 1)
+            if suffix.startswith("20") and "T" in suffix:
+                stem = prefix
         # If there is a normalization variant like ",none", trim to base task
         if "," in stem:
             stem = stem.split(",", 1)[0]

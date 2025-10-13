@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -120,7 +121,7 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Absolute clip value applied to KL improvement rewards before LinUCB updates")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
-    parser.add_argument("--alpha_ce", type=float, default=0.3,
+    parser.add_argument("--alpha_ce", type=float, default=0.1,
                         help="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
@@ -181,7 +182,7 @@ def parse_args_to_config() -> TrainingConfig:
 
     parser.add_argument("--sampled_softmax_negatives", type=int, default=1500,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
-    parser.add_argument("--ddp_offline", action="store_true", default=True,
+    parser.add_argument("--ddp_offline", action="store_true", default=False,
                         help="Enable distributed (torchrun) offline-mode training across multiple GPUs")
     parser.add_argument("--no_ddp_offline", dest="ddp_offline", action="store_false",
                         help="Disable distributed offline mode (single-process run)")
@@ -220,6 +221,7 @@ def main():
     is_main_rank = ddp_ctx.is_main_rank
     
     # Print all CLI parameters at startup
+    print("[launch] python", " ".join(sys.argv), flush=True)
     if is_main_rank:
         print("=" * 80)
         print("TRAINING CONFIGURATION")
@@ -308,12 +310,14 @@ def main():
         elif config.distill_type == "bucket":
             experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
+        cli_args = " ".join(shlex.quote(arg) for arg in sys.argv)
         upsert_run_start(
             registry_path,
             params_dict,
             experiment_name=experiment_name,
             job_id=job_id,
             model_output_dir=config.output_dir,
+            launch_args=cli_args,
         )
     else:
         current_date = datetime.now().strftime("%Y%m%d_%H%M")

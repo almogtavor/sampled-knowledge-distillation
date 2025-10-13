@@ -99,7 +99,8 @@ def get_entry(registry_path: Path, params_hash: str) -> Optional[Dict[str, Any]]
 def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                      experiment_name: Optional[str] = None,
                      job_id: Optional[str] = None,
-                     model_output_dir: Optional[str] = None) -> Dict[str, Any]:
+                     model_output_dir: Optional[str] = None,
+                     launch_args: Optional[str] = None) -> Dict[str, Any]:
     """Upsert a run entry at training start. Returns the entry dict.
 
     Schema:
@@ -127,6 +128,8 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                 "experiment": experiment_name,
                 "job_id": job_id,
                 "output_dir": model_output_dir,
+                "started_at": _now_iso(),
+                "args": launch_args,
             }
         },
         "evals": {},
@@ -144,7 +147,9 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
             "experiment": experiment_name,
             "job_id": job_id,
             "output_dir": model_output_dir,
+            "args": launch_args if launch_args is not None else items[idx]["runs"]["train"].get("args"),
         })
+        items[idx]["runs"]["train"].setdefault("started_at", _now_iso())
         items[idx].setdefault("evals", {})
         # Do not override status here; caller can change later
         entry = items[idx]
@@ -159,8 +164,10 @@ def mark_trained(registry_path: Path, params_hash: str, *, model_output_dir: Opt
         return
     items[idx]["status"] = "trained"
     items[idx]["completed_train"] = True
+    train_meta = items[idx].setdefault("runs", {}).setdefault("train", {})
     if model_output_dir:
-        items[idx].setdefault("runs", {}).setdefault("train", {}).update({"output_dir": model_output_dir})
+        train_meta["output_dir"] = model_output_dir
+    train_meta["completed_at"] = _now_iso()
     _save_registry(registry_path, items)
 
 

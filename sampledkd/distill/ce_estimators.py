@@ -52,7 +52,7 @@ def ce_is_estimator(
         log_w_U = s_rows.new_zeros((P, 0))
     else:
         qU_safe = qU_raw.clamp_min(1e-12)
-        log_qU = qU_safe.log()
+        log_qU = qU_safe.log().to(z_U.dtype)
         log_w_U = torch.full_like(z_U, float('-inf'))
         include_mask = valid_U_mask & (~y_eq_U)
         log_w_U[include_mask] = z_U[include_mask] - log_qU[include_mask]
