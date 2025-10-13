@@ -427,8 +427,16 @@ def run_lmeval_suite(
     max_batch_size: int = 0,
     generate_max_batch_size: int = 4,
     fallback_batch_size: int = 1,
+    model_dtype: str = "float16",
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+    device_map: Optional[str] = None,
+    share_gpu_pool: bool = False,
 ) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
-    """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
+    """Run the requested LM-Eval suite (light/heavy).
+
+    Executes tasks across GPUs in waves; when share_gpu_pool is True, a single task uses the full pool.
+    """
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
 
@@ -464,6 +472,9 @@ def run_lmeval_suite(
     if not gpu_ids:
         print("[lm-eval] No GPUs detected/selected; skipping suite.")
         return None
+
+    if share_gpu_pool and len(gpu_ids) > 1:
+        print(f"[lm-eval] Treating GPUs {gpu_ids} as a single tensor-parallel pool.")
 
     # preflight: load task registry to filter unknown tasks (but allow external include_path)
     try:
@@ -507,10 +518,27 @@ def run_lmeval_suite(
     effective_generate_max_batch_size = max(0, int(generate_max_batch_size))
     effective_fallback_batch_size = max(0, int(fallback_batch_size))
 
+    model_arg_parts = [
+        f"pretrained={model_dir}",
+        "trust_remote_code=True",
+    ]
+    if load_in_4bit:
+        model_arg_parts.append("load_in_4bit=True")
+    elif load_in_8bit:
+        model_arg_parts.append("load_in_8bit=True")
+    else:
+        if model_dtype:
+            model_arg_parts.append(f"dtype={model_dtype}")
+    effective_device_map = device_map
+    if not effective_device_map and share_gpu_pool and len(gpu_ids) > 1:
+        effective_device_map = "balanced_low_0"
+    if effective_device_map:
+        model_arg_parts.append(f"device_map={effective_device_map}")
+
     base_args = [
         "lm-eval",
         "--model", "hf",
-        "--model_args", f"pretrained={model_dir},trust_remote_code=True,dtype=float16",
+        "--model_args", ",".join(model_arg_parts),
         "--output_path", str(out_dir),
         "--include_path", include_path,
     ]
@@ -576,15 +604,24 @@ def run_lmeval_suite(
     task_durations: Dict[str, float] = {}
     good_any = False
     i = 0
+    shared_gpu_env = ",".join(str(x) for x in gpu_ids)
     while i < len(tasks_with_limits):
         procs = []
-        wave = tasks_with_limits[i : i + len(gpu_ids)]
+        if share_gpu_pool:
+            wave = tasks_with_limits[i : i + 1]
+            gpu_assignments = [shared_gpu_env]
+        else:
+            wave = tasks_with_limits[i : i + len(gpu_ids)]
+            gpu_assignments = [str(g) for g in gpu_ids[: len(wave)]]
         wave_names = [t for (t, _) in wave]
         timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
-        for (task, limit), gid in zip(wave, gpu_ids):
+        if share_gpu_pool:
+            print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on shared GPUs {shared_gpu_env}")
+        else:
+            print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
+        for (task, limit), gpu_assignment in zip(wave, gpu_assignments):
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
+            env["CUDA_VISIBLE_DEVICES"] = gpu_assignment  # inside, cuda:0 maps within this pool
             py_path_parts = [include_path, repo_root]
             if env.get("PYTHONPATH"):
                 py_path_parts.append(env["PYTHONPATH"])
@@ -636,7 +673,7 @@ def run_lmeval_suite(
                 print(f"[{timestamp}] ❌ Task {task} failed with code {rc} in {duration:.1f}s")
                 task_status[task] = f"failed:{rc}"
             task_durations[task] = duration
-        i += len(gpu_ids)
+        i += len(wave)
     return out_dir if good_any else None, task_status, task_durations
 
 # ---------- ECE (Expected Calibration Error) from LM-Eval samples ----------
@@ -1239,6 +1276,8 @@ def main():
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
+    parser.add_argument("--lm_eval_share_gpu_pool", action="store_true",
+                        help="Treat provided gpu_ids as a single pool per lm-eval subprocess (tensor-parallel sharding for large models).")
     parser.add_argument("--max_parallel", type=int, default=None,
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
@@ -1289,8 +1328,34 @@ def main():
         default=1,
         help="Fallback batch size to retry with if an auto batch run fails or times out.",
     )
+    parser.add_argument(
+        "--lm_eval_model_dtype",
+        type=str,
+        default="float16",
+        help="Torch dtype passed to HF model_args when not loading quantized weights.",
+    )
+    parser.add_argument(
+        "--lm_eval_load_in_8bit",
+        action="store_true",
+        help="Load the evaluation model in 8-bit using bitsandbytes (reduces VRAM).",
+    )
+    parser.add_argument(
+        "--lm_eval_load_in_4bit",
+        action="store_true",
+        help="Load the evaluation model in 4-bit using bitsandbytes (minimizes VRAM).",
+    )
+    parser.add_argument(
+        "--lm_eval_device_map",
+        type=str,
+        default=None,
+        help="Optional device_map string to forward to HF model_args (e.g., 'auto', 'balanced_low_0').",
+    )
     # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
+
+    if args.lm_eval_load_in_8bit and args.lm_eval_load_in_4bit:
+        print("Error: --lm_eval_load_in_8bit and --lm_eval_load_in_4bit are mutually exclusive.")
+        sys.exit(2)
     
     # Print all CLI parameters at startup
     print("=" * 80)
@@ -1317,6 +1382,9 @@ def main():
         gpu_pool = visible_gpu_ids()
     if args.max_parallel is not None and args.max_parallel > 0:
         gpu_pool = gpu_pool[: args.max_parallel]
+    if args.lm_eval_share_gpu_pool and len(gpu_pool) < 2:
+        print("[gpu] Warning: --lm_eval_share_gpu_pool requested but fewer than 2 GPUs available; running without sharding.")
+        args.lm_eval_share_gpu_pool = False
     print(f"[gpu] Using GPUs: {gpu_pool}" if gpu_pool else "[gpu] No GPUs detected/selected.")
 
     # Resolve the single model dir to evaluate
@@ -1396,6 +1464,11 @@ def main():
             max_batch_size=args.lm_eval_max_batch_size,
             generate_max_batch_size=args.lm_eval_generate_max_batch_size,
             fallback_batch_size=args.lm_eval_fallback_batch_size,
+            model_dtype=args.lm_eval_model_dtype,
+            load_in_8bit=args.lm_eval_load_in_8bit,
+            load_in_4bit=args.lm_eval_load_in_4bit,
+            device_map=args.lm_eval_device_map,
+            share_gpu_pool=args.lm_eval_share_gpu_pool,
         )
         lmeval_wall = time.time() - lmeval_start
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}

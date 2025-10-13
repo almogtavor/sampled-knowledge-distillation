@@ -282,7 +282,7 @@ elif [[ "${SLURM_GPUS:-}" =~ ^[0-9]+$ ]]; then
   AVAILABLE_GPUS=$SLURM_GPUS
 fi
 
-DDP_OFFLINE=${DDP_OFFLINE:-1}
+DDP_OFFLINE=${DDP_OFFLINE:-0}
 if [[ "$DDP_OFFLINE" == "1" && "$AVAILABLE_GPUS" -lt 2 ]]; then
   echo "Requested DDP but only $AVAILABLE_GPUS GPU(s) visible; running single-process."
   DDP_OFFLINE=0

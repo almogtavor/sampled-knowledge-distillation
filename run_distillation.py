@@ -486,6 +486,38 @@ def main():
     teacher_required = cache_plan.teacher_required
     teacher_rank0_only = cache_plan.teacher_rank0_only
 
+    force_rank0_teacher = (
+        teacher_required
+        and getattr(config, "ddp_offline", False)
+        and getattr(config, "ddp_world_size", 1) > 1
+    )
+    if force_rank0_teacher and not teacher_rank0_only:
+        cache_plan.teacher_rank0_only = True
+        teacher_rank0_only = True
+        if is_main_rank:
+            print("[device-planning] Hosting teacher on rank 0 only; other ranks will request logits via broadcast.")
+
+    if teacher_required:
+        will_load_teacher = (not teacher_rank0_only) or (ddp_rank == 0)
+        if will_load_teacher:
+            dedicated_candidates: list[int] = []
+            if len(local_avail) >= 2:
+                dedicated_candidates = [g for g in local_avail if g != student_local]
+            if dedicated_candidates:
+                if teacher_student_exclusion != student_local:
+                    teacher_student_exclusion = student_local
+                if teacher_locals != dedicated_candidates:
+                    teacher_locals = dedicated_candidates
+                    should_log_pref = (
+                        (teacher_rank0_only and ddp_rank == 0)
+                        or (not teacher_rank0_only and (is_main_rank or not config.ddp_offline))
+                    )
+                    if should_log_pref:
+                        print(
+                            f"[device-planning] Preferring dedicated teacher GPU(s) {teacher_locals} with student on {student_local}",
+                            flush=True,
+                        )
+
     teacher = None
     teacher_inputs_device = torch.device("cpu")
     if teacher_required:
@@ -521,14 +553,17 @@ def main():
     cache_ready = cache_result.cache_ready
     teacher_required = cache_result.teacher_required
     teacher_rank0_only = cache_result.teacher_rank0_only
+    if force_rank0_teacher:
+        teacher_rank0_only = True
 
 
     teacher_device_str = str(teacher_inputs_device)
 
     if getattr(config, "ddp_offline", False):
-        obj = [teacher_device_str] if is_rank0() else [None]
-        obj = distributed_broadcast_object_list(obj, src=0)
-        teacher_device_str = obj[0] or "cpu"
+        if teacher_rank0_only:
+            obj = [teacher_device_str] if is_rank0() else [None]
+            obj = distributed_broadcast_object_list(obj, src=0)
+            teacher_device_str = obj[0] or teacher_device_str
         teacher_inputs_device = torch.device(teacher_device_str)
         distributed_barrier()
     else:

@@ -315,6 +315,8 @@ class Distiller(
                     "Offline cache must provide logits for the configured distillation mode; teacher is not available for fallback."
                 )
             t_logits = self._teacher_forward_logits(input_ids, attn_mask, amp_enabled, amp_dtype)
+            if t_logits.device != self.student_device:
+                t_logits = t_logits.to(self.student_device, non_blocking=True)
             t_pred = t_logits[:, :-1, :]
             t_log_probs = torch.log_softmax((t_pred.float() / T), dim=-1)
             if not self._printed_cache_info:
