@@ -37,6 +37,9 @@ class LinUCBBanditController:
         student_device: torch.device,
         teacher_device: torch.device,
         sanitize_logits_fn,
+        teacher_available: bool,
+        reward_with_teacher: bool,
+        offline_only: bool,
     ) -> None:
         self.tok = tokenizer
         self.config = config
@@ -44,8 +47,29 @@ class LinUCBBanditController:
         self.teacher_device = torch.device(teacher_device)
         self._sanitize_logits = sanitize_logits_fn
 
-        # Feature vector: [entropy, teacher CE, student CE, KL, token POS class, normalized position]
-        feature_dim = 6
+        self.teacher_available = bool(teacher_available)
+        self._reward_enabled = bool(reward_with_teacher)
+        self.offline_only = bool(offline_only)
+
+        if self.teacher_available and not self.offline_only:
+            self._feature_order: Tuple[str, ...] = (
+                "entropy",
+                "teacher_ce",
+                "student_ce",
+                "kl",
+                "pos_code",
+                "pos_norm",
+            )
+        else:
+            # Offline-only mode: restrict to features backed by cache/student signals.
+            self._feature_order = (
+                "entropy",
+                "student_ce",
+                "kl",
+                "pos_norm",
+            )
+
+        feature_dim = len(self._feature_order)
         self.bandit = LinUCBBandit(
             feature_dim=feature_dim,
             alpha=self.config.bandit_alpha,
@@ -104,30 +128,46 @@ class LinUCBBanditController:
                 continue
 
             ent_vals = ent_raw[i, valid_idx].float()
-            teacher_vals = teacher_ce[i, valid_idx].float()
-            student_vals = student_ce[i, valid_idx].float()
-            kl_vals = kl_pos[i, valid_idx].float()
 
-            target_ids = input_ids[i, 1:][valid_idx].tolist()
-            pos_codes = torch.tensor(
-                [self._token_pos_code(tok_id) for tok_id in target_ids],
-                device=ent_vals.device,
-                dtype=torch.float32,
-            )
+            components: Dict[str, torch.Tensor] = {
+                "entropy": ent_vals,
+            }
 
-            denom = max(1, seq_len - 1)
-            # Explicitly encode relative position to encourage exploration across the sequence.
-            pos_norm = valid_idx.float() / denom
+            if "teacher_ce" in self._feature_order:
+                if teacher_ce is None:
+                    components["teacher_ce"] = torch.zeros_like(ent_vals)
+                else:
+                    components["teacher_ce"] = teacher_ce[i, valid_idx].float()
+
+            if "student_ce" in self._feature_order:
+                if student_ce is None:
+                    components["student_ce"] = torch.zeros_like(ent_vals)
+                else:
+                    components["student_ce"] = student_ce[i, valid_idx].float()
+
+            if "kl" in self._feature_order:
+                if kl_pos is None:
+                    components["kl"] = torch.zeros_like(ent_vals)
+                else:
+                    components["kl"] = kl_pos[i, valid_idx].float()
+
+            if "pos_code" in self._feature_order:
+                valid_idx_cpu = valid_idx.to(input_ids.device)
+                target_ids = input_ids[i, 1:][valid_idx_cpu].tolist()
+                pos_codes = torch.tensor(
+                    [self._token_pos_code(tok_id) for tok_id in target_ids],
+                    device=ent_vals.device,
+                    dtype=torch.float32,
+                )
+                components["pos_code"] = pos_codes
+
+            if "pos_norm" in self._feature_order:
+                denom = max(1, seq_len - 1)
+                pos_norm = (valid_idx.float() / denom).float()
+                components["pos_norm"] = pos_norm
 
             contexts = torch.stack(
-                (
-                    ent_vals,
-                    teacher_vals,
-                    student_vals,
-                    kl_vals,
-                    pos_codes,
-                    pos_norm.float(),
-                ),
+                [components[name] for name in self._feature_order],
                 dim=1,
             )
 
@@ -243,7 +283,7 @@ class LinUCBBanditController:
             total_overlap_selected += intersection / max(1.0, selected_count)
             total_overlap_top25 += intersection / max(1, float(top25_abs.numel()))
 
-        if pending_tokens:
+        if pending_tokens and self._reward_enabled:
             # Store a CPU copy of the batch so we can run reward rollouts after the optimizer step.
             self._pending.append(
                 BanditPendingBatch(
@@ -274,6 +314,10 @@ class LinUCBBanditController:
 
     def process_rewards(self, student_model, teacher_model) -> Optional[Dict[str, float]]:
         """Re-evaluate queued tokens and feed rewards back into the bandit."""
+        if not self._reward_enabled or teacher_model is None:
+            self._pending.clear()
+            return None
+
         if not self._pending:
             return None
 

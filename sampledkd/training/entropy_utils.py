@@ -2,17 +2,28 @@ import torch
 
 
 def token_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """Compute per-token entropy (the regular Entropy formula) in natural logarithm (base e).
-    Used find high-entropy "fork" tokens / low-entropy certain tokens.
-    Accepts logits with shape [..., V] (V=vocab size) and returns entropies with shape [...],
-    i.e. one entropy value per position, batch item, etc.
+    """Compute per-token entropy (natural log base) row by row to limit peak memory.
 
-    logits: [seq_len, vocab]
-    returns: [seq_len]"""
-    x = logits.float()  # avoid fp16 underflow
-    probs = torch.softmax(x, dim=-1)
-    p_safe = probs.clamp_min(1e-12)  # prevent log(0)
-    return -(probs * p_safe.log()).sum(-1)  # [L, V] -> [L] where L is sequence length, V is vocabulary size
+    Accepts logits with shape [..., V] and returns entropies with shape [...].
+    """
+    x = logits.float()
+    seq_shape = x.shape[:-1]
+    V = x.shape[-1]
+    flat = x.reshape(-1, V)
+    out = torch.empty(flat.size(0), dtype=x.dtype, device=x.device)
+
+    blocks = 32
+    block_size = max(1, (flat.size(0) + blocks - 1) // blocks)
+    start = 0
+    while start < flat.size(0):
+        end = min(flat.size(0), start + block_size)
+        block = flat[start:end]
+        probs = torch.softmax(block, dim=-1)
+        log_probs = probs.clamp_min(1e-12).log()
+        out[start:end] = -(probs * log_probs).sum(dim=-1)
+        start = end
+
+    return out.reshape(*seq_shape)
 
 def truncated_entropy_topk_tail_midpoint(logits: torch.Tensor, k: int = 20) -> torch.Tensor:
     x = logits.float()

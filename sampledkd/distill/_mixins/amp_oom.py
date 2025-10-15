@@ -10,9 +10,12 @@ class AmpOomMixin:
         We might train with lower precision (e.g., fp16), so instability might occur.
         """
         # cast to fp32 for stability, clamp, and replace NaN/Inf
-        x = x.float()
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
         x = torch.clamp(x, min=-1e4, max=1e4)
         x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
         if not torch.isfinite(x).all():
             print(f"[warn] non-finite after sanitize in {name}")
+        if orig_dtype != torch.float32:
+            x = x.to(orig_dtype)
         return x

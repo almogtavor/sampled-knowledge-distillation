@@ -271,6 +271,12 @@ elif [[ "$MODE" == "test_at_higher_scale" ]]; then
   sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,FINEWEB_TOKENS=10000000 train.slurm pos-rs-kd 25 light "$KD_SWEEP_TAG"
   sbatch --wait --export=ALL,NO_ELIMINATE_SOFTMAX=1,GLS_ENABLED=1,FINEWEB_TOKENS=10000000 train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
 
+elif [[ "$MODE" == "test_score_25" ]]; then
+  SUITE="${2:-light}"
+  # Use 4m tokens for all FineWeb-Edu training runs
+  sbatch --wait --export=ALL,SCORE_TOKEN_SELECTION=1,SCORE_NORMALIZE=z,SCORE_ENTROPY_WEIGHT=1.0,SCORE_CE_WEIGHT=1.0,SCORE_KL_WEIGHT=1.0 \
+    train.slurm top-k-tok 25 light "$KD_SWEEP_TAG"
+
 
 elif [[ "$MODE" == "run_all_4m" ]]; then
   # Full pipeline: evaluate baselines, then run the requested trainings in EXACT order.

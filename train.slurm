@@ -55,6 +55,26 @@ SCORE_ENTROPY_WEIGHT=${SCORE_ENTROPY_WEIGHT:-}
 SCORE_CE_WEIGHT=${SCORE_CE_WEIGHT:-}
 SCORE_KL_WEIGHT=${SCORE_KL_WEIGHT:-}
 
+# Offline cache defaults to enabled unless explicitly set or disabled via NO_OFFLINE
+if [[ -z "${OFFLINE_CACHE+x}" ]]; then
+  OFFLINE_CACHE=1
+fi
+
+if [[ -n "${NO_OFFLINE+1}" ]]; then
+  OFFLINE_CACHE=0
+fi
+
+# Determine DDP default: follow explicit overrides first, then mirror offline cache state
+if [[ -n "${NO_DDP_OFFLINE+1}" ]]; then
+  DDP_OFFLINE=0
+elif [[ -z "${DDP_OFFLINE+x}" ]]; then
+  if [[ "$OFFLINE_CACHE" == "1" ]]; then
+    DDP_OFFLINE=1
+  else
+    DDP_OFFLINE=0
+  fi
+fi
+
 EXTRA_ARGS=()
 if [[ "$SCORE_TOKEN_SELECTION" == "1" ]]; then
   EXTRA_ARGS+=(--score_token_selection)
@@ -71,6 +91,12 @@ fi
 if [[ -n "$SCORE_KL_WEIGHT" ]]; then
   EXTRA_ARGS+=(--score_kl_weight "$SCORE_KL_WEIGHT")
 fi
+if [[ -n "${ALPHA_CE:-}" ]]; then
+  EXTRA_ARGS+=(--alpha_ce "${ALPHA_CE}")
+fi
+if [[ -n "${GLS_QUEUE_SIZE:-}" ]]; then
+  EXTRA_ARGS+=(--gls_queue_size "${GLS_QUEUE_SIZE}")
+fi
 
 # ---------- bucket selection overrides ----------
 if [[ "$DISTILL_TYPE" == "bucket" ]]; then
@@ -80,6 +106,36 @@ if [[ "$DISTILL_TYPE" == "bucket" ]]; then
   if [[ -n "${BUCKET_UPPER_PERCENT:-}" ]]; then
     EXTRA_ARGS+=(--bucket_upper_percent "${BUCKET_UPPER_PERCENT}")
   fi
+fi
+
+RUN_FLAGS=()
+if [[ "$OFFLINE_CACHE" == "0" ]]; then
+  RUN_FLAGS+=(--no_offline_cache)
+fi
+
+if [[ "${GLS_ENABLED:-0}" == "1" ]]; then
+  RUN_FLAGS+=(--gls_enabled)
+fi
+if [[ -n "${NO_ELIMINATE_SOFTMAX+1}" ]]; then
+  RUN_FLAGS+=(--no_eliminate_softmax)
+fi
+if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then
+  RUN_FLAGS+=(--no_offline_cache --no_eliminate_softmax)
+fi
+if [[ "${DETERMINISTIC:-0}" == "1" ]]; then
+  RUN_FLAGS+=(--deterministic)
+fi
+if [[ "$ANNEAL_FLAG" == "anneal" ]]; then
+  RUN_FLAGS+=(--anneal_kd_temperature)
+fi
+if [[ -n "${DATASET_CONFIG:-}" ]]; then
+  RUN_FLAGS+=(--dataset_config "${DATASET_CONFIG}")
+fi
+if [[ -n "${PROMPT_COL:-}" ]]; then
+  RUN_FLAGS+=(--prompt_col "${PROMPT_COL}")
+fi
+if [[ -n "${ANSWER_COL:-}" ]]; then
+  RUN_FLAGS+=(--answer_col "${ANSWER_COL}")
 fi
 
 # ---------- caches / env ----------
@@ -157,6 +213,22 @@ PY="$VENV_DIR/bin/python"
 echo "Using virtual environment: $VENV_DIR"
 $PY -V || { echo "Venv python missing"; exit 1; }
 
+# Disable torchrun-based DDP on Python 3.12 by default (known segfault via torch.distributed.elastic)
+PY_MINOR_VERSION=$($PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  PY_VER_NUM=${PY_MINOR_VERSION//./}
+  if [[ "$PY_VER_NUM" -ge 312 && "${ALLOW_PY312_DDP:-0}" != "1" ]]; then
+    echo "Detected Python $PY_MINOR_VERSION; torch.distributed.run --standalone segfaults on this stack. Falling back to single-process (set ALLOW_PY312_DDP=1 to override)."
+    DDP_OFFLINE=0
+  fi
+fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  RUN_FLAGS+=(--ddp_offline)
+else
+  RUN_FLAGS+=(--no_ddp_offline)
+fi
+
 # ---------- ensure pip exists ----------
 if ! $PY -m pip -V >/dev/null 2>&1; then
   echo "Bootstrapping pip in venv..."
@@ -213,6 +285,33 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   echo "=============================="
 fi
 
+AVAILABLE_GPUS=1
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a _DDP_GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
+  AVAILABLE_GPUS=${#_DDP_GPU_LIST[@]}
+elif [[ "${SLURM_GPUS:-}" =~ ^[0-9]+$ ]]; then
+  AVAILABLE_GPUS=$SLURM_GPUS
+fi
+
+DDP_OFFLINE=${DDP_OFFLINE:-0}
+if [[ "$DDP_OFFLINE" == "1" && "$AVAILABLE_GPUS" -lt 2 ]]; then
+  echo "Requested DDP but only $AVAILABLE_GPUS GPU(s) visible; running single-process."
+  DDP_OFFLINE=0
+fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  DDP_NPROC=${DDP_NPROC:-$AVAILABLE_GPUS}
+  if [[ "$DDP_NPROC" -lt 2 ]]; then
+    DDP_NPROC=2
+  fi
+  export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+  export MASTER_PORT=${MASTER_PORT:-$((20000 + RANDOM % 20000))}
+else
+  DDP_NPROC=1
+fi
+
+echo "Distributed offline DDP = $DDP_OFFLINE (nproc_per_node=$DDP_NPROC)"
+
 # ---------- quick sanity ----------
 $PY - <<'PY' || true
 import sys
@@ -228,32 +327,40 @@ unset PYTHONPATH PYTHONHOME
 TRAIN_LOG=$(mktemp)
 trap 'rm -f "$TRAIN_LOG"' EXIT
 MODEL_FOR_EVAL="$OUTPUT_DIR"
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  echo "Launching in DDP offline mode with $DDP_NPROC processes"
+  LAUNCH_CMD=("$PY" -m torch.distributed.run --standalone --nproc_per_node="$DDP_NPROC")
+else
+  LAUNCH_CMD=("$PY")
+fi
+RUN_CMD=("${LAUNCH_CMD[@]}")
+RUN_CMD+=(
+  "run_distillation.py"
+  "--teacher_model" "Qwen/Qwen3-8B"
+  "--student_model" "${STUDENT_MODEL:-Qwen/Qwen3-0.6B}"
+  "--distill_type" "$DISTILL_TYPE"
+  "--k_percent" "$K_PERCENT"
+  "--datasets" "${DATASETS:-fineweb}"
+  "--fineweb_tokens" "${FINEWEB_TOKENS:-4000000}"
+  "--epochs" "$EPOCHS"
+  "--batch_size" "1"
+  "--gradient_accumulation_steps" "16"
+  "--max_seq_len" "768"
+  "--lr" "1e-5"
+  "--tensorboard_dir" "tb/${DISTILL_TYPE}_experiment"
+  "--output_dir" "$OUTPUT_DIR"
+  "--seed" "${SEED:-1337}"
+)
+if (( ${#RUN_FLAGS[@]} )); then
+  RUN_CMD+=("${RUN_FLAGS[@]}")
+fi
+if (( ${#EXTRA_ARGS[@]} )); then
+  RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
 set +e
-"$PY" run_distillation.py \
-  --teacher_model "Qwen/Qwen3-8B" \
-  --student_model "Qwen/Qwen3-0.6B" \
-  --distill_type "$DISTILL_TYPE" \
-  --k_percent "$K_PERCENT" \
-  --datasets "${DATASETS:-fineweb}" \
-  --fineweb_tokens "${FINEWEB_TOKENS:-4000000}" \
-  --epochs "$EPOCHS" \
-  --batch_size 1 \
-  --gradient_accumulation_steps 32 \
-  --max_seq_len 250 \
-  --lr 1e-5 \
-  --tensorboard_dir "tb/${DISTILL_TYPE}_experiment" \
-  --output_dir "$OUTPUT_DIR" \
-  --seed "${SEED:-1337}" \
-  $(if [[ -n "${NO_OFFLINE+1}" ]]; then echo "--no_offline_cache"; fi) \
-  $(if [[ "${GLS_ENABLED:-0}" == "1" ]]; then echo "--gls_enabled"; fi) \
-  $(if [[ -n "${NO_ELIMINATE_SOFTMAX+1}" ]]; then echo "--no_eliminate_softmax"; fi) \
-  $(if [[ "$DISTILL_TYPE" == "entropy-top-k-with-softmax" ]]; then echo "--no_offline_cache --no_eliminate_softmax"; fi) \
-  $(if [[ "${DETERMINISTIC:-0}" == "1" ]]; then echo "--deterministic"; fi) \
-  $(if [[ "$ANNEAL_FLAG" == "anneal" ]]; then echo "--anneal_kd_temperature"; fi) \
-  $(if [[ -n "${DATASET_CONFIG:-}" ]]; then echo "--dataset_config ${DATASET_CONFIG}"; fi) \
-  $(if [[ -n "${PROMPT_COL:-}" ]]; then echo "--prompt_col ${PROMPT_COL}"; fi) \
-  $(if [[ -n "${ANSWER_COL:-}" ]]; then echo "--answer_col ${ANSWER_COL}"; fi) \
-  "${EXTRA_ARGS[@]}" |& tee "$TRAIN_LOG"
+printf -v RUN_CMD_STR '%q ' "${RUN_CMD[@]}"
+echo "Executing training command: ${RUN_CMD_STR% }"
+"${RUN_CMD[@]}" |& tee "$TRAIN_LOG"
 TRAIN_EXIT=${PIPESTATUS[0]}
 set -e
 
@@ -300,9 +407,12 @@ else
   echo "No eval suite provided → skipping eval submission."
 fi
 
-# Also save a copy of the log with a descriptive filename
+# Also save a copy of the log with a descriptive filename (bucket per autopilot run)
+RUN_LABEL="${AUTOPILOT_RUN_LABEL:-run0000}"
 SAFE_TYPE="$DISTILL_TYPE_DIR"
-RICH_LOG="results/logs/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
+RICH_LOG_DIR="results/logs/${RUN_LABEL}"
+mkdir -p "$RICH_LOG_DIR"
+RICH_LOG="${RICH_LOG_DIR}/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${SLURM_JOB_ID}.log"
 SRC_LOG="logs/train.${SLURM_JOB_ID}.log"
 if [[ -f "$SRC_LOG" ]]; then
   cp -f "$SRC_LOG" "$RICH_LOG" || true

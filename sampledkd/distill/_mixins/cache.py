@@ -19,8 +19,14 @@ class CacheMixin:
 
     def compute_cache_signature(self) -> Dict[str, Any]:
         """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
+        override = getattr(self.config, "_expected_cache_signature", None)
+        if override:
+            return dict(override)
+        teacher_name = getattr(getattr(self.teacher, "config", None), "_name_or_path", None)
+        if teacher_name is None:
+            teacher_name = getattr(self.config, "teacher_model", "unknown")
         return {
-            "teacher_name": getattr(getattr(self.teacher, "config", None), "_name_or_path", "unknown"),
+            "teacher_name": teacher_name,
             "tokenizer_name": getattr(self.tok, "name_or_path", "unknown"),
             "max_seq_len": int(self.config.max_seq_len),
             "entropy_approx_m": int(getattr(self.config, "entropy_approx_m", 12)),

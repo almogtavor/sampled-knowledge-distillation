@@ -10,6 +10,11 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAn
 
 from sampledkd.utils import _bnb_triton_available
 
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6",
+)
+
 
 def _cleanup_cuda(device_idx: int) -> None:
     """Aggressively free caches on the target CUDA device before loading."""
@@ -77,6 +82,7 @@ def load_teacher_8bit_strict(
         llm_int8_enable_fp32_cpu_offload=False,  # critical: keep everything on GPU
     )
 
+    _cleanup_cuda(gpu)
     print(f"[teacher] Loading STRICT 8-bit on cuda:{gpu} (no CPU offload)", flush=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -141,6 +147,8 @@ def load_teacher_8bit_strict_2gpus(
         f"cuda:{g1}": "10GiB",
     }
 
+    _cleanup_cuda(g0)
+    _cleanup_cuda(g1)
     print(f"[teacher] Loading STRICT 8-bit across cuda:{g0},{g1} (no CPU offload)", flush=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -204,6 +212,7 @@ def load_teacher_with_fallback(
         from transformers import BitsAndBytesConfig
         q8 = BitsAndBytesConfig(load_in_8bit=True)
         one = teacher_gpus[0]
+        _cleanup_cuda(one)
         print(f"[teacher] Trying 8-bit quantization on cuda:{one}", flush=True)
         teacher = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -350,12 +359,17 @@ def load_teacher_with_fallback(
         raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
-def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_len: int = 512):
+def load_fineweb_subset(
+    tokenizer,
+    max_tokens: int,
+    seed: int = 1337,
+    max_seq_len: int = 512,
+    packing_enabled: bool = True,
+):
     """
     Load FineWeb-Edu subset with automatic caching.
-    First run: streams, filters, and caches to disk.
-    Subsequent runs: loads from cache instantly.
-    
+    The first run streams data, tokenizes, and caches to disk; later runs reuse the cache.
+
     Returns a list of {prompt, answer} examples.
     """
     from sampledkd.data.cache import load_or_create_fineweb_cache
@@ -366,4 +380,5 @@ def load_fineweb_subset(tokenizer, max_tokens: int, seed: int = 1337, max_seq_le
         max_seq_len=max_seq_len,
         seed=seed,
         batch_size=512,
+        packing_enabled=packing_enabled,
     )
