@@ -92,18 +92,29 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
-    # RS-KD with higher CE weight
     {
         "distill_type": "top-k-tok",
-        "k_percent": 20,
+        "k_percent": 100,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
+            "NO_OFFLINE": "1",
         },
     },
+    # RS-KD with higher CE weight
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 20,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "5000000",
+    #         "ALPHA_CE": "0.3",
+    #     },
+    # },
     # RS-KD no CE
     {
         "distill_type": "top-k-tok",
@@ -114,7 +125,36 @@ CUSTOM_TRAIN_SEQUENCE = [
             "ALPHA_CE": "0.0",
         },
     },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "1.0",
+        },
+    },
     # RS-KD only CE
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.0",
+            "NO_OFFLINE": "1",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.1",
+            "NO_OFFLINE": "1",
+        },
+    },
     {
         "distill_type": "top-k-tok",
         "k_percent": 100,
@@ -133,6 +173,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "NO_OFFLINE": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -144,6 +185,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -155,6 +197,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -166,6 +209,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -177,6 +221,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -188,6 +233,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -201,18 +247,20 @@ CUSTOM_TRAIN_SEQUENCE = [
             "BUCKET_LOWER_PERCENT": "5",
             "BUCKET_UPPER_PERCENT": "20",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
     # TSKD (random 20%)
     {
-        "distill_type": "top-k-tok",
+        "distill_type": "random",
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -224,6 +272,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -237,6 +286,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "GLS_ENABLED": "1",
             "GLS_QUEUE_SIZE": "50000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -249,6 +299,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "GLS_ENABLED": "1",
             "GLS_QUEUE_SIZE": "50000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -261,6 +312,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "GLS_ENABLED": "1",
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -311,6 +363,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -321,6 +374,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -331,6 +385,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -341,6 +396,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -351,6 +407,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -363,17 +420,19 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "BUCKET_LOWER_PERCENT": "5",
             "BUCKET_UPPER_PERCENT": "20",
+            "ALPHA_CE": "0.3",
         },
     },
 
     # Sampled KD (random 20%)
     {
-        "distill_type": "top-k-tok",
+        "distill_type": "random",
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
-            "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
+            "RANDOM_TOKEN_SELECTION": "1",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -384,6 +443,7 @@ CUSTOM_TRAIN_SEQUENCE = [
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 
@@ -395,6 +455,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "GLS_ENABLED": "1",
             "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
 

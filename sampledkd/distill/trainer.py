@@ -949,8 +949,10 @@ class Distiller(
                     kd_loss = loss_rows.mean()
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
-        if True:
-            kd_loss = kd_loss * T2
+        kd_loss = kd_loss * T2
+
+        if self.global_step < 3:  # Only log first few batches
+            print(f"[DEBUG] _forward_batch: kd_loss (after T^2)={kd_loss.item():.6f}, T={T}, T2={T2}", flush=True)
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
@@ -1060,6 +1062,10 @@ class Distiller(
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens among valid positions; optionally global threshold via GLS
             # Select positions FIRST, then compute KL only on selected rows (efficient)
+            if self.global_step < 3:
+                print(f"[DEBUG] top-k-tok START: t_pred shape={t_pred.shape if t_pred is not None else 'None'}, valid_next.sum()={valid_next.sum().item()}", flush=True)
+                if t_pred is not None:
+                    print(f"[DEBUG] t_pred stats: min={t_pred.min().item():.6f}, max={t_pred.max().item():.6f}, mean={t_pred.mean().item():.6f}", flush=True)
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
             normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
@@ -1078,6 +1084,10 @@ class Distiller(
                 sel_topk_count = int(valid_next.sum().item())
             else:
                 ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+                if self.global_step < 3:
+                    print(f"[DEBUG] ent_raw shape={ent_raw.shape}, valid_next.shape={valid_next.shape}", flush=True)
+                    valid_ent = ent_raw[valid_next]
+                    print(f"[DEBUG] ent_raw[valid_next] stats: min={valid_ent.min().item():.6f}, max={valid_ent.max().item():.6f}, mean={valid_ent.mean().item():.6f}, count={valid_ent.numel()}", flush=True)
 
                 if score_enabled:
                     # === Two-stage selection for efficiency ===
@@ -1201,6 +1211,7 @@ class Distiller(
             # Compute KL only on selected positions (efficient)
             rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
             if rows.numel() == 0:
+                print(f"[DEBUG] top-k-tok: keep_mask has NO selected positions! valid_next.sum()={valid_next.sum().item()}", flush=True)
                 kd_loss = t_pred.sum() * 0.0
             else:
                 b_idx, t_idx = rows[:, 0], rows[:, 1]
@@ -1211,7 +1222,10 @@ class Distiller(
                 t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 # Student tensors live on student device; indices are already there
                 s_rows = s_log_probs[b_idx, t_idx, :]
-                kd_loss = self._kl_loss(t_rows, s_rows).mean()
+                kl_per_pos = self._kl_loss(t_rows, s_rows)
+                kd_loss = kl_per_pos.mean()
+                if self.global_step < 3:  # Only log first few batches
+                    print(f"[DEBUG] top-k-tok: selected {rows.size(0)} positions, kl_per_pos stats: min={kl_per_pos.min().item():.6f}, max={kl_per_pos.max().item():.6f}, mean={kd_loss.item():.6f}", flush=True)
             
             # Log selection counters (per batch)
             if self.logger:

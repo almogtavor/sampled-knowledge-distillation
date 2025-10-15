@@ -121,7 +121,7 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Absolute clip value applied to KL improvement rewards before LinUCB updates")
     parser.add_argument("--enable_ce", action="store_true", default=True, 
                         help="Enable cross-entropy loss in addition to KD loss")
-    parser.add_argument("--alpha_ce", type=float, default=0.1,
+    parser.add_argument("--alpha_ce", type=float, default=0.3,
                         help="Weight for cross-entropy loss (vs KD loss). Total loss = (1-alpha_ce)*L_KD + alpha_ce*L_CE")
     parser.add_argument("--datasets", nargs="+", required=True)
     parser.add_argument("--prompt_col", type=str, default=None,
