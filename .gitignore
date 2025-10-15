@@ -245,3 +245,4 @@ evaluation_json_results/
 .nfs*
 pip-*
 *.pid
+data_cache/

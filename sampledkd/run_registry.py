@@ -2,10 +2,10 @@ import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
-# Keys that do NOT affect training semantics and should be excluded from the hash
+# Keys that do NOT affect training semantics and should be excluded from the serialized params
 EXCLUDED_KEYS = {
     # pure logging/output knobs
     "output_dir",
@@ -22,18 +22,29 @@ EXCLUDED_KEYS = {
     "override",
 }
 
+# Extra keys that are ignored for hashing but kept in the stored params blob so we retain
+# launch metadata while deduplicating runs by high-level training semantics.
+HASH_ONLY_EXCLUDED_KEYS = EXCLUDED_KEYS | {
+    "ddp_offline",
+    "ddp_world_size",
+    "ddp_rank",
+    "ddp_local_rank",
+}
+
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 
-def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_params(params: Dict[str, Any], *, excluded_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Return a JSON-serializable dict of parameters filtered/sorted for hashing.
 
-    - Drops EXCLUDED_KEYS
+    - Drops EXCLUDED_KEYS by default (callers can override via excluded_keys)
     - Ensures nested structures are basic Python types
     - Does NOT include timestamps, job IDs, or other runtime-only metadata
     """
+    excludes = EXCLUDED_KEYS if excluded_keys is None else excluded_keys
+
     def _to_basic(x: Any) -> Any:
         if isinstance(x, (str, int, float, type(None), bool)):
             return x
@@ -45,13 +56,13 @@ def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         # Fallback to string representation (stable for enums/literals)
         return str(x)
 
-    filtered = {k: v for k, v in params.items() if k not in EXCLUDED_KEYS}
+    filtered = {k: v for k, v in params.items() if k not in excludes}
     return _to_basic(filtered)
 
 
 def compute_params_hash(params: Dict[str, Any]) -> str:
     """Compute a stable SHA256 hash from the normalized parameters."""
-    norm = normalize_params(params)
+    norm = normalize_params(params, excluded_keys=HASH_ONLY_EXCLUDED_KEYS)
     blob = json.dumps(norm, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 

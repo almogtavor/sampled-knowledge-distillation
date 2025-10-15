@@ -816,16 +816,27 @@ def execute_cache_plan(
         persistent_workers=False,
     )
 
-    cache = build_offline_cache_if_needed(
-        cache=cache,
-        teacher=teacher,
-        tok=tok,
-        dataloader=builder_dl,
-        config=config,
-        teacher_device=teacher_inputs_device,
-        sanitize_logits_fn=sanitize_logits_fn,
-        force_refresh=plan.parallel_cache_build,
+    skip_local_build = (
+        teacher is None
+        and teacher_rank0_only
+        and getattr(config, "ddp_offline", False)
+        and getattr(config, "ddp_rank", 0) != 0
     )
+
+    if not skip_local_build:
+        cache = build_offline_cache_if_needed(
+            cache=cache,
+            teacher=teacher,
+            tok=tok,
+            dataloader=builder_dl,
+            config=config,
+            teacher_device=teacher_inputs_device,
+            sanitize_logits_fn=sanitize_logits_fn,
+            force_refresh=plan.parallel_cache_build,
+        )
+
+    # When skip_local_build==True we rely on rank 0 to populate the cache and the
+    # distributed barrier below to synchronize manifest state across ranks.
 
     cache_manifest_items = len(cache.manifest.get("items", {}))
     cache_ready = expected_items < 0 or cache_manifest_items >= expected_items

@@ -112,11 +112,6 @@ RUN_FLAGS=()
 if [[ "$OFFLINE_CACHE" == "0" ]]; then
   RUN_FLAGS+=(--no_offline_cache)
 fi
-if [[ "$DDP_OFFLINE" == "1" ]]; then
-  RUN_FLAGS+=(--ddp_offline)
-else
-  RUN_FLAGS+=(--no_ddp_offline)
-fi
 
 if [[ "${GLS_ENABLED:-0}" == "1" ]]; then
   RUN_FLAGS+=(--gls_enabled)
@@ -217,6 +212,22 @@ fi
 PY="$VENV_DIR/bin/python"
 echo "Using virtual environment: $VENV_DIR"
 $PY -V || { echo "Venv python missing"; exit 1; }
+
+# Disable torchrun-based DDP on Python 3.12 by default (known segfault via torch.distributed.elastic)
+PY_MINOR_VERSION=$($PY -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  PY_VER_NUM=${PY_MINOR_VERSION//./}
+  if [[ "$PY_VER_NUM" -ge 312 && "${ALLOW_PY312_DDP:-0}" != "1" ]]; then
+    echo "Detected Python $PY_MINOR_VERSION; torch.distributed.run --standalone segfaults on this stack. Falling back to single-process (set ALLOW_PY312_DDP=1 to override)."
+    DDP_OFFLINE=0
+  fi
+fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  RUN_FLAGS+=(--ddp_offline)
+else
+  RUN_FLAGS+=(--no_ddp_offline)
+fi
 
 # ---------- ensure pip exists ----------
 if ! $PY -m pip -V >/dev/null 2>&1; then
