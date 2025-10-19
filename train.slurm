@@ -64,16 +64,35 @@ if [[ -n "${NO_OFFLINE+1}" ]]; then
   OFFLINE_CACHE=0
 fi
 
-# Determine DDP default: follow explicit overrides first, then mirror offline cache state
+# Determine DDP default: disable unless explicitly requested
+if [[ -n "${DDP_OFFLINE+x}" ]]; then
+  _ddp_norm=$(printf '%s' "$DDP_OFFLINE" | tr '[:upper:]' '[:lower:]')
+  case "$_ddp_norm" in
+    1|true|on|yes)
+      DDP_OFFLINE=1
+      ;;
+    0|false|off|no|'')
+      DDP_OFFLINE=0
+      ;;
+    *)
+      DDP_OFFLINE=0
+      ;;
+  esac
+else
+  DDP_OFFLINE=0
+fi
+
 if [[ -n "${NO_DDP_OFFLINE+1}" ]]; then
   DDP_OFFLINE=0
-elif [[ -z "${DDP_OFFLINE+x}" ]]; then
-  if [[ "$OFFLINE_CACHE" == "1" ]]; then
-    DDP_OFFLINE=1
-  else
-    DDP_OFFLINE=0
-  fi
 fi
+
+if [[ "$DDP_OFFLINE" == "1" ]]; then
+  unset NO_DDP_OFFLINE
+else
+  NO_DDP_OFFLINE=${NO_DDP_OFFLINE:-1}
+fi
+
+DDP_OFFLINE=0  # TEMP: force single-process until DDP is re-enabled
 
 EXTRA_ARGS=()
 if [[ "$SCORE_TOKEN_SELECTION" == "1" ]]; then
@@ -159,7 +178,8 @@ export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,expandable_segments:True"
+export KILL_STALE_GPU_PROCS=${KILL_STALE_GPU_PROCS:-1}
 
 # ---------- Weights & Biases ----------
 export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
@@ -259,30 +279,109 @@ fi
 
 # ---------- GPU reorder by free VRAM ----------
 if command -v nvidia-smi >/dev/null 2>&1; then
-  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    IFS=',' read -r -a GPU_SET <<< "$CUDA_VISIBLE_DEVICES"
-    ORDERED=$(for gi in "${GPU_SET[@]}"; do
-      FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gi" 2>/dev/null | head -n1 || echo 0)
-      echo "$FREE:$gi"
-    done | sort -t: -k1,1nr | awk -F: '{print $2}' | paste -sd, -)
-    export CUDA_VISIBLE_DEVICES="$ORDERED"
-  else
-    export CUDA_VISIBLE_DEVICES="$(
-      nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits \
-      | nl -v0 | sort -k2,2nr | awk '{print $1}' | paste -sd, -
-    )"
-  fi
-  echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-  echo "=== GPU VRAM Information ==="
-  IFS=',' read -r -a GPU_ARR <<< "$CUDA_VISIBLE_DEVICES"
-  for gid in "${GPU_ARR[@]}"; do
-    NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$gid" 2>/dev/null || echo "Unknown")
-    FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gid" 2>/dev/null || echo 0)
-    TOTL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$gid" 2>/dev/null || echo 0)
-    USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$gid" 2>/dev/null || echo 0)
-    echo "GPU $gid ($NAME): ${FREE} MiB free / ${TOTL} MiB total (${USED} MiB used)"
+  mapfile -t _GPU_INFO_LINES < <(nvidia-smi --query-gpu=index,memory.free,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)
+  declare -A _GPU_FREE_MB=() _GPU_TOTAL_MB=() _GPU_UTIL=()
+  for _line in "${_GPU_INFO_LINES[@]}"; do
+    [[ -z "$_line" ]] && continue
+    IFS=',' read -r _idx_raw _free_raw _total_raw _util_raw <<< "$_line"
+    _idx=${_idx_raw//[[:space:]]/}
+    _free=${_free_raw//[!0-9]/}
+    _total=${_total_raw//[!0-9]/}
+    _util=${_util_raw//[!0-9]/}
+    [[ -z "$_idx" ]] && continue
+    [[ -z "$_free" ]] && _free=0
+    [[ -z "$_total" ]] && _total=0
+    [[ -z "$_util" ]] && _util=0
+    _GPU_FREE_MB["$_idx"]=$_free
+    _GPU_TOTAL_MB["$_idx"]=$_total
+    _GPU_UTIL["$_idx"]=$_util
   done
-  echo "=============================="
+
+  if [[ ${#_GPU_FREE_MB[@]} -gt 0 ]]; then
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+      IFS=',' read -r -a _GPU_CANDIDATES <<< "$CUDA_VISIBLE_DEVICES"
+    else
+      _GPU_CANDIDATES=(${!_GPU_FREE_MB[@]})
+    fi
+
+    # fallback to one GPU when SLURM does not set GPU count
+    _GPU_NEEDS=1
+    if [[ "${SLURM_GPUS:-}" =~ ^[0-9]+$ && ${SLURM_GPUS} -gt 0 ]]; then
+      _GPU_NEEDS=${SLURM_GPUS}
+    elif [[ "${SLURM_GPUS_ON_NODE:-}" =~ ^[0-9]+$ && ${SLURM_GPUS_ON_NODE} -gt 0 ]]; then
+      _GPU_NEEDS=${SLURM_GPUS_ON_NODE}
+    fi
+
+    mapfile -t _GPU_SORTED <<< "$(
+      for _candidate in "${_GPU_CANDIDATES[@]}"; do
+        _cid=${_candidate//[[:space:]]/}
+        [[ -z "$_cid" ]] && continue
+        _free=${_GPU_FREE_MB["$_cid"]:-0}
+        _util=${_GPU_UTIL["$_cid"]:-999}
+        _total=${_GPU_TOTAL_MB["$_cid"]:-0}
+        printf '%08d:%03d:%s:%08d\n' "$_free" "$_util" "$_cid" "$_total"
+      done | sort -t: -k1,1nr -k2,2n
+    )"
+
+    if (( ${#_GPU_SORTED[@]} > 0 )); then
+      if (( _GPU_NEEDS > ${#_GPU_SORTED[@]} )); then
+        _GPU_NEEDS=${#_GPU_SORTED[@]}
+      fi
+      unset _GPU_SELECTED
+      declare -a _GPU_SELECTED=()
+      for _entry in "${_GPU_SORTED[@]}"; do
+        IFS=':' read -r _free _util _cid _total <<< "$_entry"
+        _GPU_SELECTED+=("$_cid")
+        (( ${#_GPU_SELECTED[@]} >= _GPU_NEEDS )) && break
+      done
+      if (( ${#_GPU_SELECTED[@]} > 0 )); then
+        export CUDA_VISIBLE_DEVICES="$(IFS=','; echo "${_GPU_SELECTED[*]}")"
+      fi
+    fi
+  fi
+
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a _GPU_SELECTED_LIST <<< "$CUDA_VISIBLE_DEVICES"
+    if [[ "$KILL_STALE_GPU_PROCS" == "1" ]]; then
+      for _gid in "${_GPU_SELECTED_LIST[@]}"; do
+        _gid=${_gid//[[:space:]]/}
+        [[ -z "$_gid" ]] && continue
+        mapfile -t _PID_LIST < <(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits -i "$_gid" 2>/dev/null | tr -d '\r' | awk 'BEGIN{FS=","} {gsub(/^[ \t]+|[ \t]+$/, ""); if ($1 ~ /^[0-9]+$/) print $1}')
+        for _pid in "${_PID_LIST[@]}"; do
+          [[ -z "$_pid" ]] && continue
+          _owner=$(ps -o user= -p "$_pid" 2>/dev/null | awk '{print $1}')
+          if [[ "$_owner" == "$USER" ]]; then
+            if kill -0 "$_pid" 2>/dev/null; then
+              echo "Killing stale GPU process $_pid owned by $USER on GPU $_gid"
+              kill "$_pid" 2>/dev/null || true
+              sleep 2
+              if kill -0 "$_pid" 2>/dev/null; then
+                kill -9 "$_pid" 2>/dev/null || true
+              fi
+            fi
+          else
+            [[ -n "$_owner" ]] && echo "GPU $_gid busy with process $_pid (owner=$_owner); leaving it running"
+          fi
+        done
+      done
+      sleep 2
+    fi
+
+    echo "=== GPU Utilization Snapshot ==="
+    for _gid in "${_GPU_SELECTED_LIST[@]}"; do
+      _gid=${_gid//[[:space:]]/}
+      [[ -z "$_gid" ]] && continue
+      NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$_gid" 2>/dev/null || echo "Unknown")
+      FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$_gid" 2>/dev/null || echo 0)
+      TOTL=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$_gid" 2>/dev/null || echo 0)
+      USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$_gid" 2>/dev/null || echo 0)
+      UTIL=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i "$_gid" 2>/dev/null || echo 0)
+      echo "GPU $_gid ($NAME): ${FREE} MiB free / ${TOTL} MiB total (${USED} MiB used, util ${UTIL}%)"
+    done
+    echo "=============================="
+  fi
 fi
 
 AVAILABLE_GPUS=1
@@ -320,6 +419,15 @@ try:
   import torch; print("torch =", torch.__version__, "cuda", getattr(torch.version, "cuda", None))
 except Exception as e:
   print("torch import failed:", e)
+PY
+
+$PY - <<'PY' >/dev/null 2>&1 || true
+try:
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+except Exception:
+    pass
 PY
 
 # ---------- launch ----------

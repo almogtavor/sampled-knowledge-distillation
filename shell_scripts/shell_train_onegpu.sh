@@ -78,7 +78,7 @@ export TORCH_HOME="$TMP/torch";              mkdir -p "$TORCH_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 # ---------- Weights & Biases ----------
 export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}

@@ -10,10 +10,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAn
 
 from sampledkd.utils import _bnb_triton_available
 
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF",
-    "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6",
-)
+# os.environ.setdefault(
+#     "PYTORCH_CUDA_ALLOC_CONF",
+#     "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6",
+# )
 
 
 def _cleanup_cuda(device_idx: int) -> None:
@@ -205,6 +205,8 @@ def load_teacher_with_fallback(
     if not teacher_gpus:
         raise RuntimeError("No GPUs available for teacher after excluding the student GPU.")
 
+    skip_quantization = False
+
     # ===== 1) 8-bit quantization on single GPU =====
     try:
         if not _bnb_triton_available():
@@ -228,135 +230,141 @@ def load_teacher_with_fallback(
         return teacher, tok, torch.device(f"cuda:{one}")
     except Exception as e:
         print(f"[teacher] 8-bit failed: {e}", flush=True)
+        message = str(e).lower()
+        if "expandable_segment" in message or "internal assert" in message:
+            skip_quantization = True
+            print("[teacher] Detected allocator bug during 8-bit load; skipping further 8-bit attempts.", flush=True)
 
     # ===== 1.5) Strict 8-bit on a single GPU (no CPU offload) =====
-    try:
-        teacher, tok, teacher_inputs_device = load_teacher_8bit_strict(
-            model_name=model_name,
-            prefer_gpus=prefer_gpus,
-            student_gpu=student_gpu,
-        )
-        return teacher, tok, teacher_inputs_device
-    except Exception as e:
-        print(f"[teacher] Second variant 8-bit failed: {e}", flush=True)
+    if not skip_quantization:
+        try:
+            teacher, tok, teacher_inputs_device = load_teacher_8bit_strict(
+                model_name=model_name,
+                prefer_gpus=prefer_gpus,
+                student_gpu=student_gpu,
+            )
+            return teacher, tok, teacher_inputs_device
+        except Exception as e:
+            print(f"[teacher] Second variant 8-bit failed: {e}", flush=True)
     
     # ===== 1.6) Strict 8-bit across 2 GPUs =====
-    try:
-        teacher, tok, teacher_inputs_device = load_teacher_8bit_strict_2gpus(
-            model_name=model_name,
-            prefer_gpus=prefer_gpus,
-            student_gpu=student_gpu,
-        )
-        return teacher, tok, teacher_inputs_device
-    except Exception as e:
-        print(f"[teacher] 2-GPU 8-bit failed: {e}", flush=True)
+    if not skip_quantization:
+        try:
+            teacher, tok, teacher_inputs_device = load_teacher_8bit_strict_2gpus(
+                model_name=model_name,
+                prefer_gpus=prefer_gpus,
+                student_gpu=student_gpu,
+            )
+            return teacher, tok, teacher_inputs_device
+        except Exception as e:
+            print(f"[teacher] 2-GPU 8-bit failed: {e}", flush=True)
         
     # ===== 2) Single-GPU FP16 (best performance if it fits) =====
-    try:
-        one = teacher_gpus[0]
-        print(f"[teacher] Clearing CUDA caches on cuda:{one} before FP16 load", flush=True)
-        _cleanup_cuda(one)
-        print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            dtype=torch.float16,             # use 'dtype' (not torch_dtype)
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded on single GPU.", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except RuntimeError as e:
-        if "out of memory" not in str(e).lower():
-            print(f"[teacher] Single-GPU load failed (non-OOM): {e}", flush=True)
-            # continue anyway and try multi-GPU
-        else:
-            print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
+    # try:
+    #     one = teacher_gpus[0]
+    #     print(f"[teacher] Clearing CUDA caches on cuda:{one} before FP16 load", flush=True)
+    #     _cleanup_cuda(one)
+    #     print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
+    #     teacher = AutoModelForCausalLM.from_pretrained(
+    #         model_name,
+    #         device_map={"": one},
+    #         dtype=torch.float16,             # use 'dtype' (not torch_dtype)
+    #         low_cpu_mem_usage=True,
+    #         trust_remote_code=True,
+    #     )
+    #     teacher.eval()
+    #     for p in teacher.parameters():
+    #         p.requires_grad_(False)
+    #     print("[teacher] Loaded on single GPU.", flush=True)
+    #     return teacher, tok, torch.device(f"cuda:{one}")
+    # except RuntimeError as e:
+    #     if "out of memory" not in str(e).lower():
+    #         print(f"[teacher] Single-GPU load failed (non-OOM): {e}", flush=True)
+    #         # continue anyway and try multi-GPU
+    #     else:
+    #         print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
 
-    # ===== 3) Multi-GPU sharding with Accelerate =====
-    if len(teacher_gpus) >= 2:
-        try:
-            print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
+    # # ===== 3) Multi-GPU sharding with Accelerate =====
+    # if len(teacher_gpus) >= 2:
+    #     try:
+    #         print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
 
-            cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-            with init_empty_weights():
-                empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+    #         cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    #         with init_empty_weights():
+    #             empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
 
-            # Use all teacher_gpus with per-GPU caps
-            max_memory = {g: "11GiB" for g in teacher_gpus}
-            max_memory["cpu"] = "40GiB"
+    #         # Use all teacher_gpus with per-GPU caps
+    #         max_memory = {g: "11GiB" for g in teacher_gpus}
+    #         max_memory["cpu"] = "40GiB"
 
-            teacher = load_checkpoint_and_dispatch(
-                empty_model,
-                checkpoint=model_name,
-                device_map="balanced_low_0",
-                max_memory=max_memory,
-                offload_folder=offload_dir,
-                dtype=torch.float16,
-            )
-            teacher.eval()
-            for p in teacher.parameters():
-                p.requires_grad_(False)
+    #         teacher = load_checkpoint_and_dispatch(
+    #             empty_model,
+    #             checkpoint=model_name,
+    #             device_map="balanced_low_0",
+    #             max_memory=max_memory,
+    #             offload_folder=offload_dir,
+    #             dtype=torch.float16,
+    #         )
+    #         teacher.eval()
+    #         for p in teacher.parameters():
+    #             p.requires_grad_(False)
 
-            print(f"[teacher] Multi-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
-            # For model-parallel HF models, feeding inputs on the first teacher GPU is fine:
-            return teacher, tok, torch.device(f"cuda:{teacher_gpus[0]}")
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                print(f"[teacher] Multi-GPU load failed (non-OOM): {e}", flush=True)
-            else:
-                print("[teacher] Multi-GPU OOM, falling back to quantization (you should always start with no quantization or FP16!)...", flush=True)
-        except Exception as e:
-            print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
+    #         print(f"[teacher] Multi-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
+    #         # For model-parallel HF models, feeding inputs on the first teacher GPU is fine:
+    #         return teacher, tok, torch.device(f"cuda:{teacher_gpus[0]}")
+    #     except RuntimeError as e:
+    #         if "out of memory" not in str(e).lower():
+    #             print(f"[teacher] Multi-GPU load failed (non-OOM): {e}", flush=True)
+    #         else:
+    #             print("[teacher] Multi-GPU OOM, falling back to quantization (you should always start with no quantization or FP16!)...", flush=True)
+    #     except Exception as e:
+    #         print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
 
-    # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
-    try:
-        import importlib
-        _torch_ver = getattr(torch, "__version__", "?")
-        try:
-            _triton = importlib.import_module("triton")
-            _triton_ver = getattr(_triton, "__version__", "installed")
-        except Exception:
-            _triton_ver = "not-installed"
-        try:
-            _bnb = importlib.import_module("bitsandbytes")
-            _bnb_ver = getattr(_bnb, "__version__", "installed")
-        except Exception:
-            _bnb_ver = "not-installed"
-        print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
-    except Exception:
-        pass
+    # # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
+    # try:
+    #     import importlib
+    #     _torch_ver = getattr(torch, "__version__", "?")
+    #     try:
+    #         _triton = importlib.import_module("triton")
+    #         _triton_ver = getattr(_triton, "__version__", "installed")
+    #     except Exception:
+    #         _triton_ver = "not-installed"
+    #     try:
+    #         _bnb = importlib.import_module("bitsandbytes")
+    #         _bnb_ver = getattr(_bnb, "__version__", "installed")
+    #     except Exception:
+    #         _bnb_ver = "not-installed"
+    #     print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
+    # except Exception:
+    #     pass
 
-    # ===== 4) 4-bit quantization on single GPU (last resort) =====
-    try:
-        if not _bnb_triton_available():
-            raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
-        from transformers import BitsAndBytesConfig
-        q4 = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        one = teacher_gpus[0]
-        print(f"[teacher] Trying 4-bit quantization (last resort) on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            quantization_config=q4,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded with 4-bit quantization (last resort).", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except Exception as e:
-        raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
+    # # ===== 4) 4-bit quantization on single GPU (last resort) =====
+    # try:
+    #     if not _bnb_triton_available():
+    #         raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
+    #     from transformers import BitsAndBytesConfig
+    #     q4 = BitsAndBytesConfig(
+    #         load_in_4bit=True,
+    #         bnb_4bit_quant_type="nf4",
+    #         bnb_4bit_compute_dtype=torch.float16,
+    #         bnb_4bit_use_double_quant=True,
+    #     )
+    #     one = teacher_gpus[0]
+    #     print(f"[teacher] Trying 4-bit quantization (last resort) on cuda:{one}", flush=True)
+    #     teacher = AutoModelForCausalLM.from_pretrained(
+    #         model_name,
+    #         device_map={"": one},
+    #         quantization_config=q4,
+    #         low_cpu_mem_usage=True,
+    #         trust_remote_code=True,
+    #     )
+    #     teacher.eval()
+    #     for p in teacher.parameters():
+    #         p.requires_grad_(False)
+    #     print("[teacher] Loaded with 4-bit quantization (last resort).", flush=True)
+    #     return teacher, tok, torch.device(f"cuda:{one}")
+    # except Exception as e:
+    #     raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
 
 
 def load_fineweb_subset(

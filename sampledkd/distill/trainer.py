@@ -27,6 +27,12 @@ from ._mixins.kd_core import KDCoreMixin
 from ._mixins.selection_scoring import SelectionScoringMixin
 from ._mixins.rs_vocab import kl_from_vocab_samples
 from .ce_estimators import ce_is_estimator
+from .kd_temperature_schedule import KDTemperatureSchedule
+from .oom_setup_helper import OOMSetupHelper
+from .teacher_forward_helpers import (
+    teacher_forward_logits,
+    teacher_forward_distributed,
+)
 
 
 class Distiller(
@@ -87,63 +93,8 @@ class Distiller(
         self.student_device = student_device
 
         self._wrap_student_for_ddp()
+        OOMSetupHelper.configure(self, config)
 
-        # ===== OOM Reduction: 8-bit optimizer to save ~2-3x memory =====
-        try:
-            from bitsandbytes.optim import Adam8bit
-            self.opt = Adam8bit(self.student.parameters(), lr=config.lr)
-            if self.ddp_rank == 0:
-                print("[OOM-opt] Using 8-bit Adam optimizer to reduce memory.")
-        except Exception:
-            self.opt = AdamW(self.student.parameters(), lr=config.lr)
-            if self.ddp_rank == 0:
-                print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
-
-        self._printed_cache_info = False
-
-        # ===== OOM Reduction: Enable gradient checkpointing on student =====
-        student_base = self._student_base
-        if hasattr(student_base, "gradient_checkpointing_enable"):
-            try:
-                student_base.gradient_checkpointing_enable()
-                if self.ddp_rank == 0:
-                    print("[OOM-opt] Enabled gradient checkpointing on student model.")
-            except Exception as e:
-                if self.ddp_rank == 0:
-                    print(f"[OOM-opt] Could not enable gradient checkpointing: {e}")
-        
-        # ===== OOM Reduction: Enable memory-efficient attention =====
-        try:
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_flash_sdp(True)
-            if self.ddp_rank == 0:
-                print("[OOM-opt] Enabled memory-efficient SDPA backends.")
-        except Exception:
-            pass
-        
-        # Try Flash Attention 2 on student if supported
-        if hasattr(student_base, "config") and hasattr(student_base.config, "use_flash_attention_2"):
-            try:
-                student_base.config.use_flash_attention_2 = True
-                if self.ddp_rank == 0:
-                    print("[OOM-opt] Enabled Flash Attention 2 on student model.")
-            except Exception:
-                pass
-        
-        # ===== OOM Reduction: Mixed precision (AMP) setup =====
-        # Initialize GradScaler for fp16 AMP (disabled for bfloat16 which doesn't need scaling)
-        self._amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        self._use_amp = True
-        if self._amp_dtype == torch.float16:
-            from torch.cuda.amp import GradScaler
-            self._scaler = GradScaler(enabled=True)
-            if self.ddp_rank == 0:
-                print(f"[OOM-opt] Using AMP with {self._amp_dtype} and GradScaler.")
-        else:
-            self._scaler = None
-            if self.ddp_rank == 0:
-                print(f"[OOM-opt] Using AMP with {self._amp_dtype} (no scaler needed).")
-        
         # Logging setup
         self.logger = logger
         self.global_step = 0
@@ -186,55 +137,10 @@ class Distiller(
         return self.student
 
     def _teacher_forward_logits(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
-        if not self.teacher_available:
-            raise RuntimeError("Teacher logits requested but no teacher is available on this rank.")
-        if self.teacher is not None and not self.teacher_rank0_only:
-            from torch.cuda.amp import autocast
-            input_ids_t = input_ids.to(self.teacher_device)
-            attn_t = attn_mask.to(self.teacher_device)
-            with torch.no_grad():
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    logits = self.teacher(
-                        input_ids_t,
-                        attention_mask=attn_t,
-                        output_hidden_states=False,
-                    ).logits
-            return self._sanitize_logits(logits, "teacher")
-        return self._teacher_forward_distributed(input_ids, attn_mask, amp_enabled, amp_dtype)
+        return teacher_forward_logits(self, input_ids, attn_mask, amp_enabled, amp_dtype)
 
     def _teacher_forward_distributed(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
-        if not (self.teacher_rank0_only and self.ddp_enabled and dist.is_initialized()):
-            raise RuntimeError("Distributed teacher forwarding requested without active rank-0 ownership.")
-
-        payload = (input_ids.cpu(), attn_mask.cpu())
-        gather_list = [None] * self.ddp_world_size if self.ddp_rank == 0 else None
-        dist.gather_object(payload, gather_list, dst=0)
-
-        outputs = None
-        if self.ddp_rank == 0:
-            outputs = []
-            from torch.cuda.amp import autocast
-            with torch.no_grad():
-                for ids_cpu, mask_cpu in gather_list:
-                    if ids_cpu is None:
-                        outputs.append(None)
-                        continue
-                    ids = ids_cpu.to(self.teacher_device, non_blocking=True)
-                    mask = mask_cpu.to(self.teacher_device, non_blocking=True)
-                    with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                        logits = self.teacher(
-                            ids,
-                            attention_mask=mask,
-                            output_hidden_states=False,
-                        ).logits
-                    outputs.append(self._sanitize_logits(logits, "teacher").detach().cpu())
-
-        recv = [None]
-        dist.scatter_object_list(recv, outputs if self.ddp_rank == 0 else None, src=0)
-        logits_cpu = recv[0]
-        if logits_cpu is None:
-            raise RuntimeError("Distributed teacher failed to return logits for current rank.")
-        return logits_cpu.to(self.student_device)
+        return teacher_forward_distributed(self, input_ids, attn_mask, amp_enabled, amp_dtype)
 
     def _forward_batch(self, batch):
         # Move inputs
@@ -1542,17 +1448,7 @@ class Distiller(
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)
-
-        def kd_T_at(update_idx: int) -> float:
-            T0 = float(getattr(self.config, "kd_temperature_start", 2.0))
-            T1 = float(getattr(self.config, "kd_temperature_end", 1.0))
-            hold_frac = float(getattr(self.config, "kd_hold_frac", 0.6))
-            hold_u = int(hold_frac * total_updates)
-            if update_idx <= hold_u:
-                return T0
-            tail = max(1, (total_updates - hold_u))
-            pos = (update_idx - hold_u) / tail
-            return T0 + (T1 - T0) * pos
+        kd_schedule = KDTemperatureSchedule(self.config, total_updates)
 
         # Track OOM failures: consecutive and total
         consecutive_oom_failures = 0
@@ -1673,7 +1569,7 @@ class Distiller(
                     self.global_step += 1
                     # Update KD temperature per schedule if enabled
                     if bool(getattr(self.config, "anneal_kd_temperature", False)):
-                        self.config.kd_temperature = kd_T_at(self.global_step)
+                        self.config.kd_temperature = kd_schedule.kd_T_at(self.global_step)
                         # Log the current KD temperature to visualize the annealing schedule
                         if self.logger and rank_is_zero:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)

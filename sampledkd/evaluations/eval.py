@@ -3,6 +3,7 @@ import argparse
 import math
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -12,18 +13,21 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
 from sampledkd.run_registry import compute_params_hash, upsert_eval_results
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 import importlib
+from importlib import import_module
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
 load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TORCH_INFERENCE_MODE", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 if "HF_DATASETS_CACHE" not in os.environ:
     _tmp = os.environ.get("TMPDIR", "/tmp")
     os.environ["HF_DATASETS_CACHE"] = os.path.join(_tmp, "hf_datasets")
@@ -331,6 +335,157 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
         print("No CUDA devices visible, defaulting to CPU (will be slow).")
     return ids
 
+# Map HF model families -> default decoder layer class for FSDP auto-wrapping
+FSDP_LAYER_CLS_BY_MODEL_FAMILY: Dict[str, str] = {
+    "llama": "LlamaDecoderLayer",
+    "mistral": "MistralDecoderLayer",
+    "mixtral": "MixtralDecoderLayer",
+    "qwen2": "Qwen2DecoderLayer",
+    "qwen3": "Qwen3DecoderLayer",
+    "gemma": "GemmaDecoderLayer",
+    "yi": "YiDecoderLayer",
+    "phi": "PhiDecoderLayer",
+    "deepseek": "DeepseekDecoderLayer",
+    "glm": "GLMBlock",
+    "baichuan": "DecoderLayer",
+}
+
+
+def _normalize_family(model_type: str) -> str:
+    """Collapse model_type variants (e.g., qwen2_moe, llama3) into a family key."""
+    match = re.match(r"([a-zA-Z]+)(\d+(?:\.\d+)*)?", model_type)
+    base = match.group(1).lower() if match else model_type.lower()
+    return re.split(r"[_\-.]", base)[0]
+
+
+def _try_dynamic_discovery(model_type: str, cfg: Optional[Any]) -> Optional[str]:
+    """Inspect the modeling module for plausible decoder layer classes."""
+    import torch.nn as nn
+
+    normalized_type = model_type.lower()
+    families = [_normalize_family(normalized_type)]
+    if normalized_type not in families:
+        families.insert(0, normalized_type)
+    candidate_modules = []
+    for key in families:
+        lib = CONFIG_MAPPING_NAMES.get(key) or key
+        candidate_modules.append(f"transformers.models.{lib}.modeling_{lib}")
+    if cfg is not None:
+        cfg_module = getattr(cfg.__class__, "__module__", "")
+        if cfg_module:
+            base_mod = cfg_module.rsplit(".", 1)[0]
+            suffix = base_mod.split(".")[-1]
+            candidate_modules.extend(
+                [
+                    f"{base_mod}.modeling_{suffix}",
+                    f"{base_mod}.modeling",
+                ]
+            )
+    seen: Set[str] = set()
+    for module_name in candidate_modules:
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        try:
+            module = import_module(module_name)
+        except Exception:
+            continue
+        candidates = []
+        for attr in dir(module):
+            if not (attr.endswith("DecoderLayer") or attr.endswith("Block")):
+                continue
+            obj = getattr(module, attr)
+            try:
+                if isinstance(obj, type) and issubclass(obj, nn.Module):
+                    candidates.append(attr)
+            except Exception:
+                continue
+        if not candidates:
+            continue
+        family = _normalize_family(model_type)
+        family_upper = family.upper()
+        preferred = [
+            name
+            for name in candidates
+            if family.capitalize() in name or family.title() in name or family_upper in name
+        ]
+        return preferred[0] if preferred else candidates[0]
+    return None
+
+
+def _try_meta_sniff(cfg: Any) -> Optional[str]:
+    """Instantiate the model without weights and peek at the first decoder block."""
+    try:
+        from transformers.modeling_utils import no_init_weights
+
+        with no_init_weights():
+            model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+    except Exception:
+        return None
+    candidate_paths = [
+        "model.layers",
+        "model.decoder.layers",
+        "transformer.h",
+    ]
+    for chain in candidate_paths:
+        obj = model
+        valid = True
+        for part in chain.split("."):
+            if not hasattr(obj, part):
+                valid = False
+                break
+            obj = getattr(obj, part)
+        if not valid:
+            continue
+        layers = None
+        if isinstance(obj, (list, tuple)) and obj:
+            layers = obj
+        else:
+            try:
+                if len(obj) > 0:
+                    layers = obj
+            except Exception:
+                layers = None
+        if layers:
+            first = layers[0]
+            return first.__class__.__name__
+    return None
+
+
+def detect_fsdp_layer_cls(model_identifier: Union[str, Path]) -> Optional[str]:
+    """Best-effort detection of the transformer block class to wrap when enabling FSDP."""
+    target = str(model_identifier)
+    try:
+        cfg = AutoConfig.from_pretrained(target, trust_remote_code=True)
+    except Exception as exc:
+        print(f"[fsdp] Warning: failed to load config for '{target}': {exc}")
+        return None
+
+    model_type = getattr(cfg, "model_type", None)
+    if not model_type:
+        print(f"[fsdp] Warning: config for '{target}' does not expose model_type.")
+        return None
+
+    model_type_lc = str(model_type).lower()
+    family = _normalize_family(model_type_lc)
+    mapped = FSDP_LAYER_CLS_BY_MODEL_FAMILY.get(family)
+    if mapped:
+        print(f"[fsdp] Using mapped transformer layer '{mapped}' for model_type='{model_type}'.")
+        return mapped
+
+    dynamic = _try_dynamic_discovery(model_type_lc, cfg)
+    if dynamic:
+        print(f"[fsdp] Auto-discovered transformer layer '{dynamic}' for model_type='{model_type}'.")
+        return dynamic
+
+    meta_cls = _try_meta_sniff(cfg)
+    if meta_cls:
+        print(f"[fsdp] Meta-sniffed transformer layer '{meta_cls}' for model_type='{model_type}'.")
+        return meta_cls
+
+    print(f"[fsdp] Warning: could not identify a decoder layer class for model_type='{model_type}'.")
+    return None
+
 # ==========================================================
 #                      SUITE DEFINITIONS
 # ==========================================================
@@ -432,6 +587,9 @@ def run_lmeval_suite(
     load_in_4bit: bool = False,
     device_map: Optional[str] = None,
     share_gpu_pool: bool = False,
+    use_fsdp: bool = False,
+    fsdp_layer_cls: Optional[str] = None,
+    fsdp_policy: str = "full_shard auto_wrap",
 ) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
     """Run the requested LM-Eval suite (light/heavy).
 
@@ -472,6 +630,18 @@ def run_lmeval_suite(
     if not gpu_ids:
         print("[lm-eval] No GPUs detected/selected; skipping suite.")
         return None
+
+    if use_fsdp and (load_in_8bit or load_in_4bit):
+        print("[fsdp] Warning: --use-fsdp cannot be combined with bitsandbytes quantization flags; disabling FSDP for this run.")
+        use_fsdp = False
+
+    if use_fsdp and len(gpu_ids) < 2:
+        print("[fsdp] Warning: fewer than 2 GPUs available; disabling FSDP request.")
+        use_fsdp = False
+
+    if use_fsdp and not share_gpu_pool:
+        print("[fsdp] Enabling GPU pool sharing for FSDP.")
+        share_gpu_pool = True
 
     if share_gpu_pool and len(gpu_ids) > 1:
         print(f"[lm-eval] Treating GPUs {gpu_ids} as a single tensor-parallel pool.")
@@ -529,18 +699,33 @@ def run_lmeval_suite(
     else:
         if model_dtype:
             model_arg_parts.append(f"dtype={model_dtype}")
-    effective_device_map = device_map
-    if not effective_device_map and share_gpu_pool and len(gpu_ids) > 1:
+    effective_device_map = None if use_fsdp else device_map
+    if not effective_device_map and not use_fsdp and share_gpu_pool and len(gpu_ids) > 1:
         effective_device_map = "balanced_low_0"
     if effective_device_map:
         model_arg_parts.append(f"device_map={effective_device_map}")
 
+    entry_prefix = ["lm-eval"]
+    if use_fsdp:
+        entry_prefix = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={len(gpu_ids)}",
+            "--module",
+            "sampledkd.evaluations.lm_eval_entry",
+        ]
+
     base_args = [
-        "lm-eval",
-        "--model", "hf",
-        "--model_args", ",".join(model_arg_parts),
-        "--output_path", str(out_dir),
-        "--include_path", include_path,
+        "--model",
+        "hf",
+        "--model_args",
+        ",".join(model_arg_parts),
+        "--output_path",
+        str(out_dir),
+        "--include_path",
+        include_path,
     ]
     # Enable per-sample logging if supported (helps compute ECE later)
     if _has_log_samples:
@@ -563,7 +748,7 @@ def run_lmeval_suite(
         override_batch: Optional[str] = None,
     ) -> Tuple[List[str], str, bool]:
         nonlocal _warned_no_random_limit, _warned_no_max_batch_flag, _warned_no_generate_max_batch_flag
-        cmd = base_args + ["--tasks", task, "--device", device]
+        cmd = entry_prefix + base_args + ["--tasks", task, "--device", device]
         GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
         is_generate = task in GENERATE_BS1
         batch_value = str(override_batch) if override_batch is not None else (
@@ -630,7 +815,16 @@ def run_lmeval_suite(
             env.setdefault("PYTHONHASHSEED", str(seed))
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             env.setdefault("EVAL_SEED", str(seed))
+            env.setdefault("OMP_NUM_THREADS", "1")
             device = "cuda:0"
+            if use_fsdp:
+                env.setdefault("MASTER_ADDR", "127.0.0.1")
+                env.setdefault("MASTER_PORT", str(20000 + random.randint(0, 20000)))
+                env["SAMPLEDKD_USE_FSDP"] = "1"
+                env["SAMPLEDKD_FSDP_LAYER_CLS"] = fsdp_layer_cls or ""
+                env["SAMPLEDKD_FSDP_DTYPE"] = model_dtype or "float16"
+                env["SAMPLEDKD_FSDP_POLICY"] = fsdp_policy or "full_shard auto_wrap"
+                device = "cuda"
             cmd, bs_used, _ = _task_cmd(task, limit, device)
             start = time.time()
             p = run_async(cmd, env=env)
@@ -1278,6 +1472,12 @@ def main():
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
     parser.add_argument("--lm_eval_share_gpu_pool", action="store_true",
                         help="Treat provided gpu_ids as a single pool per lm-eval subprocess (tensor-parallel sharding for large models).")
+    parser.add_argument("--use-fsdp", "--use_fsdp", dest="use_fsdp", action="store_true",
+                        help="Wrap the evaluation model with PyTorch Fully Sharded Data Parallel (torch.distributed.run).")
+    parser.add_argument("--fsdp_layer_cls", type=str, default=None,
+                        help="Override the transformer layer class to wrap when using FSDP (e.g., 'Qwen3DecoderLayer').")
+    parser.add_argument("--fsdp_policy", type=str, default="full_shard auto_wrap",
+                        help="Value forwarded as fsdp=... in HF model_args when --use-fsdp is set (default: 'full_shard auto_wrap').")
     parser.add_argument("--max_parallel", type=int, default=None,
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
@@ -1445,6 +1645,16 @@ def main():
         print("No models exported. Exiting.")
         sys.exit(1)
 
+    fsdp_layer_cls = args.fsdp_layer_cls
+    if args.use_fsdp and not fsdp_layer_cls:
+        # Prefer the base HF dir if known; otherwise fall back to the resolved model path
+        detect_target: Union[str, Path] = base_model_dir or model_specs[0][1]
+        fsdp_layer_cls = detect_fsdp_layer_cls(detect_target)
+    if args.use_fsdp and fsdp_layer_cls and not args.fsdp_layer_cls:
+        args.fsdp_layer_cls = fsdp_layer_cls
+    if args.use_fsdp and not fsdp_layer_cls:
+        print("[fsdp] Warning: unable to identify a transformer layer class; wrapping the full model may be slower.")
+
     all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     overall_start = time.time()
@@ -1469,6 +1679,9 @@ def main():
             load_in_4bit=args.lm_eval_load_in_4bit,
             device_map=args.lm_eval_device_map,
             share_gpu_pool=args.lm_eval_share_gpu_pool,
+            use_fsdp=args.use_fsdp,
+            fsdp_layer_cls=fsdp_layer_cls,
+            fsdp_policy=args.fsdp_policy,
         )
         lmeval_wall = time.time() - lmeval_start
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
