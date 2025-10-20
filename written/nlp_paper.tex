@@ -498,7 +498,8 @@ Results show non-trivial variance across selection rules, but the strongest TSKD
 
 \begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{fig_pareto_acc_vs_ppl.pdf}
+\resizebox{\columnwidth}{!}{\input{../graphs/fig_pareto_acc_vs_ppl.pgf}}
+% \includegraphics[width=\linewidth]{fig_pareto_acc_vs_ppl.pdf}
 \caption{Accuracy--perplexity trade-off across distillation settings. Token-selective KD (TSKD) achieves the best Pareto frontier, while SampledKD compresses storage at a modest accuracy cost.}
 \label{fig:acc-ppl}
 \end{figure}
