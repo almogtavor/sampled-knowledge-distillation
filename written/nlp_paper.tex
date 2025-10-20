@@ -400,8 +400,8 @@ Additional training hyperparameters are detailed in Appendix~\ref{app:hyperparam
 We have evaluated the GLS policy with a queue size of $30K$ tokens, as reported to be optimal by the experiments of \citet{wang2021selectivekd} (that have been focused on CE-based selection).
 \citep{wang2021selectivekd} have reported $50K$ to be successful too, which we did not test.
 
-Data pipeline. We use a standard concatenate-and-chunk pretraining pipeline: documents are tokenized with an <eos> separator and packed into fixed-length windows (768 tokens).
-We exclude <eos> and the first token after each <eos> from the loss (and KD loss) to avoid modeling cross-document transitions.
+Data pipeline. We use a standard concatenate-and-chunk pretraining pipeline: documents are tokenized with an \texttt{<eos>} separator and packed into fixed-length windows (768 tokens).
+We exclude \texttt{<eos>} and the first token after each \texttt{<eos>} from the loss (and KD loss) to avoid modeling cross-document transitions.
 In a control experiment with boundary masking vs. none, results were indistinguishable within run-to-run variance, while packing substantially reduced padding and wall-clock.
 \section{Main Results}
 \label{sec:main-results}
