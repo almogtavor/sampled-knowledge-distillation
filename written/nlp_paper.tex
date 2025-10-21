@@ -526,22 +526,35 @@ Deterministic top-$K$ or percentile truncation of teacher logits (as in SLIM \ci
 Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
 While they have explored orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
 Trustworthy distillation (\emph{FIRST}) targets calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
+In contrast, \emph{TopKD} \citep{wang2025topkd} emphasizes deterministic Top-$K$ classes via scaling/decoupled objectives, which does not preserve the full-KL gradient in expectation; our class-side estimator remains unbiased while also addressing storage via an offline cache.
 
-\subsection{Token-/word-level selective supervision} Several strands selectively apply supervision at the granularity we target. In NMT, \citet{wang2021selectivekd} select high cross-entropy \emph{words} using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}. In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}. In CoT reasoning, KPOD learns token importance weights and a progressive schedule within rationales \citep{feng2024kpod}.
-Compared to these, TSKD and SampledKD select tokens using teacher-centric uncertainty (entropy and teacher-student KL) and couples selection with unbiased class-level RS-KD at selected positions.
+\subsection{Token-/word-level selective supervision}
+Several strands selectively apply supervision at the granularity we target.
+\citet{wang2021selectivekd} select high cross-entropy words using both batch-local and global FIFO queues (GLS). For LLM post-training, token-level uncertainty-aware learning applies masked MLE on high-uncertainty \emph{tokens} and self-distillation on the remainder to avoid OOD overfitting \citep{liu2025tokenlevel}.
+% In continual KD, token-level cross-entropy is used to quantify when and where to distill \citep{zhang2023continualkd}.
+In CoT reasoning, \emph{KPOD} \citep{feng2024kpod} learns token importance weights and adopts a progressive learning curriculum that schedules the training of tokens from easier to harder ones.
 
-\subsection{Entropy/uncertainty-guided KD} Beyond selection, multiple KD variants weight supervision by uncertainty or entropy.
+\emph{AT-KD (Adaptive Teaching)} \citep{zhong2024atkd} further routes token-level supervision by uncertainty (e.g., skipping target-class KD on easy tokens and emphasizing diversity on hard tokens).
+Compared to these, TSKD hard-selects tokens by teacher-centric uncertainty (entropy or teacher-student KL), skipping KD on low-importance tokens to save compute, and—unlike AT-KD's UnC (off-target mass) \citep{zhong2024atkd}—uses entropy that reflects the full distribution's uncertainty.
+SampledKD then couples position selection with unbiased class-level RS-KD at selected positions and adds a compact offline cache, addressing storage and teacher-query cost not covered by prior token-selective methods.
+
+\subsection{Entropy/uncertainty-guided KD}
+Beyond selection, multiple KD variants weight supervision by uncertainty or entropy.
 Entropy-based adaptive KD (EA-KD) prioritizes \emph{samples} with higher entropy \citep{su2023eakd}, while DE-MKD uses teacher-prediction entropy to weight among multiple teachers \citep{cheng2024demkd}.
 Uncertainty-aware mixup reduces KD cost while maintaining quality \citep{xu2023unix}.
 Recent work also shows entropy-weighted distillation can improve reliability/calibration in classification \citep{guo2024entropykd}.
-Our methods differ in using entropy/KL primarily to decide which tokens receive external-teacher KD, not to reweight losses globally.
+Our methods differ in using entropy/KL primarily to decide which tokens receive external-teacher KD, not to reweight losses globally; they further integrate unbiased class-sampling and caching, complementary to entropy-based weighting across teachers or samples.
 
-% (moved) Entropy approximation subsection relocated before Related Work.
+\subsection{Decoupled objectives}
+Decoupled KD methods (e.g., \emph{DKD} \citep{zhao2022dkd}) separate target and non-target components of the loss to avoid suppressing non-target knowledge. These ideas are largely developed for classification and are orthogonal to our contributions: we focus on \emph{where} to distill along the sequence (token selection) and \emph{how} to obtain unbiased, storage-efficient class supervision (RS-KD with an offline cache), without altering the fundamental KL factorization for autoregressive LMs.
 
-\subsection{Entropy/perplexity for data selection} Selecting \emph{samples} by entropy or perplexity is long-standing in NLP.
+% (moved) Entropy approximation subsection relocated before Related Work).
+
+\subsection{Entropy/perplexity for data selection}
+Selecting \emph{samples} by entropy or perplexity is long-standing in NLP.
 Moore-Lewis cross-entropy difference and follow-ups established perplexity-based domain selection \citep{moore2010cediff,axelrod2015few,axelrod2017cynical}.
 Recent LLM-scale pruning leverages perplexity or loss from small reference models \citep{ankner2024perplexedperplexityperplexitybaseddata} and surveys consolidate techniques \citep{datasel2024survey}.
-% Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}. 
+% Active learning routinely employs entropy/margin sampling \citep{zhang2022alsurvey}.
 Our method is orthogonal: we operate at the token level within sequences and combine selection with unbiased sparse logits.
 
 \section{Limitations and Future Work}
