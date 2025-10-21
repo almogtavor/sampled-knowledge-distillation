@@ -522,7 +522,7 @@ Foundational KD \citep{hinton2015distillation} and encoder-model distillation (e
 More recently, cross-tokenizer distillation has been enabled by Universal Logit Distillation (ULD) \citep{boizard2024uld} and others.
 
 \subsection{Sparse logit KD and calibration}
-Deterministic top-$K$/percentile caching of teacher logits (e.g., SLIM \citep{raman2023slim} and top-$5$ variants) reduces storage but discards tail mass, inducing biased gradients and miscalibrated students.
+Deterministic top-$K$ or percentile truncation of teacher logits (as in SLIM \citep{raman2023slim} and related variants) reduces compute and storage costs but discards tail mass, inducing biased gradient estimates and miscalibrated students.
 Random-Sampling KD \citep{anshumann2025sparse} replaces truncation with importance sampling to provide unbiased gradient estimates and improved calibration.
 While they have explored orthogonal improvements such as CE--KLD mixing and confidence-based reweighting at the loss level, our work targets token-level selection with different confidence metrics.
 Trustworthy distillation (\emph{FIRST}) targets calibration by processing top-$k$ vocabulary tokens with temperature scaling and label smoothing \citep{shum2024first}, whereas we apply entropy/KL-based position selection coupled with RS-KD over classes.
