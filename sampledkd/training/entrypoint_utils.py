@@ -2,18 +2,13 @@ from __future__ import annotations
 
 import gc
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.pytorch_utils import Conv1D
 
 from sampledkd.utils import _bnb_triton_available
-
-# os.environ.setdefault(
-#     "PYTORCH_CUDA_ALLOC_CONF",
-#     "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6",
-# )
 
 
 def _cleanup_cuda(device_idx: int) -> None:
@@ -44,7 +39,7 @@ def _cleanup_cuda(device_idx: int) -> None:
                 pass
     gc.collect()
 
- 
+
 def load_teacher_8bit_strict(
     model_name: str,
     prefer_gpus: List[int],
@@ -52,8 +47,16 @@ def load_teacher_8bit_strict(
 ) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
     """
     Strict 8-bit load on a single GPU, no CPU offload allowed.
-    If it fails, raise – do not fall back to FP16 or CPU.
+    Falls back to an internal FP16→8bit conversion path if the CUDA allocator
+    triggers the known bitsandbytes expandable-segment assertion.
     """
+    if not _bnb_triton_available():
+        raise RuntimeError("bitsandbytes/triton not available; cannot load teacher in 8-bit.")
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6",
+    )
+
     # Environment nudges for bnb + CUDA 11.8 on these nodes
     os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
     ld = os.environ.get("LD_LIBRARY_PATH", "")
@@ -79,18 +82,48 @@ def load_teacher_8bit_strict(
     q8 = BitsAndBytesConfig(
         load_in_8bit=True,
         llm_int8_threshold=6.0,
-        llm_int8_enable_fp32_cpu_offload=False,  # critical: keep everything on GPU
+        llm_int8_enable_fp32_cpu_offload=True,
     )
 
     _cleanup_cuda(gpu)
-    print(f"[teacher] Loading STRICT 8-bit on cuda:{gpu} (no CPU offload)", flush=True)
-    teacher = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=q8,
-        device_map={"": gpu},          # pin every module to this GPU
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
+    print(
+        f"[teacher] Loading STRICT 8-bit on cuda:{gpu} "
+        f"(cpu_offload={q8.llm_int8_enable_fp32_cpu_offload})",
+        flush=True,
     )
+    try:
+        teacher = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=q8,
+            device_map={"": gpu},          # pin every module to this GPU
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        load_mode = "direct-8bit"
+    except Exception as exc:
+        message = str(exc).lower()
+        if "expandable_segment" in message or "cudaalloc" in message or "out of memory" in message:
+            print(
+                "[teacher] Detected allocator failure during direct 8-bit load; "
+                "falling back to FP16→8-bit streaming conversion.",
+                flush=True,
+            )
+            try:
+                teacher = _load_teacher_fp16_then_quantize(
+                    model_name=model_name,
+                    device=torch.device(f"cuda:{gpu}"),
+                    quant_config=q8,
+                )
+                load_mode = "manual-8bit"
+            except Exception as manual_exc:
+                raise RuntimeError(
+                    f"Manual 8-bit conversion failed on cuda:{gpu}. Model={model_name}."
+                ) from manual_exc
+        else:
+            raise RuntimeError(
+                f"Strict 8-bit teacher load failed on cuda:{gpu}. Model={model_name}."
+            ) from exc
+
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -102,59 +135,114 @@ def load_teacher_8bit_strict(
         if bad:
             raise RuntimeError(f"Unexpected CPU/offloaded modules in device_map: {bad}")
 
-    print("[teacher] 8-bit loaded on single 2080 Ti with no CPU offload.", flush=True)
+    print(f"[teacher] Teacher load completed via {load_mode}.", flush=True)
     return teacher, tok, torch.device(f"cuda:{gpu}")
 
 
-def load_teacher_8bit_strict_2gpus(
+def _convert_linear_module_to_int8(
+    module: torch.nn.Module,
+    quant_config: BitsAndBytesConfig,
+    quant_device: torch.device,
+) -> torch.nn.Module:
+    import bitsandbytes as bnb
+
+    has_fp16_weights = quant_config.llm_int8_has_fp16_weight
+    threshold = quant_config.llm_int8_threshold
+
+    if isinstance(module, torch.nn.Linear):
+        in_features = module.in_features
+        out_features = module.out_features
+        weight = module.weight.detach()
+    elif isinstance(module, Conv1D):
+        # Conv1D stores weights as (in_features, out_features)
+        in_features = module.weight.shape[0]
+        out_features = module.weight.shape[1]
+        weight = module.weight.detach().t()
+    else:
+        raise TypeError(f"Unsupported module type for int8 conversion: {type(module)}")
+
+    new_layer = bnb.nn.Linear8bitLt(
+        in_features,
+        out_features,
+        module.bias is not None,
+        has_fp16_weights=has_fp16_weights,
+        threshold=threshold,
+        device=quant_device,
+    )
+
+    quant_weight = weight.to(device=quant_device, dtype=torch.float32, non_blocking=True)
+    new_layer.weight = bnb.nn.Int8Params(
+        quant_weight,
+        requires_grad=False,
+        has_fp16_weights=has_fp16_weights,
+    )
+    if module.bias is not None:
+        bias = module.bias.detach().to(device=quant_device, dtype=torch.float32, non_blocking=True)
+        new_layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+    new_layer.requires_grad_(False)
+
+    # Explicit cleanup to avoid holding onto the original tensors.
+    del weight
+    del quant_weight
+    if module.bias is not None:
+        del bias
+    return new_layer
+
+
+def _convert_modules_to_int8_inplace(
+    module: torch.nn.Module,
+    quant_config: BitsAndBytesConfig,
+    quant_device: torch.device,
+    staging_device: torch.device,
+    prefix: str = "",
+    skip_modules: Optional[Sequence[str]] = None,
+) -> None:
+    skip_modules = skip_modules or ()
+    for name, child in list(module.named_children()):
+        child_prefix = f"{prefix}.{name}" if prefix else name
+        should_skip = any(
+            child_prefix == skip_name or child_prefix.startswith(f"{skip_name}.") for skip_name in skip_modules
+        )
+        if should_skip:
+            continue
+
+        if isinstance(child, (torch.nn.Linear, Conv1D)):
+            converted = _convert_linear_module_to_int8(child, quant_config, quant_device)
+            if staging_device != quant_device:
+                try:
+                    converted = converted.to(staging_device)
+                except Exception as move_exc:
+                    print(
+                        f"[teacher] Warning: failed to move quantized module {child_prefix} to "
+                        f"{staging_device}; keeping on {quant_device}. Error: {move_exc}",
+                        flush=True,
+                    )
+            module._modules[name] = converted
+            del child
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            _convert_modules_to_int8_inplace(
+                child,
+                quant_config=quant_config,
+                quant_device=quant_device,
+                staging_device=staging_device,
+                prefix=child_prefix,
+                skip_modules=skip_modules,
+            )
+
+
+def _load_teacher_fp16_then_quantize(
     model_name: str,
-    prefer_gpus: List[int],
-    student_gpu: Optional[int],
-) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
-    """
-    Strict 8-bit load sharded across two GPUs, no CPU offload.
-    """
-    # Env nudges
-    os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
-    ld = os.environ.get("LD_LIBRARY_PATH", "")
-    if "/usr/local/cuda/lib64" not in ld:
-        os.environ["LD_LIBRARY_PATH"] = ld + (":" if ld else "") + "/usr/local/cuda/lib64"
-    os.environ.setdefault("BNB_CUDA_VERSION", "118")
-
-    teacher_gpus = [g for g in prefer_gpus if g != student_gpu]
-    if len(teacher_gpus) < 2:
-        raise RuntimeError("Need at least two GPUs for strict 2-GPU 8-bit sharding.")
-    g0, g1 = teacher_gpus[:2]
-
-    tok = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,
-        trust_remote_code=True,
-        local_files_only=False,
-    )
-    if tok.pad_token_id is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token
-
-    q8 = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_enable_fp32_cpu_offload=False,
-    )
-
-    # Important: only give max_memory for the two GPUs; do not mention CPU
-    max_memory = {
-        f"cuda:{g0}": "10GiB",
-        f"cuda:{g1}": "10GiB",
-    }
-
-    _cleanup_cuda(g0)
-    _cleanup_cuda(g1)
-    print(f"[teacher] Loading STRICT 8-bit across cuda:{g0},{g1} (no CPU offload)", flush=True)
+    device: torch.device,
+    quant_config: BitsAndBytesConfig,
+) -> torch.nn.Module:
+    _cleanup_cuda(device.index if device.type == "cuda" else 0)
+    print("[teacher] Loading FP16 weights on CPU before manual 8-bit conversion...", flush=True)
     teacher = AutoModelForCausalLM.from_pretrained(
         model_name,
-        quantization_config=q8,
-        device_map="balanced_low_0",       # spread layers across listed GPUs
-        max_memory=max_memory,             # constrain to these GPUs only
+        torch_dtype=torch.float16,
+        device_map={"": "cpu"},
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
@@ -162,209 +250,76 @@ def load_teacher_8bit_strict_2gpus(
     for p in teacher.parameters():
         p.requires_grad_(False)
 
-    devmap = getattr(teacher, "hf_device_map", None)
-    if isinstance(devmap, dict):
-        bad = [k for k, v in devmap.items() if isinstance(v, str) and ("cpu" in v or "disk" in v)]
-        if bad:
-            raise RuntimeError(f"Unexpected CPU/offloaded modules in device_map: {bad}")
+    skip = {"lm_head"}
+    if quant_config.llm_int8_skip_modules is not None:
+        skip.update(quant_config.llm_int8_skip_modules)
 
-    print(f"[teacher] 8-bit sharded. Device map: {devmap}", flush=True)
-    # Use the first teacher GPU for feeding inputs
-    return teacher, tok, torch.device(f"cuda:{g0}")
+    quant_device = device if device.type == "cuda" else torch.device("cpu")
+    staging_device = quant_device
+
+    _convert_modules_to_int8_inplace(
+        teacher,
+        quant_config=quant_config,
+        quant_device=quant_device,
+        staging_device=staging_device,
+        skip_modules=tuple(skip),
+    )
+
+    print(f"[teacher] Moving remaining non-int8 parameters to {device}...", flush=True)
+    _move_non_int8_to_device(teacher, device)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return teacher
 
 
+def _move_non_int8_to_device(module: torch.nn.Module, device: torch.device) -> None:
+    import bitsandbytes as bnb
+
+    for child in module.children():
+        if isinstance(child, bnb.nn.Linear8bitLt):
+            continue
+        _move_non_int8_to_device(child, device)
+
+    for name, param in list(module._parameters.items()):
+        if param is None:
+            continue
+        if isinstance(param, bnb.nn.Int8Params):
+            continue
+        if param.device == device:
+            continue
+        new_param = torch.nn.Parameter(
+            param.detach().to(device=device, non_blocking=True),
+            requires_grad=param.requires_grad,
+        )
+        module._parameters[name] = new_param
+
+    for name, buf in list(module._buffers.items()):
+        if buf is None:
+            continue
+        if buf.device == device:
+            continue
+        module._buffers[name] = buf.detach().to(device=device, non_blocking=True)
 def load_teacher_with_fallback(
     model_name: str,
     prefer_gpus: List[int],          # Local GPU indices to use for the teacher, in order of preference
     student_gpu: Optional[int],      # Local GPU index reserved for the student (exclude from teacher)
 ) -> Tuple[torch.nn.Module, AutoTokenizer, torch.device]:
     """
-    1) Try single-GPU FP16 on prefer_gpus[0]
-    2) If OOM, try 2-GPU sharding across prefer_gpus[0:2] (excluding student_gpu)
-    3) If still OOM, try 8-bit on single GPU
-    4) If still OOM, try 4-bit on single GPU
+    Load teacher strictly in 8-bit on a single GPU (with CPU offload when possible).
     Returns: (teacher_model, tokenizer, teacher_device_for_inputs)
     """
-    # Helper: make a local offload/cache dir (per job if SLURM), prefer node-local TMPDIR
-    tmpdir = os.environ.get("TMPDIR", "/home/joberant/NLP_2425b/almogt/ekd/tmp")
-    offload_dir = os.path.join(tmpdir, "hf_offload_teacher")
-    os.makedirs(offload_dir, exist_ok=True)
-
-    # Tokenizer first (slow & local to avoid cluster hiccups)
-    tok = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,
-        trust_remote_code=True,
-        local_files_only=False,   # set True if your cache is complete
-    )
-    if tok.pad_token_id is None and tok.eos_token is not None:
-        tok.pad_token = tok.eos_token
-
-    # Filter teacher GPUs (exclude student's GPU if present)
-    teacher_gpus = [g for g in prefer_gpus if g != student_gpu]
-    if not teacher_gpus:
-        raise RuntimeError("No GPUs available for teacher after excluding the student GPU.")
-
-    skip_quantization = False
-
-    # ===== 1) 8-bit quantization on single GPU =====
     try:
-        if not _bnb_triton_available():
-            raise RuntimeError("bitsandbytes/triton not available; skipping 8-bit fallback")
-        from transformers import BitsAndBytesConfig
-        q8 = BitsAndBytesConfig(load_in_8bit=True)
-        one = teacher_gpus[0]
-        _cleanup_cuda(one)
-        print(f"[teacher] Trying 8-bit quantization on cuda:{one}", flush=True)
-        teacher = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map={"": one},
-            quantization_config=q8,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
+        return load_teacher_8bit_strict(
+            model_name=model_name,
+            prefer_gpus=prefer_gpus,
+            student_gpu=student_gpu,
         )
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        print("[teacher] Loaded 8-bit.", flush=True)
-        return teacher, tok, torch.device(f"cuda:{one}")
-    except Exception as e:
-        print(f"[teacher] 8-bit failed: {e}", flush=True)
-        message = str(e).lower()
-        if "expandable_segment" in message or "internal assert" in message:
-            skip_quantization = True
-            print("[teacher] Detected allocator bug during 8-bit load; skipping further 8-bit attempts.", flush=True)
-
-    # ===== 1.5) Strict 8-bit on a single GPU (no CPU offload) =====
-    if not skip_quantization:
-        try:
-            teacher, tok, teacher_inputs_device = load_teacher_8bit_strict(
-                model_name=model_name,
-                prefer_gpus=prefer_gpus,
-                student_gpu=student_gpu,
-            )
-            return teacher, tok, teacher_inputs_device
-        except Exception as e:
-            print(f"[teacher] Second variant 8-bit failed: {e}", flush=True)
-    
-    # ===== 1.6) Strict 8-bit across 2 GPUs =====
-    if not skip_quantization:
-        try:
-            teacher, tok, teacher_inputs_device = load_teacher_8bit_strict_2gpus(
-                model_name=model_name,
-                prefer_gpus=prefer_gpus,
-                student_gpu=student_gpu,
-            )
-            return teacher, tok, teacher_inputs_device
-        except Exception as e:
-            print(f"[teacher] 2-GPU 8-bit failed: {e}", flush=True)
-        
-    # ===== 2) Single-GPU FP16 (best performance if it fits) =====
-    # try:
-    #     one = teacher_gpus[0]
-    #     print(f"[teacher] Clearing CUDA caches on cuda:{one} before FP16 load", flush=True)
-    #     _cleanup_cuda(one)
-    #     print(f"[teacher] Trying single-GPU FP16 on cuda:{one}", flush=True)
-    #     teacher = AutoModelForCausalLM.from_pretrained(
-    #         model_name,
-    #         device_map={"": one},
-    #         dtype=torch.float16,             # use 'dtype' (not torch_dtype)
-    #         low_cpu_mem_usage=True,
-    #         trust_remote_code=True,
-    #     )
-    #     teacher.eval()
-    #     for p in teacher.parameters():
-    #         p.requires_grad_(False)
-    #     print("[teacher] Loaded on single GPU.", flush=True)
-    #     return teacher, tok, torch.device(f"cuda:{one}")
-    # except RuntimeError as e:
-    #     if "out of memory" not in str(e).lower():
-    #         print(f"[teacher] Single-GPU load failed (non-OOM): {e}", flush=True)
-    #         # continue anyway and try multi-GPU
-    #     else:
-    #         print("[teacher] Single-GPU OOM, trying 2-GPU sharding...", flush=True)
-
-    # # ===== 3) Multi-GPU sharding with Accelerate =====
-    # if len(teacher_gpus) >= 2:
-    #     try:
-    #         print(f"[teacher] Trying multi-GPU sharding on {len(teacher_gpus)} GPUs: {teacher_gpus}", flush=True)
-
-    #         cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    #         with init_empty_weights():
-    #             empty_model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
-
-    #         # Use all teacher_gpus with per-GPU caps
-    #         max_memory = {g: "11GiB" for g in teacher_gpus}
-    #         max_memory["cpu"] = "40GiB"
-
-    #         teacher = load_checkpoint_and_dispatch(
-    #             empty_model,
-    #             checkpoint=model_name,
-    #             device_map="balanced_low_0",
-    #             max_memory=max_memory,
-    #             offload_folder=offload_dir,
-    #             dtype=torch.float16,
-    #         )
-    #         teacher.eval()
-    #         for p in teacher.parameters():
-    #             p.requires_grad_(False)
-
-    #         print(f"[teacher] Multi-GPU sharding done. Device map: {getattr(teacher, 'hf_device_map', None)}", flush=True)
-    #         # For model-parallel HF models, feeding inputs on the first teacher GPU is fine:
-    #         return teacher, tok, torch.device(f"cuda:{teacher_gpus[0]}")
-    #     except RuntimeError as e:
-    #         if "out of memory" not in str(e).lower():
-    #             print(f"[teacher] Multi-GPU load failed (non-OOM): {e}", flush=True)
-    #         else:
-    #             print("[teacher] Multi-GPU OOM, falling back to quantization (you should always start with no quantization or FP16!)...", flush=True)
-    #     except Exception as e:
-    #         print(f"[teacher] Multi-GPU dispatch error: {e}", flush=True)
-
-    # # Optional: print one-shot diagnostics so logs show why quantization was/wasn't attempted
-    # try:
-    #     import importlib
-    #     _torch_ver = getattr(torch, "__version__", "?")
-    #     try:
-    #         _triton = importlib.import_module("triton")
-    #         _triton_ver = getattr(_triton, "__version__", "installed")
-    #     except Exception:
-    #         _triton_ver = "not-installed"
-    #     try:
-    #         _bnb = importlib.import_module("bitsandbytes")
-    #         _bnb_ver = getattr(_bnb, "__version__", "installed")
-    #     except Exception:
-    #         _bnb_ver = "not-installed"
-    #     print(f"[teacher] Quant backends → available={_bnb_triton_available()} torch={_torch_ver} triton={_triton_ver} bitsandbytes={_bnb_ver}", flush=True)
-    # except Exception:
-    #     pass
-
-    # # ===== 4) 4-bit quantization on single GPU (last resort) =====
-    # try:
-    #     if not _bnb_triton_available():
-    #         raise RuntimeError("bitsandbytes/triton not available; skipping 4-bit fallback")
-    #     from transformers import BitsAndBytesConfig
-    #     q4 = BitsAndBytesConfig(
-    #         load_in_4bit=True,
-    #         bnb_4bit_quant_type="nf4",
-    #         bnb_4bit_compute_dtype=torch.float16,
-    #         bnb_4bit_use_double_quant=True,
-    #     )
-    #     one = teacher_gpus[0]
-    #     print(f"[teacher] Trying 4-bit quantization (last resort) on cuda:{one}", flush=True)
-    #     teacher = AutoModelForCausalLM.from_pretrained(
-    #         model_name,
-    #         device_map={"": one},
-    #         quantization_config=q4,
-    #         low_cpu_mem_usage=True,
-    #         trust_remote_code=True,
-    #     )
-    #     teacher.eval()
-    #     for p in teacher.parameters():
-    #         p.requires_grad_(False)
-    #     print("[teacher] Loaded with 4-bit quantization (last resort).", flush=True)
-    #     return teacher, tok, torch.device(f"cuda:{one}")
-    # except Exception as e:
-    #     raise RuntimeError(f"[teacher] All GPU strategies failed. Last error: {e}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Teacher 8-bit load failed on GPUs {prefer_gpus} (student GPU={student_gpu})."
+        ) from exc
 
 
 def load_fineweb_subset(
@@ -381,7 +336,7 @@ def load_fineweb_subset(
     Returns a list of {prompt, answer} examples.
     """
     from sampledkd.data.cache import load_or_create_fineweb_cache
-    
+
     return load_or_create_fineweb_cache(
         tokenizer=tokenizer,
         max_tokens=max_tokens,
