@@ -3,6 +3,7 @@ import argparse
 import math
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -12,18 +13,21 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union, Set
 from sampledkd.run_registry import compute_params_hash, upsert_eval_results
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ConfigDict
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoConfig
 import importlib
+from importlib import import_module
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
 load_dotenv()
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TORCH_INFERENCE_MODE", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 if "HF_DATASETS_CACHE" not in os.environ:
     _tmp = os.environ.get("TMPDIR", "/tmp")
     os.environ["HF_DATASETS_CACHE"] = os.path.join(_tmp, "hf_datasets")
@@ -331,6 +335,157 @@ def pick_gpu_pool(max_workers: Optional[int] = None) -> List[int]:
         print("No CUDA devices visible, defaulting to CPU (will be slow).")
     return ids
 
+# Map HF model families -> default decoder layer class for FSDP auto-wrapping
+FSDP_LAYER_CLS_BY_MODEL_FAMILY: Dict[str, str] = {
+    "llama": "LlamaDecoderLayer",
+    "mistral": "MistralDecoderLayer",
+    "mixtral": "MixtralDecoderLayer",
+    "qwen2": "Qwen2DecoderLayer",
+    "qwen3": "Qwen3DecoderLayer",
+    "gemma": "GemmaDecoderLayer",
+    "yi": "YiDecoderLayer",
+    "phi": "PhiDecoderLayer",
+    "deepseek": "DeepseekDecoderLayer",
+    "glm": "GLMBlock",
+    "baichuan": "DecoderLayer",
+}
+
+
+def _normalize_family(model_type: str) -> str:
+    """Collapse model_type variants (e.g., qwen2_moe, llama3) into a family key."""
+    match = re.match(r"([a-zA-Z]+)(\d+(?:\.\d+)*)?", model_type)
+    base = match.group(1).lower() if match else model_type.lower()
+    return re.split(r"[_\-.]", base)[0]
+
+
+def _try_dynamic_discovery(model_type: str, cfg: Optional[Any]) -> Optional[str]:
+    """Inspect the modeling module for plausible decoder layer classes."""
+    import torch.nn as nn
+
+    normalized_type = model_type.lower()
+    families = [_normalize_family(normalized_type)]
+    if normalized_type not in families:
+        families.insert(0, normalized_type)
+    candidate_modules = []
+    for key in families:
+        lib = CONFIG_MAPPING_NAMES.get(key) or key
+        candidate_modules.append(f"transformers.models.{lib}.modeling_{lib}")
+    if cfg is not None:
+        cfg_module = getattr(cfg.__class__, "__module__", "")
+        if cfg_module:
+            base_mod = cfg_module.rsplit(".", 1)[0]
+            suffix = base_mod.split(".")[-1]
+            candidate_modules.extend(
+                [
+                    f"{base_mod}.modeling_{suffix}",
+                    f"{base_mod}.modeling",
+                ]
+            )
+    seen: Set[str] = set()
+    for module_name in candidate_modules:
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        try:
+            module = import_module(module_name)
+        except Exception:
+            continue
+        candidates = []
+        for attr in dir(module):
+            if not (attr.endswith("DecoderLayer") or attr.endswith("Block")):
+                continue
+            obj = getattr(module, attr)
+            try:
+                if isinstance(obj, type) and issubclass(obj, nn.Module):
+                    candidates.append(attr)
+            except Exception:
+                continue
+        if not candidates:
+            continue
+        family = _normalize_family(model_type)
+        family_upper = family.upper()
+        preferred = [
+            name
+            for name in candidates
+            if family.capitalize() in name or family.title() in name or family_upper in name
+        ]
+        return preferred[0] if preferred else candidates[0]
+    return None
+
+
+def _try_meta_sniff(cfg: Any) -> Optional[str]:
+    """Instantiate the model without weights and peek at the first decoder block."""
+    try:
+        from transformers.modeling_utils import no_init_weights
+
+        with no_init_weights():
+            model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+    except Exception:
+        return None
+    candidate_paths = [
+        "model.layers",
+        "model.decoder.layers",
+        "transformer.h",
+    ]
+    for chain in candidate_paths:
+        obj = model
+        valid = True
+        for part in chain.split("."):
+            if not hasattr(obj, part):
+                valid = False
+                break
+            obj = getattr(obj, part)
+        if not valid:
+            continue
+        layers = None
+        if isinstance(obj, (list, tuple)) and obj:
+            layers = obj
+        else:
+            try:
+                if len(obj) > 0:
+                    layers = obj
+            except Exception:
+                layers = None
+        if layers:
+            first = layers[0]
+            return first.__class__.__name__
+    return None
+
+
+def detect_fsdp_layer_cls(model_identifier: Union[str, Path]) -> Optional[str]:
+    """Best-effort detection of the transformer block class to wrap when enabling FSDP."""
+    target = str(model_identifier)
+    try:
+        cfg = AutoConfig.from_pretrained(target, trust_remote_code=True)
+    except Exception as exc:
+        print(f"[fsdp] Warning: failed to load config for '{target}': {exc}")
+        return None
+
+    model_type = getattr(cfg, "model_type", None)
+    if not model_type:
+        print(f"[fsdp] Warning: config for '{target}' does not expose model_type.")
+        return None
+
+    model_type_lc = str(model_type).lower()
+    family = _normalize_family(model_type_lc)
+    mapped = FSDP_LAYER_CLS_BY_MODEL_FAMILY.get(family)
+    if mapped:
+        print(f"[fsdp] Using mapped transformer layer '{mapped}' for model_type='{model_type}'.")
+        return mapped
+
+    dynamic = _try_dynamic_discovery(model_type_lc, cfg)
+    if dynamic:
+        print(f"[fsdp] Auto-discovered transformer layer '{dynamic}' for model_type='{model_type}'.")
+        return dynamic
+
+    meta_cls = _try_meta_sniff(cfg)
+    if meta_cls:
+        print(f"[fsdp] Meta-sniffed transformer layer '{meta_cls}' for model_type='{model_type}'.")
+        return meta_cls
+
+    print(f"[fsdp] Warning: could not identify a decoder layer class for model_type='{model_type}'.")
+    return None
+
 # ==========================================================
 #                      SUITE DEFINITIONS
 # ==========================================================
@@ -350,7 +505,7 @@ LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     # ("arc_challenge", None),
-    # ("arc_easy", None),
+    ("arc_easy", None),
     # exact-match
     # ("aime25", None),
     # ("ifeval", None)
@@ -422,8 +577,24 @@ def run_lmeval_suite(
     results_dir: Path,
     gpu_ids: List[int],
     suite: str,
+    batch_size: str = "auto",
+    generate_batch_size: str = "1",
+    max_batch_size: int = 0,
+    generate_max_batch_size: int = 4,
+    fallback_batch_size: int = 1,
+    model_dtype: str = "float16",
+    load_in_8bit: bool = False,
+    load_in_4bit: bool = False,
+    device_map: Optional[str] = None,
+    share_gpu_pool: bool = False,
+    use_fsdp: bool = False,
+    fsdp_layer_cls: Optional[str] = None,
+    fsdp_policy: str = "full_shard auto_wrap",
 ) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
-    """Run the requested LM-Eval suite (light/heavy). Executes one task per GPU in waves."""
+    """Run the requested LM-Eval suite (light/heavy).
+
+    Executes tasks across GPUs in waves; when share_gpu_pool is True, a single task uses the full pool.
+    """
     out_dir = results_dir / f"lmeval_{suite}_{tag}"
     ensure_dir(out_dir)
 
@@ -460,6 +631,21 @@ def run_lmeval_suite(
         print("[lm-eval] No GPUs detected/selected; skipping suite.")
         return None
 
+    if use_fsdp and (load_in_8bit or load_in_4bit):
+        print("[fsdp] Warning: --use-fsdp cannot be combined with bitsandbytes quantization flags; disabling FSDP for this run.")
+        use_fsdp = False
+
+    if use_fsdp and len(gpu_ids) < 2:
+        print("[fsdp] Warning: fewer than 2 GPUs available; disabling FSDP request.")
+        use_fsdp = False
+
+    if use_fsdp and not share_gpu_pool:
+        print("[fsdp] Enabling GPU pool sharing for FSDP.")
+        share_gpu_pool = True
+
+    if share_gpu_pool and len(gpu_ids) > 1:
+        print(f"[lm-eval] Treating GPUs {gpu_ids} as a single tensor-parallel pool.")
+
     # preflight: load task registry to filter unknown tasks (but allow external include_path)
     try:
         from lm_eval import tasks as _tasks_mod  # type: ignore
@@ -481,12 +667,65 @@ def run_lmeval_suite(
     # Per-sample logging (needed for ECE)
     _has_log_samples = _help_code == 0 and ("--log_samples" in _help_out)
 
+    def _detect_flag(help_blob: str, *candidates: str) -> Optional[str]:
+        if help_blob is None:
+            return None
+        for cand in candidates:
+            if cand in help_blob:
+                return cand
+        return None
+
+    _max_batch_flag = _detect_flag(_help_out, "--max_batch_size", "--max-batch-size")
+    _generate_max_batch_flag = _detect_flag(
+        _help_out,
+        "--generate_max_batch_size",
+        "--generate-max-batch-size",
+    )
+
+    default_batch_size = str(batch_size)
+    default_generate_batch_size = str(generate_batch_size)
+    effective_max_batch_size = max(0, int(max_batch_size))
+    effective_generate_max_batch_size = max(0, int(generate_max_batch_size))
+    effective_fallback_batch_size = max(0, int(fallback_batch_size))
+
+    model_arg_parts = [
+        f"pretrained={model_dir}",
+        "trust_remote_code=True",
+    ]
+    if load_in_4bit:
+        model_arg_parts.append("load_in_4bit=True")
+    elif load_in_8bit:
+        model_arg_parts.append("load_in_8bit=True")
+    else:
+        if model_dtype:
+            model_arg_parts.append(f"dtype={model_dtype}")
+    effective_device_map = None if use_fsdp else device_map
+    if not effective_device_map and not use_fsdp and share_gpu_pool and len(gpu_ids) > 1:
+        effective_device_map = "balanced_low_0"
+    if effective_device_map:
+        model_arg_parts.append(f"device_map={effective_device_map}")
+
+    entry_prefix = ["lm-eval"]
+    if use_fsdp:
+        entry_prefix = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            f"--nproc_per_node={len(gpu_ids)}",
+            "--module",
+            "sampledkd.evaluations.lm_eval_entry",
+        ]
+
     base_args = [
-        "lm-eval",
-        "--model", "hf",
-        "--model_args", f"pretrained={model_dir},trust_remote_code=True,dtype=float16",
-        "--output_path", str(out_dir),
-        "--include_path", include_path,
+        "--model",
+        "hf",
+        "--model_args",
+        ",".join(model_arg_parts),
+        "--output_path",
+        str(out_dir),
+        "--include_path",
+        include_path,
     ]
     # Enable per-sample logging if supported (helps compute ECE later)
     if _has_log_samples:
@@ -499,16 +738,39 @@ def run_lmeval_suite(
         base_args += ["--fewshot-seed", str(seed)]
 
     _warned_no_random_limit = False
+    _warned_no_max_batch_flag = False
+    _warned_no_generate_max_batch_flag = False
 
-    def _task_cmd(task: str, limit: Optional[int], device: str) -> List[str]:
-        nonlocal _warned_no_random_limit
-        cmd = base_args + ["--tasks", task, "--device", device]
-        # Some generate_until tasks stall when probing batch_size=auto; force bs=1
+    def _task_cmd(
+        task: str,
+        limit: Optional[int],
+        device: str,
+        override_batch: Optional[str] = None,
+    ) -> Tuple[List[str], str, bool]:
+        nonlocal _warned_no_random_limit, _warned_no_max_batch_flag, _warned_no_generate_max_batch_flag
+        cmd = entry_prefix + base_args + ["--tasks", task, "--device", device]
         GENERATE_BS1 = {"gsm8k", "svamp", "aime25"}
-        if task in GENERATE_BS1:
-            cmd += ["--batch_size", "1"]
-        else:
-            cmd += ["--batch_size", "auto"]
+        is_generate = task in GENERATE_BS1
+        batch_value = str(override_batch) if override_batch is not None else (
+            default_generate_batch_size if is_generate else default_batch_size
+        )
+        cmd += ["--batch_size", batch_value]
+        target_max = effective_generate_max_batch_size if is_generate else effective_max_batch_size
+        if target_max > 0:
+            flag = None
+            if is_generate and _generate_max_batch_flag:
+                flag = _generate_max_batch_flag
+            elif _max_batch_flag:
+                flag = _max_batch_flag
+            if flag:
+                cmd += [flag, str(target_max)]
+            else:
+                if is_generate and not _warned_no_generate_max_batch_flag:
+                    print("[lm-eval] Warning: CLI lacks a generate max batch size flag; skipping cap.")
+                    _warned_no_generate_max_batch_flag = True
+                elif not is_generate and not _warned_no_max_batch_flag:
+                    print("[lm-eval] Warning: CLI lacks a max batch size flag; skipping cap.")
+                    _warned_no_max_batch_flag = True
         if isinstance(limit, (int, float)):
             cmd += ["--limit", str(limit)]
             # Prefer randomized subset selection when supported by this lm-eval version
@@ -520,22 +782,31 @@ def run_lmeval_suite(
                 if not _warned_no_random_limit:
                     print("[lm-eval] Warning: CLI lacks a random subset flag; using first-N for --limit.")
                     _warned_no_random_limit = True
-        return cmd
+        return cmd, batch_value, is_generate
 
     # Parallel across physical GPUs (mask each process to one GPU)
     task_status: Dict[str, str] = {}
     task_durations: Dict[str, float] = {}
     good_any = False
     i = 0
+    shared_gpu_env = ",".join(str(x) for x in gpu_ids)
     while i < len(tasks_with_limits):
         procs = []
-        wave = tasks_with_limits[i : i + len(gpu_ids)]
+        if share_gpu_pool:
+            wave = tasks_with_limits[i : i + 1]
+            gpu_assignments = [shared_gpu_env]
+        else:
+            wave = tasks_with_limits[i : i + len(gpu_ids)]
+            gpu_assignments = [str(g) for g in gpu_ids[: len(wave)]]
         wave_names = [t for (t, _) in wave]
         timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
-        for (task, limit), gid in zip(wave, gpu_ids):
+        if share_gpu_pool:
+            print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on shared GPUs {shared_gpu_env}")
+        else:
+            print(f"[{timestamp}] [lm-eval] Launching wave: {wave_names} on GPUs {gpu_ids}")
+        for (task, limit), gpu_assignment in zip(wave, gpu_assignments):
             env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gid)  # inside, cuda:0 maps to this physical GPU
+            env["CUDA_VISIBLE_DEVICES"] = gpu_assignment  # inside, cuda:0 maps within this pool
             py_path_parts = [include_path, repo_root]
             if env.get("PYTHONPATH"):
                 py_path_parts.append(env["PYTHONPATH"])
@@ -544,17 +815,49 @@ def run_lmeval_suite(
             env.setdefault("PYTHONHASHSEED", str(seed))
             env.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
             env.setdefault("EVAL_SEED", str(seed))
-            cmd = _task_cmd(task, limit, "cuda:0")
+            env.setdefault("OMP_NUM_THREADS", "1")
+            device = "cuda:0"
+            if use_fsdp:
+                env.setdefault("MASTER_ADDR", "127.0.0.1")
+                env.setdefault("MASTER_PORT", str(20000 + random.randint(0, 20000)))
+                env["SAMPLEDKD_USE_FSDP"] = "1"
+                env["SAMPLEDKD_FSDP_LAYER_CLS"] = fsdp_layer_cls or ""
+                env["SAMPLEDKD_FSDP_DTYPE"] = model_dtype or "float16"
+                env["SAMPLEDKD_FSDP_POLICY"] = fsdp_policy or "full_shard auto_wrap"
+                device = "cuda"
+            cmd, bs_used, _ = _task_cmd(task, limit, device)
             start = time.time()
             p = run_async(cmd, env=env)
             timeout = TASK_TIMEOUTS.get(task, 3600)
-            procs.append((task, p, timeout, start))
-        for task, p, to, start in procs:
+            procs.append((task, p, timeout, start, env, limit, device, bs_used))
+        for task, p, to, start, env, limit, device, bs_used in procs:
             rc, out = wait_with_timeout(p, timeout=to)
             duration = max(0.0, time.time() - start)
+            fallback_used = False
+            if (
+                rc not in (0, 124)
+                and effective_fallback_batch_size > 0
+                and "auto" in str(bs_used).lower()
+            ):
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Retrying {task} with fallback batch size {effective_fallback_batch_size} after failure at batch_size={bs_used}"
+                )
+                fallback_cmd, fb_batch, _ = _task_cmd(
+                    task,
+                    limit,
+                    device,
+                    override_batch=str(effective_fallback_batch_size),
+                )
+                fb_start = time.time()
+                p_fb = run_async(fallback_cmd, env=env)
+                rc, out = wait_with_timeout(p_fb, timeout=to)
+                duration += max(0.0, time.time() - fb_start)
+                bs_used = fb_batch
+                fallback_used = True
             timestamp = datetime.now().strftime("%H:%M:%S")
             if rc == 0:
-                print(f"[{timestamp}] ✅ Task {task} completed successfully in {duration:.1f}s")
+                status_suffix = " (fallback)" if fallback_used else ""
+                print(f"[{timestamp}] ✅ Task {task} completed successfully in {duration:.1f}s{status_suffix}")
                 task_status[task] = "ok"
                 good_any = True
             elif rc == 124:
@@ -564,7 +867,7 @@ def run_lmeval_suite(
                 print(f"[{timestamp}] ❌ Task {task} failed with code {rc} in {duration:.1f}s")
                 task_status[task] = f"failed:{rc}"
             task_durations[task] = duration
-        i += len(gpu_ids)
+        i += len(wave)
     return out_dir if good_any else None, task_status, task_durations
 
 # ---------- ECE (Expected Calibration Error) from LM-Eval samples ----------
@@ -616,23 +919,65 @@ def _parse_sample_line_for_mc(line: Dict[str, Any]) -> Optional[Tuple[List[float
     Returns list of scores (higher is better, e.g., log-likelihoods) and gold index.
     Returns None if the line does not look like a multiple-choice sample with usable data.
     """
-    # Try common fields for label index
-    gold_idx = None
-    for k in ("label", "gold_idx", "gold_index"):
-        if isinstance(line.get(k), int):
-            gold_idx = int(line[k])
+
+    def _maybe_int(value: Any) -> Optional[int]:
+        if isinstance(value, int):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    def _maybe_score(entry: Any) -> Optional[float]:
+        if isinstance(entry, (int, float)):
+            return float(entry)
+        if isinstance(entry, str):
+            try:
+                return float(entry)
+            except ValueError:
+                return None
+        if isinstance(entry, dict):
+            for key in ("loglikelihood", "logprob", "score", "value"):
+                if key in entry:
+                    val = _maybe_score(entry[key])
+                    if val is not None:
+                        return val
+        if isinstance(entry, list) and entry:
+            for item in entry:
+                val = _maybe_score(item)
+                if val is not None:
+                    return val
+        return None
+
+    # Try common fields for label index, including modern lm-eval layouts
+    gold_idx: Optional[int] = None
+    for k in ("label", "gold_idx", "gold_index", "target"):
+        cand = _maybe_int(line.get(k))
+        if cand is not None:
+            gold_idx = cand
             break
     if gold_idx is None:
+        doc = line.get("doc")
+        if isinstance(doc, dict):
+            for k in ("label", "gold", "gold_idx"):
+                cand = _maybe_int(doc.get(k))
+                if cand is not None:
+                    gold_idx = cand
+                    break
+    if gold_idx is None:
         # Some tasks log gold as letter (A/B/C/D)
-        gold = line.get("gold") or line.get("answer")
+        gold = line.get("gold") or line.get("answer") or (line.get("doc") or {}).get("gold")
         if isinstance(gold, str) and len(gold) == 1 and gold in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
             gold_idx = ord(gold) - ord('A')
+
     # Collect choice scores
     scores: Optional[List[float]] = None
-    # Direct list of numbers
-    if isinstance(line.get("choice_scores"), list) and all(isinstance(x, (int, float)) for x in line["choice_scores"]):
-        scores = [float(x) for x in line["choice_scores"]]
-    # Choices as list of dicts with score-like fields
+    raw_choice_scores = line.get("choice_scores")
+    if isinstance(raw_choice_scores, list) and all(isinstance(x, (int, float)) for x in raw_choice_scores):
+        scores = [float(x) for x in raw_choice_scores]
+
     if scores is None and isinstance(line.get("choices"), list) and line["choices"]:
         cand_keys = ("loglikelihood", "logprob", "score")
         first = line["choices"][0]
@@ -641,6 +986,23 @@ def _parse_sample_line_for_mc(line: Dict[str, Any]) -> Optional[Tuple[List[float
                 if k in first and all(isinstance(c.get(k), (int, float)) for c in line["choices"]):
                     scores = [float(c[k]) for c in line["choices"]]
                     break
+
+    if scores is None:
+        # Modern lm-eval emits nested lists under filtered_resps/resps with stringified scores
+        for resp_key in ("filtered_resps", "resps"):
+            resp_blob = line.get(resp_key)
+            if isinstance(resp_blob, list) and resp_blob:
+                extracted: List[float] = []
+                for entry in resp_blob:
+                    val = _maybe_score(entry)
+                    if val is None:
+                        extracted = []
+                        break
+                    extracted.append(float(val))
+                if extracted:
+                    scores = extracted
+                    break
+
     if scores is None or gold_idx is None:
         return None
     if not (0 <= gold_idx < len(scores)):
@@ -672,6 +1034,13 @@ def collect_ece_from_lmeval_samples(lmeval_dir: Optional[Path], bins: int = 15) 
             stem = stem[: -len("_samples")]
         if stem.endswith(".samples"):
             stem = stem[: -len(".samples")]
+        if stem.startswith("samples_"):
+            stem = stem[len("samples_") :]
+        # Drop trailing ISO-like timestamps that lm-eval appends after the task name
+        if "_" in stem:
+            prefix, suffix = stem.rsplit("_", 1)
+            if suffix.startswith("20") and "T" in suffix:
+                stem = prefix
         # If there is a normalization variant like ",none", trim to base task
         if "," in stem:
             stem = stem.split(",", 1)[0]
@@ -1101,6 +1470,14 @@ def main():
     # Parallel/GPU controls
     parser.add_argument("--gpu_ids", type=str, default=None,
                         help="Comma-separated physical GPU ids for parallel lm-eval (e.g., '0,1,2'). Defaults to visible GPUs.")
+    parser.add_argument("--lm_eval_share_gpu_pool", action="store_true",
+                        help="Treat provided gpu_ids as a single pool per lm-eval subprocess (tensor-parallel sharding for large models).")
+    parser.add_argument("--use-fsdp", "--use_fsdp", dest="use_fsdp", action="store_true",
+                        help="Wrap the evaluation model with PyTorch Fully Sharded Data Parallel (torch.distributed.run).")
+    parser.add_argument("--fsdp_layer_cls", type=str, default=None,
+                        help="Override the transformer layer class to wrap when using FSDP (e.g., 'Qwen3DecoderLayer').")
+    parser.add_argument("--fsdp_policy", type=str, default="full_shard auto_wrap",
+                        help="Value forwarded as fsdp=... in HF model_args when --use-fsdp is set (default: 'full_shard auto_wrap').")
     parser.add_argument("--max_parallel", type=int, default=None,
                         help="Cap the number of parallel lm-eval workers (<= number of provided GPUs).")
     parser.add_argument("--work_dir", type=str, default="eval_runs")
@@ -1120,8 +1497,65 @@ def main():
                         help="Evaluation suite to run: 'light' (quick) or 'heavy' (paper).")
     # Source override: treat positional model arg as HF hub ID
     parser.add_argument("--from_hf", action="store_true", help="Interpret 'model' as a HF hub ID even if it is not a local path.")
+    # LM-Eval batching controls
+    parser.add_argument(
+        "--lm_eval_batch_size",
+        type=str,
+        default="auto",
+        help="Default batch size passed to lm-eval (--batch_size). Use 'auto' to probe GPU capacity.",
+    )
+    parser.add_argument(
+        "--lm_eval_generate_batch_size",
+        type=str,
+        default="1",
+        help="Batch size for long-form generation tasks (gsm8k, svamp, aime25).",
+    )
+    parser.add_argument(
+        "--lm_eval_max_batch_size",
+        type=int,
+        default=0,
+        help="Cap auto-detected batch sizes when lm-eval supports --max_batch_size (0 disables the cap).",
+    )
+    parser.add_argument(
+        "--lm_eval_generate_max_batch_size",
+        type=int,
+        default=4,
+        help="Cap auto-detected batch sizes on generation tasks when supported (0 disables the cap).",
+    )
+    parser.add_argument(
+        "--lm_eval_fallback_batch_size",
+        type=int,
+        default=1,
+        help="Fallback batch size to retry with if an auto batch run fails or times out.",
+    )
+    parser.add_argument(
+        "--lm_eval_model_dtype",
+        type=str,
+        default="float16",
+        help="Torch dtype passed to HF model_args when not loading quantized weights.",
+    )
+    parser.add_argument(
+        "--lm_eval_load_in_8bit",
+        action="store_true",
+        help="Load the evaluation model in 8-bit using bitsandbytes (reduces VRAM).",
+    )
+    parser.add_argument(
+        "--lm_eval_load_in_4bit",
+        action="store_true",
+        help="Load the evaluation model in 4-bit using bitsandbytes (minimizes VRAM).",
+    )
+    parser.add_argument(
+        "--lm_eval_device_map",
+        type=str,
+        default=None,
+        help="Optional device_map string to forward to HF model_args (e.g., 'auto', 'balanced_low_0').",
+    )
     # No vanilla/ekd distinction; one model at a time
     args = parser.parse_args()
+
+    if args.lm_eval_load_in_8bit and args.lm_eval_load_in_4bit:
+        print("Error: --lm_eval_load_in_8bit and --lm_eval_load_in_4bit are mutually exclusive.")
+        sys.exit(2)
     
     # Print all CLI parameters at startup
     print("=" * 80)
@@ -1148,6 +1582,9 @@ def main():
         gpu_pool = visible_gpu_ids()
     if args.max_parallel is not None and args.max_parallel > 0:
         gpu_pool = gpu_pool[: args.max_parallel]
+    if args.lm_eval_share_gpu_pool and len(gpu_pool) < 2:
+        print("[gpu] Warning: --lm_eval_share_gpu_pool requested but fewer than 2 GPUs available; running without sharding.")
+        args.lm_eval_share_gpu_pool = False
     print(f"[gpu] Using GPUs: {gpu_pool}" if gpu_pool else "[gpu] No GPUs detected/selected.")
 
     # Resolve the single model dir to evaluate
@@ -1208,6 +1645,16 @@ def main():
         print("No models exported. Exiting.")
         sys.exit(1)
 
+    fsdp_layer_cls = args.fsdp_layer_cls
+    if args.use_fsdp and not fsdp_layer_cls:
+        # Prefer the base HF dir if known; otherwise fall back to the resolved model path
+        detect_target: Union[str, Path] = base_model_dir or model_specs[0][1]
+        fsdp_layer_cls = detect_fsdp_layer_cls(detect_target)
+    if args.use_fsdp and fsdp_layer_cls and not args.fsdp_layer_cls:
+        args.fsdp_layer_cls = fsdp_layer_cls
+    if args.use_fsdp and not fsdp_layer_cls:
+        print("[fsdp] Warning: unable to identify a transformer layer class; wrapping the full model may be slower.")
+
     all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     overall_start = time.time()
@@ -1222,6 +1669,19 @@ def main():
             results_dir=results_dir,
             gpu_ids=gpu_pool,
             suite=args.suite,
+            batch_size=args.lm_eval_batch_size,
+            generate_batch_size=args.lm_eval_generate_batch_size,
+            max_batch_size=args.lm_eval_max_batch_size,
+            generate_max_batch_size=args.lm_eval_generate_max_batch_size,
+            fallback_batch_size=args.lm_eval_fallback_batch_size,
+            model_dtype=args.lm_eval_model_dtype,
+            load_in_8bit=args.lm_eval_load_in_8bit,
+            load_in_4bit=args.lm_eval_load_in_4bit,
+            device_map=args.lm_eval_device_map,
+            share_gpu_pool=args.lm_eval_share_gpu_pool,
+            use_fsdp=args.use_fsdp,
+            fsdp_layer_cls=fsdp_layer_cls,
+            fsdp_policy=args.fsdp_policy,
         )
         lmeval_wall = time.time() - lmeval_start
         lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
@@ -1372,7 +1832,16 @@ def main():
                     params_blob = params_candidate.get("params") or params_candidate
                     if isinstance(params_candidate.get("id"), str):
                         params_hash = params_candidate["id"]
-                        upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+                        upsert_eval_results(
+                            Path(args.runs_registry),
+                            params_hash,
+                            args.suite,
+                            merged,
+                            averages,
+                            task_status,
+                            model_path=model_path_str,
+                            calibration=calibration,
+                        )
                         raise StopIteration
             else:
                 # Preferred: run_params.json saved by training
@@ -1385,7 +1854,16 @@ def main():
                             # If file already contains id, prefer to trust it
                             if isinstance(rp_blob.get("id"), str):
                                 params_hash = rp_blob["id"]
-                                upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+                                upsert_eval_results(
+                                    Path(args.runs_registry),
+                                    params_hash,
+                                    args.suite,
+                                    merged,
+                                    averages,
+                                    task_status,
+                                    model_path=model_path_str,
+                                    calibration=calibration,
+                                )
                                 raise StopIteration  # already upserted; skip remainder
                     except Exception:
                         pass
@@ -1420,7 +1898,16 @@ def main():
                 # As a last resort, attach an empty dict so the call still produces a stable id from empty params
                 params_blob = {}
             params_hash = compute_params_hash(params_blob)
-            upsert_eval_results(Path(args.runs_registry), params_hash, args.suite, merged, averages, task_status, model_path=model_path_str)
+            upsert_eval_results(
+                Path(args.runs_registry),
+                params_hash,
+                args.suite,
+                merged,
+                averages,
+                task_status,
+                model_path=model_path_str,
+                calibration=calibration,
+            )
         except StopIteration:
             pass
         except Exception as e:

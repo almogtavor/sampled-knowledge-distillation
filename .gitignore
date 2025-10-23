@@ -238,8 +238,11 @@ logits_caches/
 # LaTeX code snippets
 tex.code-snippets
 results/
+results/.autopilot_serial
 .github/copilot-instructions.md
 evals/
 evaluation_json_results/
 .nfs*
 pip-*
+*.pid
+data_cache/

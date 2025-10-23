@@ -167,8 +167,14 @@ cd /home/joberant/NLP_2425b/YOUR_USER/ekd/
 
 ### 3. Create virtual environment:
 ```bash
-python3.10 -m venv --without-pip fastenv310
-source ./fastenv310/bin/activate
+python3.10 -m venv --without-pip venv
+source ./venv/bin/activate
+```
+
+For future sessions just run:
+
+```bash
+source ./venv/bin/activate
 ```
 
 ### 4. Install dependencies:
@@ -196,26 +202,57 @@ rsync -avz --progress ./ YOUR_USER@c-001.cs.tau.ac.il:/home/joberant/NLP_2425b/Y
 watch -n 5 'rsync -avz ./ YOUR_USER@c-001.cs.tau.ac.il:/home/joberant/NLP_2425b/YOUR_USER/ekd/'
 ```
 
-## 🏃 Training Commands
+## 🏃 Cluster Workflows
 
-### Submit Top K tokens training:
+### Automation (recommended)
+
+Keep a small pool of jobs running without babysitting by using the orchestration loop in `tools/runs_autopilot.py`. It inspects `results/runs.json`, respects concurrency caps, and submits `train.slurm`/`evals.slurm` jobs for unfinished configs.
+
 ```bash
-sbatch train.slurm top-k-tok
+python tools/runs_autopilot.py --max-train 3 --max-eval 2 --interval 600 --tag april25
 ```
 
-### Submit Vanilla training:
+- Console output is tee'd to `logs/autopilot.log`, and a small state file is stored at `results/automation_state.json`.
+- The default behaviour is to walk through `CUSTOM_TRAIN_SEQUENCE` inside the script. Edit that list for the combos you care about, or pass `--allow-registry-fallback` to let it pick runs straight from the registry backlog.
+- Every job gets a `KD_SWEEP_TAG` derived from `--tag` plus the run serial, so checkpoints collect under `results/kd_<tag>-runXXXX_out/`.
+- Add `--dry-run --once` if you want to inspect the plan without submitting.
+
+### Manual sbatch training
+
 ```bash
-sbatch train.slurm vanilla
+sbatch train.slurm <distill_type> <k_percent> [light|heavy] [KD_SWEEP_TAG] [epochs] [anneal_flag]
 ```
 
-### Monitor training (replace `<jobid>` with actual job ID):
+- Example:
+  ```bash
+  sbatch train.slurm top-k-tok 20 light april25
+  ```
+- Omit the third argument (or pass an empty string) to skip auto-evaluation; passing `light` or `heavy` queues `evals.slurm` after a successful train.
+- `KD_SWEEP_TAG` names the output bucket (e.g. `april25` → `results/kd_april25_out/`).
+- Override knobs through environment variables: `sbatch --export=ALL,NO_OFFLINE=1,ALPHA_CE=0.3 train.slurm top-k-tok 20 light mytag`.
+- `run_distillation.py` updates `results/runs.json`; if an identical config is already marked trained the job exits early (code 10) and no eval is re-submitted.
+- Training logs live at `logs/train.<jobid>.log` and the full run artefacts are copied to `results/logs/<run_label>/`.
+
+Monitor active jobs with:
+
 ```bash
 tail -f logs/train.<jobid>.log
+squeue -u $USER
 ```
 
-### Check job status:
+Common one-liners:
+
 ```bash
-squeue -u YOUR_USER
+sbatch train.slurm top-k-tok 20 light oct25
+sbatch --export=ALL,NO_OFFLINE=1,ALPHA_CE=0.3 train.slurm top-k-tok 20 "" oct25
+```
+
+### Housekeeping
+
+```bash
+scancel -u $USER
+tail -f $(ls -t logs/train.*.log | head -1)
+nvidia-smi
 ```
 
 ## 📊 TensorBoard Monitoring
@@ -228,92 +265,57 @@ tensorboard --logdir tb --port 6006 --bind_all &
 ### View in browser:
 Open: http://localhost:6006
 
-## 🛠️ Useful Commands
-
-### Kill all jobs:
-```bash
-scancel -u YOUR_USER
-```
-
-### View latest log automatically:
-```bash
-tail -f $(ls -t logs/train.*.log | head -1)
-```
-
-### Check GPU usage:
-```bash
-nvidia-smi
-```
-
 ## 📋 Quick Workflow
 
 1. **Sync code**: `rsync -avz --progress ./ YOUR_USER@c-001.cs.tau.ac.il:/home/joberant/NLP_2425b/YOUR_USER/ekd/`
-2. **Submit job**: `sbatch train.slurm ekd`
-3. **Monitor**: `tail -f $(ls -t logs/train.*.log | head -1)`
-4. **View metrics**: http://localhost:6006
+2. **Launch jobs**:
+   - `python tools/runs_autopilot.py --max-train 3 --max-eval 2 --interval 600 --tag <tag>` (recommended), or
+   - `sbatch train.slurm top-k-tok 20 light <tag>` for a single run.
+3. **Monitor**: `squeue -u $USER` and `tail -f logs/train.<jobid>.log`
+4. **Inspect metrics**: open TensorBoard on http://localhost:6006
 
 ## 🧪 Model Evaluation
 
-### Submit evaluation job:
+`train.slurm` already submits `evals.slurm` when you pass `light` or `heavy`, but you can launch or repeat evaluations manually.
+
+### Slurm (preferred)
+
 ```bash
-./submit_eval.sh ekd <CHECKPOINT_NAME> light
+sbatch evals.slurm <MODEL_PATH> <light|heavy> [from_hf|from_path] [OUTPUT_DIR] [extra args...]
 ```
 
-**Examples:**
-```bash
-# Evaluate specific checkpoint
-./submit_eval.sh ekd checkpoint_epoch1_step4527.pt light
+- Typical calls:
+  ```bash
+  sbatch evals.slurm results/kd_april25_out/models/model_12345_20240422_2359_top_k_tok_k20 light
+  sbatch evals.slurm results/kd_april25_out/models/model_12345_20240422_2359_top_k_tok_k20 heavy
+  sbatch evals.slurm kd_top_k_tok_run_out_models/model_2617 light from_hf
+  ```
+- `MODEL_PATH` accepts HF repo IDs, local HF exports, or raw `.pt` checkpoints (auto-exported to a temporary HF directory).
+- Include `from_hf` when the first argument is a Hub ID; omit it for local paths.
+- Outputs default to `evaluation_json_results/`, and logs are streamed to `eval_runs/<model>.<jobid>.<suite>.log`.
+- For a quick retry with automatic GPU fallbacks you can still call `./submit_eval.sh <MODEL_PATH> <light|heavy>`, but `evals.slurm` is the canonical entrypoint.
 
-# Evaluate final model (model.safetensors)
-./submit_eval.sh ekd model.safetensors light
+### Direct Python (rare)
+
+```bash
+python -m sampledkd.evaluations.eval <MODEL_PATH> --suite light --work_dir eval_runs --output_dir evaluation_json_results
 ```
 
-### Monitor evaluation:
-```bash
-# Check job status
-squeue -u YOUR_USER
+Examples (only when you need to bypass Slurm for debugging):
 
-# View evaluation logs
+```bash
+python -m sampledkd.evaluations.eval results/kd_april25_out/models/model_12345_20240422_2359_top_k_tok_k20 --suite light
+python -m sampledkd.evaluations.eval kd_top_k_tok_run_out_models/model_2617 --suite heavy --from_hf
+```
+
+### Monitoring
+
+```bash
 tail -f logs/eval.<jobid>.log
+squeue -u $USER
 ```
 
-### Available checkpoints:
-- Check saved checkpoints: `ls -la kd_ekd_run_out_model/checkpoints/`
-- Final trained model: `kd_ekd_run_out_model/model.safetensors`
-
-### Evaluation details:
-## 🧪 Model Evaluation
-
-### Submit evaluation job (HF dir or checkpoint)
-
-The evaluator now accepts a single model path:
-- HF model directory (preferred), e.g. `kd_top_k_tok_run_out_models/model_2617`
-- or a `.pt` checkpoint, which will be exported automatically to a temporary HF directory
-
-```bash
-# SLURM (recommended)
-sbatch evals.slurm <MODEL_PATH> <SUITE: light|heavy>
-
-# Direct (if you already have an env active)
-python -m sampledkd.evaluations.eval <MODEL_PATH> --suite light
-```
-
-**Examples:**
-```bash
-# Evaluate a ready HF model directory (no export)
-sbatch evals.slurm kd_top_k_tok_run_out_models/model_2617 light
-
-# Evaluate a raw checkpoint (auto-export)
-sbatch evals.slurm kd_top_k_tok_run_out_models/checkpoints/checkpoint_epoch2_step5055.pt heavy
-```
-
-No need to specify the original base model; the evaluator reads it from the checkpoint if needed.
-
-### Monitor evaluation
-- **Benchmarks**: LM-Eval, Lighteval, EvalPlus, AlpacaEval
-- **GPU allocation**: Automatic fallback (3→2→1 GPUs as available)
-- **Cache management**: Handled via SLURM environment variables
-- **Results**: Logged to W&B and TensorBoard
+Evaluation results are appended to `results/runs.json` so you can track coverage and avoid duplicate runs.
 
 ## 🌀 How to run (Slurm + W&B Sweeps)
 
@@ -363,7 +365,7 @@ Notes:
 - For a quick pass, edit the YAML to set `epochs: [1]`.
 - To customize the virtual env per run, add a sweep param and pass `--venv=${venv}` to the command in the YAML.
 
-## � Entropy Ablation (Top‑k overlap)
+## 🔬 Entropy Ablation (Top‑k overlap)
 
 Use `ablate.slurm` to run the entropy agreement ablation between exact entropy and truncated Top‑k+Tail.
 sbatch ablate.slurm --model <HF_MODEL_DIR_OR_ID> --dataset <HF_DATASET> --prompt_col <PROMPT_COL> --answer_col <ANSWER_COL> [--dataset_config <NAME>] [--batch_size 4] [--max_seq_len 512] [--k_percent 20] [--m 20]

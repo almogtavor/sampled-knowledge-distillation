@@ -2,10 +2,10 @@ import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
-# Keys that do NOT affect training semantics and should be excluded from the hash
+# Keys that do NOT affect training semantics and should be excluded from the serialized params
 EXCLUDED_KEYS = {
     # pure logging/output knobs
     "output_dir",
@@ -22,18 +22,29 @@ EXCLUDED_KEYS = {
     "override",
 }
 
+# Extra keys that are ignored for hashing but kept in the stored params blob so we retain
+# launch metadata while deduplicating runs by high-level training semantics.
+HASH_ONLY_EXCLUDED_KEYS = EXCLUDED_KEYS | {
+    "ddp_offline",
+    "ddp_world_size",
+    "ddp_rank",
+    "ddp_local_rank",
+}
+
 
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 
-def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_params(params: Dict[str, Any], *, excluded_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Return a JSON-serializable dict of parameters filtered/sorted for hashing.
 
-    - Drops EXCLUDED_KEYS
+    - Drops EXCLUDED_KEYS by default (callers can override via excluded_keys)
     - Ensures nested structures are basic Python types
     - Does NOT include timestamps, job IDs, or other runtime-only metadata
     """
+    excludes = EXCLUDED_KEYS if excluded_keys is None else excluded_keys
+
     def _to_basic(x: Any) -> Any:
         if isinstance(x, (str, int, float, type(None), bool)):
             return x
@@ -45,13 +56,13 @@ def normalize_params(params: Dict[str, Any]) -> Dict[str, Any]:
         # Fallback to string representation (stable for enums/literals)
         return str(x)
 
-    filtered = {k: v for k, v in params.items() if k not in EXCLUDED_KEYS}
+    filtered = {k: v for k, v in params.items() if k not in excludes}
     return _to_basic(filtered)
 
 
 def compute_params_hash(params: Dict[str, Any]) -> str:
     """Compute a stable SHA256 hash from the normalized parameters."""
-    norm = normalize_params(params)
+    norm = normalize_params(params, excluded_keys=HASH_ONLY_EXCLUDED_KEYS)
     blob = json.dumps(norm, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -99,7 +110,8 @@ def get_entry(registry_path: Path, params_hash: str) -> Optional[Dict[str, Any]]
 def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                      experiment_name: Optional[str] = None,
                      job_id: Optional[str] = None,
-                     model_output_dir: Optional[str] = None) -> Dict[str, Any]:
+                     model_output_dir: Optional[str] = None,
+                     launch_args: Optional[str] = None) -> Dict[str, Any]:
     """Upsert a run entry at training start. Returns the entry dict.
 
     Schema:
@@ -127,6 +139,8 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
                 "experiment": experiment_name,
                 "job_id": job_id,
                 "output_dir": model_output_dir,
+                "started_at": _now_iso(),
+                "args": launch_args,
             }
         },
         "evals": {},
@@ -144,7 +158,9 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
             "experiment": experiment_name,
             "job_id": job_id,
             "output_dir": model_output_dir,
+            "args": launch_args if launch_args is not None else items[idx]["runs"]["train"].get("args"),
         })
+        items[idx]["runs"]["train"].setdefault("started_at", _now_iso())
         items[idx].setdefault("evals", {})
         # Do not override status here; caller can change later
         entry = items[idx]
@@ -159,8 +175,10 @@ def mark_trained(registry_path: Path, params_hash: str, *, model_output_dir: Opt
         return
     items[idx]["status"] = "trained"
     items[idx]["completed_train"] = True
+    train_meta = items[idx].setdefault("runs", {}).setdefault("train", {})
     if model_output_dir:
-        items[idx].setdefault("runs", {}).setdefault("train", {}).update({"output_dir": model_output_dir})
+        train_meta["output_dir"] = model_output_dir
+    train_meta["completed_at"] = _now_iso()
     _save_registry(registry_path, items)
 
 
@@ -172,6 +190,7 @@ def upsert_eval_results(
     averages: Dict[str, float],
     task_status: Dict[str, str],
     model_path: Optional[str] = None,
+    calibration: Optional[Dict[str, Any]] = None,
 ) -> None:
     items = _load_registry(registry_path)
     idx = find_entry(items, params_hash)
@@ -184,6 +203,8 @@ def upsert_eval_results(
         }
         if model_path:
             eval_entry["model_evaluated"] = model_path
+        if calibration is not None:
+            eval_entry["calibration"] = calibration
         items.append({
             "id": params_hash,
             "params": {},
@@ -201,6 +222,8 @@ def upsert_eval_results(
         }
         if model_path:
             eval_entry["model_evaluated"] = model_path
+        if calibration is not None:
+            eval_entry["calibration"] = calibration
         items[idx].setdefault("evals", {})[suite] = eval_entry
         items[idx]["status"] = "evaluated"
         items[idx].setdefault("completed_train", False)

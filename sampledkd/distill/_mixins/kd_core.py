@@ -8,7 +8,10 @@ class KDCoreMixin:
     @staticmethod
     def _kl_loss(log_p: torch.Tensor, log_q: torch.Tensor):
         """KL(P||Q) where log_p are teacher log-probs, log_q are student log-probs."""
-        return F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)
+        log_q32 = log_q.float()
+        log_p32 = log_p.float()
+        kl = F.kl_div(log_q32, log_p32, log_target=True, reduction="none").sum(-1)
+        return kl.to(log_q.dtype)
 
     @staticmethod
     def _proposal_sample_negatives(V: int, M: int, device: torch.device) -> torch.Tensor:

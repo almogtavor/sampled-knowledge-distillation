@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import device
 from torch.optim import AdamW
@@ -26,6 +27,12 @@ from ._mixins.kd_core import KDCoreMixin
 from ._mixins.selection_scoring import SelectionScoringMixin
 from ._mixins.rs_vocab import kl_from_vocab_samples
 from .ce_estimators import ce_is_estimator
+from .kd_temperature_schedule import KDTemperatureSchedule
+from .oom_setup_helper import OOMSetupHelper
+from .teacher_forward_helpers import (
+    teacher_forward_logits,
+    teacher_forward_distributed,
+)
 
 
 class Distiller(
@@ -39,8 +46,7 @@ class Distiller(
     BanditMixin,
 ):
     """Main distillation trainer class.
-    It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation -
-    both EKD and both vanilla style."""
+    It takes a teacher and a student model, a tokenizer, and a dataloader, then performs distillation ."""
 
     def __init__(
             self,
@@ -53,61 +59,42 @@ class Distiller(
             student_device: device = "cuda",
             logger=None,  # Combined logger for W&B + TensorBoard
     ):
-        self.teacher = teacher_model.eval()  # frozen
-        self.student = student_model.train()
+        self.config = config
+        self.ddp_world_size = int(getattr(self.config, "ddp_world_size", 1))
+        self.ddp_rank = int(getattr(self.config, "ddp_rank", 0))
+        self.ddp_local_rank = int(getattr(self.config, "ddp_local_rank", 0))
+        self.ddp_enabled = bool(
+            getattr(self.config, "ddp_offline", False)
+            and self.ddp_world_size > 1
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+
+        self.teacher_rank0_only = bool(getattr(config, "_teacher_rank0_owner", False))
+        self.teacher_required = bool(getattr(config, "_teacher_required", teacher_model is not None))
+        if teacher_model is not None:
+            self.teacher = teacher_model.eval()
+        else:
+            self.teacher = None
+            if self.teacher_required and not self.teacher_rank0_only:
+                raise ValueError("Teacher model is required but unavailable for this rank.")
+        self.student = student_model.to(student_device).train()
+        teacher_device_str = getattr(config, "_teacher_device_str", None)
+        if teacher_device_str is not None:
+            self.teacher_device = torch.device(teacher_device_str)
+        else:
+            self.teacher_device = teacher_device
+        self.teacher_available = self.teacher_required and (
+            self.teacher is not None or self.teacher_rank0_only
+        )
         self.tok = tokenizer
         self.dataloader = dataloader
-        self.config = config
-        
-        # ===== OOM Reduction: 8-bit optimizer to save ~2-3x memory =====
-        try:
-            from bitsandbytes.optim import Adam8bit
-            self.opt = Adam8bit(self.student.parameters(), lr=config.lr)
-            print("[OOM-opt] Using 8-bit Adam optimizer to reduce memory.")
-        except Exception:
-            self.opt = AdamW(self.student.parameters(), lr=config.lr)
-            print("[OOM-opt] bitsandbytes not available, using standard AdamW.")
-        
-        self.teacher_device = teacher_device
+
         self.student_device = student_device
-        self._printed_cache_info = False
-        
-        # ===== OOM Reduction: Enable gradient checkpointing on student =====
-        if hasattr(self.student, "gradient_checkpointing_enable"):
-            try:
-                self.student.gradient_checkpointing_enable()
-                print("[OOM-opt] Enabled gradient checkpointing on student model.")
-            except Exception as e:
-                print(f"[OOM-opt] Could not enable gradient checkpointing: {e}")
-        
-        # ===== OOM Reduction: Enable memory-efficient attention =====
-        try:
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_flash_sdp(True)
-            print("[OOM-opt] Enabled memory-efficient SDPA backends.")
-        except Exception:
-            pass
-        
-        # Try Flash Attention 2 on student if supported
-        if hasattr(self.student, "config") and hasattr(self.student.config, "use_flash_attention_2"):
-            try:
-                self.student.config.use_flash_attention_2 = True
-                print("[OOM-opt] Enabled Flash Attention 2 on student model.")
-            except Exception:
-                pass
-        
-        # ===== OOM Reduction: Mixed precision (AMP) setup =====
-        # Initialize GradScaler for fp16 AMP (disabled for bfloat16 which doesn't need scaling)
-        self._amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        self._use_amp = True
-        if self._amp_dtype == torch.float16:
-            from torch.cuda.amp import GradScaler
-            self._scaler = GradScaler(enabled=True)
-            print(f"[OOM-opt] Using AMP with {self._amp_dtype} and GradScaler.")
-        else:
-            self._scaler = None
-            print(f"[OOM-opt] Using AMP with {self._amp_dtype} (no scaler needed).")
-        
+
+        self._wrap_student_for_ddp()
+        OOMSetupHelper.configure(self, config)
+
         # Logging setup
         self.logger = logger
         self.global_step = 0
@@ -128,16 +115,45 @@ class Distiller(
 
         # Track once-per-run warnings
         self._warned_invalid_targets = False
+        self._warned_invalid_logprob = False
 
         # LinUCB contextual bandit setup
         self._init_bandit_manager()
+
+    def _wrap_student_for_ddp(self) -> None:
+        if self.ddp_enabled:
+            device_ids = [self.ddp_local_rank]
+            self.student = torch.nn.parallel.DistributedDataParallel(
+                self.student,
+                device_ids=device_ids,
+                output_device=device_ids[0],
+                find_unused_parameters=False,
+            )
+
+    @property
+    def _student_base(self):
+        if hasattr(self.student, "module"):
+            return self.student.module
+        return self.student
+
+    def _teacher_forward_logits(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
+        return teacher_forward_logits(self, input_ids, attn_mask, amp_enabled, amp_dtype)
+
+    def _teacher_forward_distributed(self, input_ids: torch.Tensor, attn_mask: torch.Tensor, amp_enabled: bool, amp_dtype: torch.dtype) -> torch.Tensor:
+        return teacher_forward_distributed(self, input_ids, attn_mask, amp_enabled, amp_dtype)
 
     def _forward_batch(self, batch):
         # Move inputs
         input_ids = batch["input_ids"] # [B, L]
         attn_mask = batch["attention_mask"]
+        kd_mask_tensor = batch.get("kd_mask")
         input_ids_s = input_ids.to(self.student_device)
         attn_mask_s = attn_mask.to(self.student_device)
+        kd_mask_s = None
+        if kd_mask_tensor is not None:
+            kd_mask_s = kd_mask_tensor.to(self.student_device)
+            if kd_mask_s.dtype != torch.bool:
+                kd_mask_s = kd_mask_s.bool()
 
         # Unified KD temperature (applies to both teacher and student log-softmax)
         T = float(getattr(self.config, "kd_temperature", 1.0))
@@ -148,6 +164,8 @@ class Distiller(
         amp_enabled = getattr(self, "_use_amp", False)
         amp_dtype = getattr(self, "_amp_dtype", torch.float32)
         
+        rank_is_zero = (not self.ddp_enabled) or (self.ddp_rank == 0)
+
         # --- student forward (always) ---
         with autocast(enabled=amp_enabled, dtype=amp_dtype):
             s_logits = self.student(input_ids_s, attention_mask=attn_mask_s).logits
@@ -156,17 +174,32 @@ class Distiller(
         # Align to next-token prediction
         s_pred = s_logits[:, :-1, :]  # [B, L-1, V]
         valid_next = attn_mask_s[:, 1:].bool()  # [B, L-1]
+        if kd_mask_s is not None:
+            valid_next = valid_next & kd_mask_s[:, 1:].bool()
         # Compute student log-probs lazily; skip full-vocab softmax if we use cached elimination path
         do_elim_softmax = bool(getattr(self.config, "eliminate_softmax", False))
         s_log_probs = None  # set to log_softmax on-demand when needed (only non-elimination paths)
 
         # Decide path: cached RS-KD with softmax elimination vs. fallback
         cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
+        if not self.teacher_available:
+            if not bool(getattr(self.config, "offline_cache", False)):
+                raise RuntimeError("Teacher-less training requires offline_cache=True.")
+            if cached_items is None:
+                raise RuntimeError("Teacher is unavailable but the offline cache is missing entries for this batch. Rebuild the cache before training.")
         do_elim = bool(getattr(self.config, "eliminate_softmax", False)) and (cached_items is not None)
         # Whether we will use the cached RS-KD vocabulary estimator path at all
         use_vocab_rs_kd = bool(getattr(self.config, "offline_cache", False))
+        if not self.teacher_available and not use_vocab_rs_kd:
+            raise RuntimeError("Teacher-less training currently requires offline cache enabled.")
         distill_type = getattr(self.config, "distill_type", "vanilla")
         score_enabled_flag = bool(getattr(self.config, "score_token_selection", False))
+        if not self.teacher_available:
+            allowed_distill = {"vanilla", "top-k-tok", "bucket", "random"}
+            if distill_type not in allowed_distill:
+                raise RuntimeError(
+                    f"distill_type='{distill_type}' requires a teacher; supported cache-only modes: {sorted(allowed_distill)}."
+                )
 
         supports_cached_no_elim = (
             use_vocab_rs_kd
@@ -178,27 +211,31 @@ class Distiller(
         # Only run teacher forward if we are NOT in elimination mode or cache is missing/unsupported
         t_pred = t_log_probs = None
         if supports_cached_no_elim and not self._printed_cache_info:
-            print("[logits-cache] Using offline cache without elimination → computing KD from cache.", flush=True)
+            if rank_is_zero:
+                print("[logits-cache] Using offline cache without elimination → computing KD from cache.", flush=True)
             self._printed_cache_info = True
 
         if not do_elim and not supports_cached_no_elim:
-            input_ids_t = input_ids.to(self.teacher_device)
-            attn_t = attn_mask.to(self.teacher_device)
-            with torch.no_grad():
-                with autocast(enabled=amp_enabled, dtype=amp_dtype):
-                    t_logits = self.teacher(input_ids_t, attention_mask=attn_t, output_hidden_states=False).logits
-                t_logits = self._sanitize_logits(t_logits, "teacher")  # [B, L, V]
+            if not self.teacher_available:
+                raise RuntimeError(
+                    "Offline cache must provide logits for the configured distillation mode; teacher is not available for fallback."
+                )
+            t_logits = self._teacher_forward_logits(input_ids, attn_mask, amp_enabled, amp_dtype)
+            if t_logits.device != self.student_device:
+                t_logits = t_logits.to(self.student_device, non_blocking=True)
             t_pred = t_logits[:, :-1, :]
-            t_log_probs = torch.log_softmax(t_pred / T, dim=-1)
+            t_log_probs = torch.log_softmax((t_pred.float() / T), dim=-1)
             if not self._printed_cache_info:
-                if getattr(self.config, "offline_cache", False) and cached_items is None:
-                    print("[logits-cache] Cache miss or not available → running online teacher forward.")
-                else:
-                    print("[logits-cache] Running online teacher forward (elimination off).")
+                if rank_is_zero:
+                    if getattr(self.config, "offline_cache", False) and cached_items is None:
+                        print("[logits-cache] Cache miss or not available → running online teacher forward.")
+                    else:
+                        print("[logits-cache] Running online teacher forward (elimination off).")
                 self._printed_cache_info = True
         else:
             if not self._printed_cache_info:
-                print("[logits-cache] Softmax elimination active with cache → skipping online teacher forward.")
+                if rank_is_zero:
+                    print("[logits-cache] Softmax elimination active with cache → skipping online teacher forward.")
                 self._printed_cache_info = True
 
         # --- KD loss ---
@@ -207,7 +244,7 @@ class Distiller(
         extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
             if s_log_probs is None: # compute softmax if cache not rs-kd
-                s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
             kd_loss, kd_extra = self._compute_kd_loss(
                 t_pred,
                 t_log_probs,
@@ -314,14 +351,14 @@ class Distiller(
 
                     # Scatter proxies back to [B, L-1]
                     Bsz, Lm1 = valid_next.size()
-                    kd_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
-                    ce_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=s_rows.dtype)
-                    kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows
-                    ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows
+                    kd_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=torch.float32)
+                    ce_pos_proxy = torch.zeros((Bsz, Lm1), device=self.student_device, dtype=torch.float32)
+                    kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows.float()
+                    ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows.float()
 
                     if not do_elim:
                         if s_log_probs is None:
-                            s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                            s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
                         s_rows_logp = s_log_probs[batch_idx, pos_idx]          # [P_total, V]
                         s_logp_on_U_exact = torch.gather(s_rows_logp, 1, ids_U)  # [P_total, U_max]
                         kd_rows_exact = -(probs_U * s_logp_on_U_exact).sum(dim=1)
@@ -350,6 +387,12 @@ class Distiller(
                                 kd_loss = kd_rows_exact.mean() if kd_rows_exact.numel() > 0 else s_pred.sum() * 0.0
                             elif distill == "top-k-tok":
                                 pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
+                                shared_quota = None
+                                if normalize_topk:
+                                    total_valid = int(valid_next.sum().item())
+                                    avg_valid = total_valid / max(1, valid_next.size(0))
+                                    shared_quota = max(1, math.ceil(pct * avg_valid))
                                 if score_enabled and score_ctx is not None:
                                     stat = torch.full_like(ent_cached, float('-inf'))
                                     for i in range(valid_next.size(0)):
@@ -361,7 +404,7 @@ class Distiller(
                                 else:
                                     stat = ent_cached.masked_fill(~valid_next, float('-inf'))
 
-                                use_gls = bool(getattr(self.config, "gls_enabled", False))
+                                use_gls = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
                                 keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                 sel_topk_count = 0
                                 sel_gls_count = 0
@@ -371,7 +414,10 @@ class Distiller(
                                         n_valid = int(mask_i.sum().item())
                                         if n_valid < 3:
                                             continue
-                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        if normalize_topk and shared_quota is not None:
+                                            k = min(n_valid, shared_quota)
+                                        else:
+                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                         sel_topk_count += int(k)
                                         valid_idx_i = torch.where(mask_i)[0]
                                         scores = stat[i][mask_i].float()
@@ -383,13 +429,16 @@ class Distiller(
                                 else:
                                     self._gls_init_if_needed()
                                     thr = self._gls_threshold(top_percent=self.config.k_percent)
-                                    if thr is None:
+                                    if thr is None or normalize_topk:
                                         for i in range(valid_next.size(0)):
                                             mask_i = valid_next[i]
                                             n_valid = int(mask_i.sum().item())
                                             if n_valid < 3:
                                                 continue
-                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                            if normalize_topk and shared_quota is not None:
+                                                k = min(n_valid, shared_quota)
+                                            else:
+                                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                             sel_topk_count += int(k)
                                             valid_idx_i = torch.where(mask_i)[0]
                                             scores = stat[i][mask_i].float()
@@ -523,19 +572,28 @@ class Distiller(
                             else:
                                 stat_elim = ent_cached.masked_fill(~valid_next, float('-inf'))
 
-                            use_gls = bool(getattr(self.config, "gls_enabled", False))
+                            normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
+                            use_gls = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
                             sel_topk_count = 0
                             sel_gls_count = 0
                             if not use_gls:
                                 # Original per-example top-k
                                 pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                shared_quota = None
+                                if normalize_topk:
+                                    total_valid = int(valid_next.sum().item())
+                                    avg_valid = total_valid / max(1, valid_next.size(0))
+                                    shared_quota = max(1, math.ceil(pct * avg_valid))
                                 keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                 for i in range(valid_next.size(0)):
                                     mask_i = valid_next[i]
                                     n_valid = int(mask_i.sum().item())
                                     if n_valid < 3:
                                         continue
-                                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                    if normalize_topk and shared_quota is not None:
+                                        k = min(n_valid, shared_quota)
+                                    else:
+                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                     sel_topk_count += int(k)
                                     valid_idx_i = torch.where(mask_i)[0]
                                     scores = stat_elim[i][mask_i].float()
@@ -550,13 +608,21 @@ class Distiller(
                                 thr = self._gls_threshold(top_percent=self.config.k_percent)
                                 if thr is None:
                                     pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
+                                    shared_quota = None
+                                    if normalize_topk:
+                                        total_valid = int(valid_next.sum().item())
+                                        avg_valid = total_valid / max(1, valid_next.size(0))
+                                        shared_quota = max(1, math.ceil(pct * avg_valid))
                                     keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)
                                     for i in range(valid_next.size(0)):
                                         mask_i = valid_next[i]
                                         n_valid = int(mask_i.sum().item())
                                         if n_valid < 3:
                                             continue
-                                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                                        if normalize_topk and shared_quota is not None:
+                                            k = min(n_valid, shared_quota)
+                                        else:
+                                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                                         sel_topk_count += int(k)
                                         valid_idx_i = torch.where(mask_i)[0]
                                         scores = stat_elim[i][mask_i].float()
@@ -725,12 +791,12 @@ class Distiller(
                             # Scatter keep_mask to full [B, L-1] if needed
                             if distill == "top-k-tok":
                                 # KD: masked loss over selected positions
-                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                kd_loss = (kd_pos_proxy.to(self.student_dtype) * keep_mask).sum() / keep_mask.sum().clamp_min(1)
                                 # CE: on ALL valid positions (standard practice for top-k-tok)
                                 ce_loss_override = ce_pos_proxy_rows.mean() if self.config.enable_ce else None
                             else:
                                 # bucket/random: KD and CE both on selected positions
-                                kd_loss = (kd_pos_proxy * keep_mask).sum() / keep_mask.sum().clamp_min(1)
+                                kd_loss = (kd_pos_proxy.to(self.student_dtype) * keep_mask).sum() / keep_mask.sum().clamp_min(1)
                                 # For CE on selected positions, we need to mask ce_pos_proxy
                                 if self.config.enable_ce:
                                     keep_rows = keep_mask[batch_idx, pos_idx] if P_total > 0 else torch.zeros(
@@ -744,7 +810,7 @@ class Distiller(
                 assert t_log_probs is not None and t_pred is not None, "Teacher logits required for online RS-KD when cache missing"
                 # Move necessary teacher tensors to the student device for gathers with student log-probs
                 t_logp_Tkd = t_log_probs.to(self.student_device)           # [B, L-1, V]
-                t_logp_T1 = torch.log_softmax(t_pred.to(self.student_device) / 1.0, dim=-1)  # [B, L-1, V]
+                t_logp_T1 = torch.log_softmax(t_pred.to(self.student_device).float() / 1.0, dim=-1)  # [B, L-1, V]
                 p_Tkd = t_logp_Tkd.exp()                                   # [B, L-1, V]
 
                 mask = valid_next  # [B, L-1] bool
@@ -755,7 +821,7 @@ class Distiller(
                     # Gather all valid rows once: [P_total, V]
                     p_rows = p_Tkd[mask]
                     if s_log_probs is None:
-                        s_log_probs = torch.log_softmax(s_pred / T, dim=-1)
+                        s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
                     s_rows = s_log_probs[mask]
                     t1_rows = t_logp_T1[mask]
 
@@ -789,8 +855,10 @@ class Distiller(
                     kd_loss = loss_rows.mean()
         
         # Temperature factor (keep gradients comparable across T, as in standard distillation)
-        if True:
-            kd_loss = kd_loss * T2
+        kd_loss = kd_loss * T2
+
+        if self.global_step < 3:  # Only log first few batches
+            print(f"[DEBUG] _forward_batch: kd_loss (after T^2)={kd_loss.item():.6f}, T={T}, T2={T2}", flush=True)
 
         # --- CE loss (only valid targets) ---
         if self.config.enable_ce:
@@ -800,29 +868,55 @@ class Distiller(
             else:
                 targets = input_ids_s[:, 1:]  # [B, L-1]
                 # In the new mode, CE is on ALL valid tokens (standard masking)
+                # Clamp out-of-range teacher targets before masking to avoid device-side asserts
+                V = s_pred.size(-1)
+                targets = targets.clamp(min=-1, max=V - 1)
                 targets = targets.masked_fill(~valid_next, -100)
                 # CE loss should always be at T=1 (standard practice in KD)
-                s_log_probs_T1 = torch.log_softmax(s_pred, dim=-1)
+                s_log_probs_T1 = torch.log_softmax(s_pred.float(), dim=-1)
                 V = s_log_probs_T1.size(-1)
                 flat_log_probs = s_log_probs_T1.reshape(-1, V)
-                flat_targets = targets.reshape(-1).long()
-                if torch.isfinite(s_log_probs_T1).all():
-                    valid_mask = flat_targets != -100
-                    if valid_mask.any():
-                        max_id = flat_targets[valid_mask].max()
-                        min_id = flat_targets[valid_mask].min()
-                        if (max_id >= V) or (min_id < 0):
-                            bad_mask = valid_mask & ((flat_targets >= V) | (flat_targets < 0))
-                            bad_count = int(bad_mask.sum().item())
-                            if bad_count > 0:
-                                flat_targets[bad_mask] = -100
-                                if not self._warned_invalid_targets:
-                                    print(
-                                        f"[warn] CE targets out of range (count={bad_count}) → masking from loss.",
-                                        flush=True,
-                                    )
-                                    self._warned_invalid_targets = True
-                ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
+                flat_targets = targets.reshape(-1).long().clone()
+
+                ignore_mask = flat_targets == -100
+                valid_range_mask = (flat_targets >= 0) & (flat_targets < V)
+                invalid_range_mask = ~(ignore_mask | valid_range_mask)
+                if invalid_range_mask.any():
+                    bad_vals = flat_targets[invalid_range_mask].detach().to("cpu", non_blocking=True)
+                    bad_count = int(bad_vals.numel())
+                    flat_targets = flat_targets.masked_fill(invalid_range_mask, -100)
+                    if bad_count > 0 and not self._warned_invalid_targets:
+                        min_bad = int(bad_vals.min().item()) if bad_vals.numel() else 0
+                        max_bad = int(bad_vals.max().item()) if bad_vals.numel() else 0
+                        sample_vals = bad_vals.unique()
+                        if sample_vals.numel() > 5:
+                            sample_vals = sample_vals[:5]
+                        sample_list = ", ".join(str(int(v.item())) for v in sample_vals)
+                        print(
+                            "[warn] CE targets out of range (count="
+                            f"{bad_count}, min={min_bad}, max={max_bad}, sample=[{sample_list}])"
+                            " → masking from loss.",
+                            flush=True,
+                        )
+                        self._warned_invalid_targets = True
+
+                # Mask rows that contain non-finite log-probs to avoid device-side asserts
+                finite_row_mask = torch.isfinite(flat_log_probs).all(dim=-1)
+                drop_mask = (~finite_row_mask) & (flat_targets != -100)
+                if drop_mask.any():
+                    drop_count = int(drop_mask.sum().item())
+                    flat_targets[drop_mask] = -100
+                    if drop_count > 0 and not self._warned_invalid_logprob:
+                        print(
+                            f"[warn] CE log-probs contained {drop_count} non-finite rows → masking from loss.",
+                            flush=True,
+                        )
+                        self._warned_invalid_logprob = True
+
+                if (flat_targets != -100).any():
+                    ce_loss = F.nll_loss(flat_log_probs, flat_targets, ignore_index=-100, reduction="mean")
+                else:
+                    ce_loss = torch.zeros((), device=self.student_device, dtype=s_pred.dtype)
             total = (1.0 - self.config.alpha_ce) * kd_loss + self.config.alpha_ce * ce_loss
         else:
             ce_loss = torch.tensor(0.0, device=self.student_device)
@@ -874,102 +968,111 @@ class Distiller(
         elif self.config.distill_type == "top-k-tok":
             # top-k% tokens among valid positions; optionally global threshold via GLS
             # Select positions FIRST, then compute KL only on selected rows (efficient)
-            ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+            if self.global_step < 3:
+                print(f"[DEBUG] top-k-tok START: t_pred shape={t_pred.shape if t_pred is not None else 'None'}, valid_next.sum()={valid_next.sum().item()}", flush=True)
+                if t_pred is not None:
+                    print(f"[DEBUG] t_pred stats: min={t_pred.min().item():.6f}, max={t_pred.max().item():.6f}, mean={t_pred.mean().item():.6f}", flush=True)
             pct = max(0.0, min(1.0, self.config.k_percent / 100.0))
-
-            # Build ranking statistic with two-stage selection when scoring enabled
+            normalize_topk = bool(getattr(self.config, "normalize_topk_by_length", False))
             score_enabled = bool(getattr(self.config, "score_token_selection", False))
-            
-            if score_enabled:
-                # === Two-stage selection for efficiency ===
-                # Stage 1: Prefilter by entropy (cheap, no softmax needed)
-                prefilter_mult = float(getattr(self.config, "score_prefilter_multiplier", 3.0))
-                # Stage 2: Compute KL/CE only on prefiltered subset
-                
-                stat = torch.full_like(ent_raw, float('-inf'))
-                for i in range(valid_next.size(0)):
-                    mask_i = valid_next[i]
-                    n_valid = int(mask_i.sum().item())
-                    if n_valid < 3:
-                        continue
-                    
-                    # Stage 1: Select top (k * prefilter_mult) by entropy
-                    k_final = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                    k_pre = min(n_valid, max(k_final, int(k_final * prefilter_mult)))
-                    
-                    valid_idx = torch.where(mask_i)[0]
-                    ent_valid = ent_raw[i][mask_i]
-                    _, pre_rel_idx = torch.topk(ent_valid, k=k_pre, largest=True, sorted=False)
-                    prefilter_idx = valid_idx[pre_rel_idx]  # [k_pre] absolute indices
-                    
-                    # Stage 2: Compute KL/CE only on prefiltered positions (efficient!)
-                    # Create mask for prefiltered positions
-                    prefilter_mask = torch.zeros_like(mask_i, dtype=torch.bool)
-                    prefilter_mask[prefilter_idx] = True
-                    
-                    # Gather only prefiltered rows for KL computation
-                    # Ensure indices are on the same device as teacher log-probs
-                    pre_idx_t = prefilter_idx.to(t_log_probs.device)
-                    t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_pre, V]
-                    s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
-                    kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
-                    
-                    # Build full-size KL tensor with -inf for non-prefiltered
-                    kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
-                    kl_pos_partial[prefilter_idx] = kl_pre
-                    
-                    # Prepare score context with partial KL
-                    score_ctx_i = self._prepare_score_context(
-                        ent_raw[i:i+1],
-                        kl_pos_partial.unsqueeze(0),
-                        s_log_probs[i:i+1] if s_log_probs is not None else None,
-                        prefilter_mask.unsqueeze(0),
-                        input_ids[i:i+1]
-                    )
-                    combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask)
-                    if combined is not None:
-                        stat[i] = combined
-                
-                stat = stat.masked_fill(~valid_next, float('-inf'))
-            else:
-                # Entropy-only ranking (no softmax needed, fully efficient)
-                stat = ent_raw.masked_fill(~valid_next, float('-inf'))
+            gls_effective = bool(getattr(self.config, "gls_enabled", False)) and not normalize_topk
 
-            use_gls = bool(getattr(self.config, "gls_enabled", False))
-            sel_topk_count = 0
+            skip_entropy = (
+                pct >= 0.9995
+                and not normalize_topk
+                and not gls_effective
+                and not score_enabled
+            )
+
             sel_gls_count = 0
-            
-            # Create boolean mask for positions to include in KD loss
-            keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
-            
-            if not use_gls:
-                # Per-example top-k
-                for i in range(valid_next.size(0)):
-                    mask = valid_next[i]
-                    n_valid = int(mask.sum().item())
-                    if n_valid < 3:
-                        continue
-                    k = max(1, min(n_valid, math.ceil(pct * n_valid)))
-                    sel_topk_count += int(k)
-                    valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-                    scores = stat[i][mask]
-                    if scores.numel() == 0:
-                        continue
-                    _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
-                    sel = valid_idx[rel_idx]
-                    keep_mask[i, sel] = True
+            if skip_entropy:
+                keep_mask = valid_next.clone()
+                sel_topk_count = int(valid_next.sum().item())
             else:
-                # GLS: global threshold over history with warm-up fallback
-                self._gls_init_if_needed()
-                thr = self._gls_threshold(top_percent=self.config.k_percent)
-                if thr is None:
-                    # Warm-up: fallback to per-example top-k
+                ent_raw = self._entropy_for_selection(input_ids, t_pred)  # [B, L-1]
+                if self.global_step < 3:
+                    print(f"[DEBUG] ent_raw shape={ent_raw.shape}, valid_next.shape={valid_next.shape}", flush=True)
+                    valid_ent = ent_raw[valid_next]
+                    print(f"[DEBUG] ent_raw[valid_next] stats: min={valid_ent.min().item():.6f}, max={valid_ent.max().item():.6f}, mean={valid_ent.mean().item():.6f}, count={valid_ent.numel()}", flush=True)
+
+                if score_enabled:
+                    # === Two-stage selection for efficiency ===
+                    # Stage 1: Prefilter by entropy (cheap, no softmax needed)
+                    prefilter_mult = float(getattr(self.config, "score_prefilter_multiplier", 3.0))
+                    # Stage 2: Compute KL/CE only on prefiltered subset
+
+                    stat = torch.full_like(ent_raw, float('-inf'))
+                    for i in range(valid_next.size(0)):
+                        mask_i = valid_next[i]
+                        n_valid = int(mask_i.sum().item())
+                        if n_valid < 3:
+                            continue
+
+                        # Stage 1: Select top (k * prefilter_mult) by entropy
+                        k_final = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                        k_pre = min(n_valid, max(k_final, int(k_final * prefilter_mult)))
+
+                        valid_idx = torch.where(mask_i)[0]
+                        ent_valid = ent_raw[i][mask_i]
+                        _, pre_rel_idx = torch.topk(ent_valid, k=k_pre, largest=True, sorted=False)
+                        prefilter_idx = valid_idx[pre_rel_idx]  # [k_pre] absolute indices
+
+                        # Stage 2: Compute KL/CE only on prefiltered positions (efficient!)
+                        # Create mask for prefiltered positions
+                        prefilter_mask = torch.zeros_like(mask_i, dtype=torch.bool)
+                        prefilter_mask[prefilter_idx] = True
+
+                        # Gather only prefiltered rows for KL computation
+                        # Ensure indices are on the same device as teacher log-probs
+                        pre_idx_t = prefilter_idx.to(t_log_probs.device)
+                        t_rows_pre = t_log_probs[i, pre_idx_t, :].to(self.student_device)  # [k_pre, V]
+                        s_rows_pre = s_log_probs[i, prefilter_idx, :]  # [k_pre, V]
+                        kl_pre = self._kl_loss(t_rows_pre, s_rows_pre)  # [k_pre]
+
+                        # Build full-size KL tensor with -inf for non-prefiltered
+                        kl_pos_partial = torch.full((ent_raw.size(1),), float('-inf'), device=self.student_device)
+                        kl_pos_partial[prefilter_idx] = kl_pre
+
+                        # Prepare score context with partial KL
+                        score_ctx_i = self._prepare_score_context(
+                            ent_raw[i:i+1],
+                            kl_pos_partial.unsqueeze(0),
+                            s_log_probs[i:i+1] if s_log_probs is not None else None,
+                            prefilter_mask.unsqueeze(0),
+                            input_ids[i:i+1]
+                        )
+                        combined = self._build_score_vector(score_ctx_i, 0, prefilter_mask)
+                        if combined is not None:
+                            stat[i] = combined
+
+                    stat = stat.masked_fill(~valid_next, float('-inf'))
+                else:
+                    # Entropy-only ranking (no softmax needed, fully efficient)
+                    stat = ent_raw.masked_fill(~valid_next, float('-inf'))
+
+                use_gls = gls_effective
+                sel_topk_count = 0
+
+                # Create boolean mask for positions to include in KD loss
+                keep_mask = torch.zeros_like(valid_next, dtype=torch.bool)  # [B, L-1]
+
+                shared_quota = None
+                if normalize_topk:
+                    total_valid = int(valid_next.sum().item())
+                    avg_valid = total_valid / max(1, valid_next.size(0))
+                    shared_quota = max(1, math.ceil(pct * avg_valid))
+
+                if not use_gls:
+                    # Per-example top-k
                     for i in range(valid_next.size(0)):
                         mask = valid_next[i]
                         n_valid = int(mask.sum().item())
                         if n_valid < 3:
                             continue
-                        k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                        if normalize_topk and shared_quota is not None:
+                            k = min(n_valid, shared_quota)
+                        else:
+                            k = max(1, min(n_valid, math.ceil(pct * n_valid)))
                         sel_topk_count += int(k)
                         valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
                         scores = stat[i][mask]
@@ -979,18 +1082,42 @@ class Distiller(
                         sel = valid_idx[rel_idx]
                         keep_mask[i, sel] = True
                 else:
-                    keep_mask = (stat >= thr) & valid_next
-                    sel_gls_count = int(keep_mask.sum().item())
-                # Push current batch stats and optionally log threshold
-                flat_vals = stat[valid_next].detach().float().to("cpu")
-                flat_vals = flat_vals[torch.isfinite(flat_vals)]
-                self._gls_push(flat_vals)
-                if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
-                    self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
-            
+                    # GLS: global threshold over history with warm-up fallback
+                    self._gls_init_if_needed()
+                    thr = self._gls_threshold(top_percent=self.config.k_percent)
+                    if thr is None:
+                        # Warm-up: fallback to per-example top-k
+                        for i in range(valid_next.size(0)):
+                            mask = valid_next[i]
+                            n_valid = int(mask.sum().item())
+                            if n_valid < 3:
+                                continue
+                            if normalize_topk and shared_quota is not None:
+                                k = min(n_valid, shared_quota)
+                            else:
+                                k = max(1, min(n_valid, math.ceil(pct * n_valid)))
+                            sel_topk_count += int(k)
+                            valid_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                            scores = stat[i][mask]
+                            if scores.numel() == 0:
+                                continue
+                            _, rel_idx = torch.topk(scores, k=k, largest=True, sorted=False)
+                            sel = valid_idx[rel_idx]
+                            keep_mask[i, sel] = True
+                    else:
+                        keep_mask = (stat >= thr) & valid_next
+                        sel_gls_count = int(keep_mask.sum().item())
+                    # Push current batch stats and optionally log threshold
+                    flat_vals = stat[valid_next].detach().float().to("cpu")
+                    flat_vals = flat_vals[torch.isfinite(flat_vals)]
+                    self._gls_push(flat_vals)
+                    if getattr(self.config, "gls_log_threshold", False) and ('thr' in locals()) and thr is not None and self.logger:
+                        self.logger.log_scalar("train/gls_threshold", float(thr), self.global_step)
+
             # Compute KL only on selected positions (efficient)
             rows = keep_mask.nonzero(as_tuple=False)  # [P, 2] -> (b, t)
             if rows.numel() == 0:
+                print(f"[DEBUG] top-k-tok: keep_mask has NO selected positions! valid_next.sum()={valid_next.sum().item()}", flush=True)
                 kd_loss = t_pred.sum() * 0.0
             else:
                 b_idx, t_idx = rows[:, 0], rows[:, 1]
@@ -1001,7 +1128,10 @@ class Distiller(
                 t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 # Student tensors live on student device; indices are already there
                 s_rows = s_log_probs[b_idx, t_idx, :]
-                kd_loss = self._kl_loss(t_rows, s_rows).mean()
+                kl_per_pos = self._kl_loss(t_rows, s_rows)
+                kd_loss = kl_per_pos.mean()
+                if self.global_step < 3:  # Only log first few batches
+                    print(f"[DEBUG] top-k-tok: selected {rows.size(0)} positions, kl_per_pos stats: min={kl_per_pos.min().item():.6f}, max={kl_per_pos.max().item():.6f}, mean={kd_loss.item():.6f}", flush=True)
             
             # Log selection counters (per batch)
             if self.logger:
@@ -1266,36 +1396,51 @@ class Distiller(
     def train(self, epochs: int = 1, log_every: int = 100):
         """Run distillation training for specified number of epochs."""
         overall_train_start = time.time()
-        # make the offline pass once, if requested (no hidden side effects)
+        rank_is_zero = (not self.ddp_enabled) or (self.ddp_rank == 0)
+        build_cache_on_rank = (not self.ddp_enabled) or (self.ddp_rank == 0)
         if getattr(self.config, "offline_cache", False):
-            if self.cache is None:
-                self.cache = init_offline_cache_for_trainer(
-                    getattr(self.config, "offline_cache_dir", None),
-                    self.compute_cache_signature()
-                )
-            # Build cache with a single-worker DataLoader to avoid multiprocessing/fork hangs
-            # after CUDA initialization on HPC nodes.
-            try:
-                from torch.utils.data import DataLoader
-                dl_for_cache = DataLoader(
-                    self.dataloader.dataset,
-                    batch_size=self.config.batch_size,
-                    shuffle=False,
-                    collate_fn=self.dataloader.collate_fn,
-                    num_workers=0,
-                    pin_memory=False,
-                    persistent_workers=False,
-                )
-            except Exception:
-                # Fallback: use the existing dataloader
-                dl_for_cache = self.dataloader
+            cache_ready_flag = bool(getattr(self.config, "_cache_is_ready", False))
+            if build_cache_on_rank:
+                if self.cache is None:
+                    self.cache = init_offline_cache_for_trainer(
+                        getattr(self.config, "offline_cache_dir", None),
+                        self.compute_cache_signature()
+                    )
+                if self.teacher_available:
+                    try:
+                        from torch.utils.data import DataLoader
+                        dl_for_cache = DataLoader(
+                            self.dataloader.dataset,
+                            batch_size=self.config.batch_size,
+                            shuffle=False,
+                            collate_fn=self.dataloader.collate_fn,
+                            num_workers=0,
+                            pin_memory=False,
+                            persistent_workers=False,
+                        )
+                    except Exception:
+                        dl_for_cache = self.dataloader
 
-            self.cache = build_offline_cache_if_needed(
-                cache=self.cache,
-                teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
-                config=self.config, teacher_device=self.teacher_device,
-                sanitize_logits_fn=self._sanitize_logits,
-            )
+                    self.cache = build_offline_cache_if_needed(
+                        cache=self.cache,
+                        teacher=self.teacher, tok=self.tok, dataloader=dl_for_cache,
+                        config=self.config, teacher_device=self.teacher_device,
+                        sanitize_logits_fn=self._sanitize_logits,
+                    )
+                elif not cache_ready_flag:
+                    raise RuntimeError(
+                        "Teacherless run requires an existing offline cache. Provide a cache built with the same signature."
+                    )
+
+            if self.ddp_enabled and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+                if not build_cache_on_rank:
+                    self.cache = init_offline_cache_for_trainer(
+                        getattr(self.config, "offline_cache_dir", None),
+                        self.compute_cache_signature()
+                    )
+                    if not self.teacher_available and not cache_ready_flag:
+                        raise RuntimeError("Offline cache not ready on non-building rank and teacher unavailable.")
 
         if self.bandit_manager is not None:
             # Guard against stale pending batches when resuming training or restarting loops.
@@ -1303,25 +1448,15 @@ class Distiller(
         # Prepare KD temperature annealing schedule (in units of optimizer updates)
         updates_per_epoch = math.ceil(len(self.dataloader) / max(1, self.config.gradient_accumulation_steps))
         total_updates = updates_per_epoch * max(1, epochs)
-
-        def kd_T_at(update_idx: int) -> float:
-            T0 = float(getattr(self.config, "kd_temperature_start", 2.0))
-            T1 = float(getattr(self.config, "kd_temperature_end", 1.0))
-            hold_frac = float(getattr(self.config, "kd_hold_frac", 0.6))
-            hold_u = int(hold_frac * total_updates)
-            if update_idx <= hold_u:
-                return T0
-            tail = max(1, (total_updates - hold_u))
-            pos = (update_idx - hold_u) / tail
-            return T0 + (T1 - T0) * pos
+        kd_schedule = KDTemperatureSchedule(self.config, total_updates)
 
         # Track OOM failures: consecutive and total
         consecutive_oom_failures = 0
         total_oom_failures = 0
         max_consecutive_ooms = 10
-        max_total_oom_percent = 50  # Abort if >50% of batches OOM
+        max_total_oom_percent = 50  # Abort if >50% of attempted forwards OOM
         oom_failure_sleep_s = 100
-        batches_attempted = 0
+        total_batch_attempts = 0
         
         for epoch in range(epochs):
             step_start = time.time()
@@ -1330,68 +1465,90 @@ class Distiller(
             bandit_steps = 0
             last_reward_metrics: Optional[Dict[str, float]] = None
             self.opt.zero_grad(set_to_none=True)  # Initialize gradients
+
+            if self.ddp_enabled:
+                sampler = getattr(self.dataloader, "sampler", None)
+                if sampler is not None and hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
+                else:
+                    batch_sampler = getattr(self.dataloader, "batch_sampler", None)
+                    if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+                        batch_sampler.set_epoch(epoch)
             
             step = 0  # Manual step counter that only increments on success
             for batch in self.dataloader:
-                batches_attempted += 1
-                # Per-batch forward/backward with CUDA OOM handling
-                try:
-                    loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
-                    # Scale loss by gradient accumulation steps
-                    loss = loss / self.config.gradient_accumulation_steps
-                    
-                    # ===== OOM Reduction: AMP backward pass =====
-                    scaler = getattr(self, "_scaler", None)
-                    if scaler is not None:
-                        # fp16: use scaler
-                        scaler.scale(loss).backward()
-                    else:
-                        # bfloat16 or no AMP: standard backward
-                        loss.backward()
-                    
-                    # Reset consecutive OOM counter on success
-                    consecutive_oom_failures = 0
-                    step += 1  # Only increment step on successful batch
-                except torch.cuda.OutOfMemoryError:
-                    consecutive_oom_failures += 1
-                    total_oom_failures += 1
-                    # Clear partial grads and GPU caches
+                attempt_retries = 0
+                while True:
+                    total_batch_attempts += 1
                     try:
-                        self.opt.zero_grad(set_to_none=True)
-                    except Exception:
-                        pass
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    try:
-                        import gc
-                        gc.collect()
-                    except Exception:
-                        pass
-                    
-                    oom_rate = (total_oom_failures / batches_attempted) * 100
-                    print(f"[OOM] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
-                          f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
-                          f"Total: {total_oom_failures}/{batches_attempted} ({oom_rate:.1f}%). "
-                          f"Skipping batch...")
-                    
-                    # Exit if too many consecutive OOMs
-                    if consecutive_oom_failures >= max_consecutive_ooms:
-                        print(f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures. "
-                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
-                        time.sleep(oom_failure_sleep_s)
-                        raise RuntimeError(f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures.")
-                    
-                    # Exit if OOM rate is too high (only check after seeing enough batches)
-                    if batches_attempted >= 20 and oom_rate > max_total_oom_percent:
-                        print(f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
-                              f"Sleeping {oom_failure_sleep_s}s before exiting...")
-                        time.sleep(oom_failure_sleep_s)
-                        raise RuntimeError(f"Training aborted: {total_oom_failures}/{batches_attempted} batches failed with OOM ({oom_rate:.1f}%).")
-                    
-                    # Skip this batch and continue to the next one (step counter doesn't increment)
-                    continue
+                        loss, kl_val, ce_val, bandit_metrics = self._forward_batch(batch)
+                        # Scale loss by gradient accumulation steps
+                        loss = loss / self.config.gradient_accumulation_steps
+
+                        # ===== OOM Reduction: AMP backward pass =====
+                        scaler = getattr(self, "_scaler", None)
+                        if scaler is not None:
+                            # fp16: use scaler
+                            scaler.scale(loss).backward()
+                        else:
+                            # bfloat16 or no AMP: standard backward
+                            loss.backward()
+
+                        # Reset consecutive OOM counter on success
+                        consecutive_oom_failures = 0
+                        step += 1  # Only increment step on successful batch
+                        break
+                    except torch.cuda.OutOfMemoryError:
+                        attempt_retries += 1
+                        consecutive_oom_failures += 1
+                        total_oom_failures += 1
+                        # Clear partial grads and GPU caches
+                        try:
+                            self.opt.zero_grad(set_to_none=True)
+                        except Exception:
+                            pass
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        try:
+                            import gc
+                            gc.collect()
+                        except Exception:
+                            pass
+
+                        oom_rate = (total_oom_failures / total_batch_attempts) * 100 if total_batch_attempts > 0 else 0.0
+                        if rank_is_zero:
+                            print(
+                                f"[OOM][rank {self.ddp_rank}] CUDA out of memory at epoch {epoch + 1}, step {step + 1}. "
+                                f"Consecutive: {consecutive_oom_failures}/{max_consecutive_ooms}, "
+                                f"Total: {total_oom_failures}/{total_batch_attempts} ({oom_rate:.1f}%). "
+                                f"Retrying batch (attempt {attempt_retries + 1})..."
+                            )
+
+                        # Exit if too many retries for this batch or globally
+                        if attempt_retries >= max_consecutive_ooms and rank_is_zero:
+                            print(
+                                f"[OOM] Reached {max_consecutive_ooms} consecutive OOM failures on the same batch. "
+                                f"Sleeping {oom_failure_sleep_s}s before exiting..."
+                            )
+                            time.sleep(oom_failure_sleep_s)
+                            raise RuntimeError(
+                                f"Training aborted after {max_consecutive_ooms} consecutive CUDA OOM failures on one batch."
+                            )
+
+                        if total_batch_attempts >= 20 and oom_rate > max_total_oom_percent and rank_is_zero:
+                            print(
+                                f"[OOM] OOM rate ({oom_rate:.1f}%) exceeds threshold ({max_total_oom_percent}%). "
+                                f"Sleeping {oom_failure_sleep_s}s before exiting..."
+                            )
+                            time.sleep(oom_failure_sleep_s)
+                            raise RuntimeError(
+                                f"Training aborted: {total_oom_failures}/{total_batch_attempts} forward attempts failed with OOM ({oom_rate:.1f}%)."
+                            )
+
+                        # Retry the same batch with cleared caches
+                        continue
                 
                 # Only update weights after accumulation steps
                 if step % self.config.gradient_accumulation_steps == 0:
@@ -1412,22 +1569,22 @@ class Distiller(
                     self.global_step += 1
                     # Update KD temperature per schedule if enabled
                     if bool(getattr(self.config, "anneal_kd_temperature", False)):
-                        self.config.kd_temperature = kd_T_at(self.global_step)
+                        self.config.kd_temperature = kd_schedule.kd_T_at(self.global_step)
                         # Log the current KD temperature to visualize the annealing schedule
-                        if self.logger:
+                        if self.logger and rank_is_zero:
                             self.logger.log_scalar("train/kd_temperature", float(self.config.kd_temperature), self.global_step)
                     reward_metrics = None
-                    if self.bandit_manager is not None:
+                    if self.bandit_manager is not None and self.teacher_available:
                         # Consume queued actions collected during forward passes and update the bandit.
                         reward_metrics = self.bandit_manager.process_rewards(self.student, self.teacher)
                     if reward_metrics:
                         last_reward_metrics = reward_metrics
-                        if self.logger:
+                        if self.logger and rank_is_zero:
                             self.logger.log(reward_metrics, self.global_step)
                     
                     # Save checkpoint if needed
                     if (self.config.checkpoint_steps > 0 and 
-                        self.global_step % self.config.checkpoint_steps == 0):
+                        self.global_step % self.config.checkpoint_steps == 0 and rank_is_zero):
                         self.save_checkpoint(epoch, step)
 
                 # logging
@@ -1451,7 +1608,7 @@ class Distiller(
                 )
                 
                 # Log metrics
-                if self.logger:
+                if self.logger and rank_is_zero:
                     log_metrics = {**metrics.to_dict(), "train/step": step + 1, "train/global_step": self.global_step}
                     if bandit_metrics:
                         log_metrics.update(bandit_metrics)
@@ -1477,11 +1634,12 @@ class Distiller(
                     if last_reward_metrics:
                         avg_reward = last_reward_metrics.get("bandit/avg_reward", 0.0)
                         reward_str = f" | bandit_reward={avg_reward:.4f}"
-                    print(
-                        f"ep{epoch + 1} step{step + 1} | "
-                        f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
-                        f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
-                    )
+                    if rank_is_zero:
+                        print(
+                            f"ep{epoch + 1} step{step + 1} | "
+                            f"loss={avg_loss:.4f} kl={avg_kl:.4f} ce={avg_ce:.4f} "
+                            f"| global_step={self.global_step}{bandit_str}{reward_str} | {elapsed:.2f}s total, {elapsed/log_every:.2f}s/step"
+                        )
                     
                     # Log averages using new combined logger or legacy loggers
                     avg_metrics = {
@@ -1497,7 +1655,7 @@ class Distiller(
                         avg_metrics.update(last_reward_metrics)
                     
                     # Log averages
-                    if self.logger:
+                    if self.logger and rank_is_zero:
                         self.logger.log(avg_metrics, self.global_step)
                         self.logger.flush()
                         
@@ -1506,12 +1664,13 @@ class Distiller(
                     bandit_steps = 0
         
         # Final checkpoint and cleanup at the end
-        if self.config.checkpoint_steps > 0:
+        if self.config.checkpoint_steps > 0 and rank_is_zero:
             print("Training completed. Performing final cleanup of old checkpoints...")
             self._cleanup_old_checkpoints()
 
         overall_train_elapsed = time.time() - overall_train_start
-        print(f"[distill] Total training duration: {overall_train_elapsed:.2f}s for {epochs} epoch(s)")
+        if rank_is_zero:
+            print(f"[distill] Total training duration: {overall_train_elapsed:.2f}s for {epochs} epoch(s)")
 
 
 __all__ = ["Distiller", "kl_from_vocab_samples"]

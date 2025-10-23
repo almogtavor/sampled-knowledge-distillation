@@ -1,13 +1,16 @@
 import argparse
 import os
 import random
+import shlex
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
 from datasets import load_dataset
+from transformers import AutoTokenizer
 
 from sampledkd.config import TrainingConfig
 from sampledkd.run_registry import (
@@ -18,10 +21,23 @@ from sampledkd.run_registry import (
     normalize_params,
     get_entry,
 )
-from sampledkd.data.dataset import AIMEJsonl, DistillCollator
+from sampledkd.data.dataset import AIMEJsonl, DistillCollator, PackedTokenDataset, PromptDataset
 from sampledkd.models.loader import load_model
 from sampledkd.distill import Distiller
+from sampledkd.distill._mixins.amp_oom import AmpOomMixin
 from sampledkd.training.entrypoint_utils import load_teacher_with_fallback, load_fineweb_subset
+from sampledkd.training.distributed import (
+    create_distributed_sampler,
+    distributed_barrier,
+    distributed_broadcast_object_list,
+    destroy_distributed,
+    is_rank0,
+    setup_distributed_context,
+)
+from sampledkd.training.offline_cache import (
+    execute_cache_plan,
+    plan_offline_cache,
+)
 
 # Import logging utils with fallback
 try:
@@ -29,7 +45,6 @@ try:
 except ImportError:
     def create_training_combined_logger(*args, **kwargs):
         return None
-
 def parse_args_to_config() -> TrainingConfig:
     """Parse command line arguments and create TrainingConfig."""
     parser = argparse.ArgumentParser(description="Entropy-guided KD for LLMs")
@@ -46,6 +61,12 @@ def parse_args_to_config() -> TrainingConfig:
         "linucb",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
+    parser.add_argument(
+        "--normalize_topk_by_length",
+        action="store_true",
+        default=False,
+        help="When set, top-k token quota is based on the batch-average valid length instead of per-example length",
+    )
     parser.add_argument("--kd_temperature", type=float, default=2.0, help="Unified KD temperature for teacher/student log-softmax and T^2 scaling")
     parser.add_argument("--entropy_approx_temperature", type=float, default=2.0, help="Temperature for offline entropy approximation (and RS-KD proposal)")
     # KD temperature annealing controls
@@ -109,6 +130,19 @@ def parse_args_to_config() -> TrainingConfig:
                         help="name of answer column for HF datasets")
     parser.add_argument("--fineweb_tokens", type=int, default=50_000_000,
                         help="Token budget when streaming FineWeb-Edu (used when datasets[0] == 'fineweb')")
+    parser.add_argument(
+        "--disable_packing",
+        dest="enable_packing",
+        action="store_false",
+        help="Disable sequence packing into fixed-length windows",
+    )
+    parser.add_argument(
+        "--enable_packing",
+        dest="enable_packing",
+        action="store_true",
+        help="Enable sequence packing into fixed-length windows",
+    )
+    parser.set_defaults(enable_packing=True)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, 
@@ -141,13 +175,17 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--rs_vocab_beta", type=float, default=1.0,
                         help="Proposal exponent: q ∝ p^beta (beta=1 is proportional to p).")
     # Sampled softmax elimination (only in cached RS-KD path)
-    parser.add_argument("--eliminate_softmax", action="store_true", default=True,
+    parser.add_argument("--eliminate_softmax", action="store_true", default=False,
                         help="Eliminate full-vocab softmax in cached RS-KD path using sampled softmax and importance correction")
     parser.add_argument("--no_eliminate_softmax", dest="eliminate_softmax", action="store_false",
                         help="Disable softmax elimination (force full-vocab softmax).")
 
     parser.add_argument("--sampled_softmax_negatives", type=int, default=1500,
                         help="Number of uniform negative samples per position when --eliminate_softmax is set")
+    parser.add_argument("--ddp_offline", action="store_true", default=False,
+                        help="Enable distributed (torchrun) offline-mode training across multiple GPUs")
+    parser.add_argument("--no_ddp_offline", dest="ddp_offline", action="store_false",
+                        help="Disable distributed offline mode (single-process run)")
     # Global-Level Selection (GLS) over tokens — only impacts top-k-tok when enabled
     parser.add_argument("--gls_enabled", action="store_true", default=False,
                         help="Enable global-level selection FIFO queue (only impacts top-k-tok)")
@@ -175,27 +213,41 @@ def parse_args_to_config() -> TrainingConfig:
 def main():
     """Main training function using Pydantic configuration."""
     config = parse_args_to_config()
+
+    ddp_ctx = setup_distributed_context(config)
+    ddp_world_size = ddp_ctx.world_size
+    ddp_rank = ddp_ctx.rank
+    ddp_local_rank = ddp_ctx.local_rank
+    is_main_rank = ddp_ctx.is_main_rank
     
     # Print all CLI parameters at startup
-    print("=" * 80)
-    print("TRAINING CONFIGURATION")
-    print("=" * 80)
-    try:
-        params_dict = config.model_dump()
-    except Exception:
-        params_dict = vars(config)
-    
-    for key, value in sorted(params_dict.items()):
-        print(f"  {key:30s} = {value}")
-    print("=" * 80)
-    print()
+    print("[launch] python", " ".join(sys.argv), flush=True)
+    if is_main_rank:
+        print("=" * 80)
+        print("TRAINING CONFIGURATION")
+        print("=" * 80)
+        try:
+            params_dict = config.model_dump()
+        except Exception:
+            params_dict = vars(config)
+        
+        for key, value in sorted(params_dict.items()):
+            print(f"  {key:30s} = {value}")
+        print("=" * 80)
+        print()
+    else:
+        try:
+            params_dict = config.model_dump()
+        except Exception:
+            params_dict = vars(config)
 
     # global seeding
-    random.seed(config.seed)
-    np.random.seed(config.seed)
-    torch.manual_seed(config.seed)
+    seed_offset = config.seed + ddp_rank
+    random.seed(seed_offset)
+    np.random.seed(seed_offset)
+    torch.manual_seed(seed_offset)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config.seed)
+        torch.cuda.manual_seed_all(seed_offset)
 
     # Optional deterministic mode
     if getattr(config, "deterministic", False):
@@ -232,162 +284,186 @@ def main():
 
     # ----------------- runs registry preflight -----------------
     registry_path = Path(getattr(config, "runs_registry", "results/runs.json"))
-    # Build a stable hash over parameters (exclude dates/job ids)
     try:
         params_dict = config.model_dump()
     except Exception:
-        # Fallback for older Pydantic versions
         params_dict = vars(config)
     params_hash = compute_params_hash(params_dict)
 
-    if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
-        entry = get_entry(registry_path, params_hash)
-        completed_eval = bool(entry and entry.get("completed_eval"))
-        runs_info = entry.get("runs", {}) if entry else {}
-        existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
-        print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
-        needs_eval = not completed_eval
-        meta_output_dir = existing_output_dir or ""
-        print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
-        sys.exit(11 if needs_eval else 10)
+    if is_main_rank:
+        if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
+            entry = get_entry(registry_path, params_hash)
+            completed_eval = bool(entry and entry.get("completed_eval"))
+            runs_info = entry.get("runs", {}) if entry else {}
+            existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
+            print(f"[registry] Run with identical parameters already exists (id={params_hash}). Use --override to force rerun. Exiting gracefully.")
+            needs_eval = not completed_eval
+            meta_output_dir = existing_output_dir or ""
+            print(f"[registry] duplicate params_hash={params_hash} needs_eval={int(needs_eval)} output_dir={meta_output_dir}")
+            sys.exit(11 if needs_eval else 10)
 
-    # Create experiment name early (not part of the hash)
-    current_date = datetime.now().strftime("%Y%m%d_%H%M")
-    job_id = os.getenv("SLURM_JOB_ID", "local")
-    experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
-    if config.distill_type == "top-k-tok" or config.distill_type == "random":
-        experiment_name += f"_k={config.k_percent}"
-    elif config.distill_type == "bucket":
-        experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
+        current_date = datetime.now().strftime("%Y%m%d_%H%M")
+        job_id = os.getenv("SLURM_JOB_ID", "local")
+        experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+        if config.distill_type in {"top-k-tok", "random"}:
+            experiment_name += f"_k={config.k_percent}"
+        elif config.distill_type == "bucket":
+            experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
-    upsert_run_start(
-        registry_path,
-        params_dict,
-        experiment_name=experiment_name,
-        job_id=job_id,
-        model_output_dir=config.output_dir,
-    )
+        cli_args = " ".join(shlex.quote(arg) for arg in sys.argv)
+        upsert_run_start(
+            registry_path,
+            params_dict,
+            experiment_name=experiment_name,
+            job_id=job_id,
+            model_output_dir=config.output_dir,
+            launch_args=cli_args,
+        )
+    else:
+        current_date = datetime.now().strftime("%Y%m%d_%H%M")
+        job_id = os.getenv("SLURM_JOB_ID", "local")
+        experiment_name = f"distill-{config.distill_type}-{current_date}_{job_id}"
+        if config.distill_type in {"top-k-tok", "random"}:
+            experiment_name += f"_k={config.k_percent}"
+        elif config.distill_type == "bucket":
+            experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
     # Persist normalized params and hash alongside model outputs for downstream eval
-    try:
-        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-        params_out = Path(config.output_dir) / "run_params.json"
-        with open(params_out, "w", encoding="utf-8") as f:
-            import json as _json
-            _json.dump({
-                "id": params_hash,
-                "params": normalize_params(params_dict),
-            }, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        print(f"[registry] Warning: failed to write run_params.json: {e}")
+    if is_main_rank:
+        try:
+            Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+            params_out = Path(config.output_dir) / "run_params.json"
+            with open(params_out, "w", encoding="utf-8") as f:
+                import json as _json
+                _json.dump({
+                    "id": params_hash,
+                    "params": normalize_params(params_dict),
+                }, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[registry] Warning: failed to write run_params.json: {e}")
 
     # ----------------- teacher / student device planning -----------------
     device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if device_count == 0:
         raise RuntimeError("No CUDA devices available.")
 
-    # Calculate total VRAM across all GPUs
     total_vram_gb = 0
     for i in range(device_count):
         vram_bytes = torch.cuda.get_device_properties(i).total_memory
-        total_vram_gb += vram_bytes / (1024**3)  # Convert bytes to GB
-    print("Success: Detected " + str(device_count) + " GPUs with " + str(round(total_vram_gb, 1)) + " GB total VRAM available.")
+        total_vram_gb += vram_bytes / (1024**3)
+    if is_main_rank:
+        print(
+            "Success: Detected "
+            + str(device_count)
+            + " GPUs with "
+            + str(round(total_vram_gb, 1))
+            + " GB total VRAM available."
+        )
 
-    # Dynamic GPU allocation normalized to local indices [0..N-1]
-    # When CUDA_VISIBLE_DEVICES=1,3,4,5, local torch sees devices as [0,1,2,3]
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
     if cvd:
         physical = [int(x) for x in cvd.split(",") if x != ""]
-        # local indices are 0..len(physical)-1
         local_avail = list(range(len(physical)))
     else:
         physical = list(range(device_count))
         local_avail = list(range(device_count))
 
-    # Reserve one local GPU for student (pick 1 if exists else 0)
-    student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
-    student_device = torch.device(f"cuda:{student_local}")
-    # Teacher uses remaining local indices
-    teacher_locals = [g for g in local_avail if g != student_local]
-    
-    print(f"CUDA_VISIBLE_DEVICES: {cvd}")
-    print(f"Available GPUs (local indices): {local_avail}")
-    print(f"Student GPU (local): {student_local}")
-    print(f"Teacher GPUs (local): {teacher_locals}")
-
-    print("Loading teacher with GPU-first fallback...", flush=True)
-    teacher, tok, teacher_inputs_device = load_teacher_with_fallback(
-        model_name=config.teacher_model,
-        prefer_gpus=teacher_locals,
-        student_gpu=student_local,
-    )
-
-    print("Loading student on its own GPU...", flush=True)
-    student = load_model(  # your existing helper is fine for student
-        config.student_model,
-        device_map=student_local,     # {'': 1} but using local index
-        quant_bits=config.student_quant_bits,
-    )
-
-    # Freeze teacher, no grads (redundant but safe)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    # Reduce memory footprint during forward
-    teacher.config.use_cache = False
-
-    # Ensure student is in training mode - keep parameters in FP32 for gradient computation
-    student.train()
-    student.config.use_cache = False
-        
-    print(f"Teacher device: {teacher_inputs_device}")
-    print(f"Student device: {student_device}")
-    
-    if student_device.type == "cuda":
-        print(f"Using GPU: {torch.cuda.get_device_name(student_device.index)} (device {student_device.index})")
-        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
-        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
+    if config.ddp_offline:
+        if ddp_local_rank >= len(local_avail):
+            raise RuntimeError(f"LOCAL_RANK={ddp_local_rank} exceeds available GPUs {local_avail}")
+        student_local = ddp_local_rank
+        student_device = torch.device(f"cuda:{student_local}")
+        teacher_locals = [student_local]
+        teacher_student_exclusion = None
     else:
-        print(f"Using device: {student_device}")
+        student_local = local_avail[1] if len(local_avail) >= 2 else local_avail[0]
+        student_device = torch.device(f"cuda:{student_local}")
+        teacher_locals = [g for g in local_avail if g != student_local]
+        if teacher_locals:
+            teacher_student_exclusion = student_local
+        else:
+            teacher_locals = [student_local]
+            teacher_student_exclusion = None
+    
+    if is_main_rank:
+        print(f"CUDA_VISIBLE_DEVICES: {cvd}")
+        print(f"Available GPUs (local indices): {local_avail}")
+    print(f"[rank {ddp_rank}] Student GPU (local): {student_local}")
+    print(f"[rank {ddp_rank}] Teacher GPUs (local): {teacher_locals}")
+
+    # ---- Tokenizer and dataset preparation (before teacher load) ----
+    tok = AutoTokenizer.from_pretrained(
+        config.teacher_model,
+        use_fast=False,
+        trust_remote_code=True,
+        local_files_only=False,
+    )
+    if tok.pad_token_id is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
 
     if all(p.endswith(".jsonl") for p in config.datasets):
-        # Use local JSONL if paths are given TODO: make this generic
-        dataset = AIMEJsonl([Path(p) for p in config.datasets])
+        aime = AIMEJsonl([Path(p) for p in config.datasets])
+        raw_texts = [aime[i]["prompt"] for i in range(len(aime))]
     else:
-        # Special-case: FineWeb-Edu streaming with token budget
         if config.datasets[0].lower() == "fineweb":
             budget = int(getattr(config, "fineweb_tokens", 50_000_000))
             print(f"Loading FineWeb-Edu subset with {budget:,} tokens, seed {config.seed}")
-            dataset = load_fineweb_subset(tok, max_tokens=budget, seed=config.seed, max_seq_len=config.max_seq_len)
+            cached_examples = load_fineweb_subset(
+                tok,
+                max_tokens=budget,
+                seed=config.seed,
+                max_seq_len=config.max_seq_len,
+                packing_enabled=bool(getattr(config, "enable_packing", True)),
+            )
+            raw_texts = [ex["prompt"] for ex in cached_examples]
         else:
-            # Load from Hugging Face dataset if user passes HF dataset name
             print(f"Loading Hugging Face dataset: {config.datasets[0]}")
             hf_dataset = load_dataset(config.datasets[0], config.dataset_config)["train"] if config.dataset_config \
                 else load_dataset(config.datasets[0])["train"]
-            print(f"Using columns - prompt: '{config.prompt_col}', answer: '{config.answer_col}'")
-            examples = []
+            prompt_col = config.prompt_col or "prompt"
+            answer_col = config.answer_col
+            print(f"Using columns - prompt: '{prompt_col}', answer: '{answer_col}'")
+            raw_texts = []
             for ex in hf_dataset:
-                examples.append({
-                    "prompt": ex[config.prompt_col],
-                    "answer": ex[config.answer_col],
-                })
-            dataset = examples
+                prompt_text = ex[prompt_col]
+                if answer_col is not None and answer_col in ex and ex[answer_col] is not None:
+                    raw_texts.append(f"{prompt_text}\n{ex[answer_col]}")
+                else:
+                    raw_texts.append(prompt_text)
 
-    # (Removed) special-case subsampling for deprecated 'entropy-top-k-with-softmax'
+    if getattr(config, "enable_packing", True):
+        dataset = PackedTokenDataset(raw_texts, tok, config.max_seq_len)
+        if len(dataset) == 0:
+            raise RuntimeError("Packed dataset is empty. Reduce max_seq_len or provide longer input texts.")
+    else:
+        dataset = PromptDataset(raw_texts)
+        if len(dataset) == 0:
+            raise RuntimeError("Dataset is empty. Provide non-empty input texts.")
+
+    packed_dataset = dataset
 
     collate = DistillCollator(tok, config.max_seq_len)
-    # Seeded DataLoader generator for reproducible shuffling
     gen = torch.Generator()
     gen.manual_seed(config.seed)
+
     def _seed_worker(worker_id: int):
         base = int(config.seed)
         np.random.seed(base + worker_id)
         random.seed(base + worker_id)
 
+    sampler = create_distributed_sampler(
+        dataset,
+        config=config,
+        seed=seed_offset,
+        shuffle=True,
+        drop_last=False,
+    )
+
     dl = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         collate_fn=collate,
         num_workers=min(8, os.cpu_count() or 1),
         pin_memory=True,
@@ -396,12 +472,145 @@ def main():
         worker_init_fn=_seed_worker,
     )
 
+    dataset_size = len(dataset)
+
+    teacherless_modes = {"vanilla", "top-k-tok", "bucket", "random", "linucb"}
+    cache_plan = plan_offline_cache(
+        config,
+        tok,
+        dataset_size,
+        is_main_rank=is_main_rank,
+        teacherless_modes=teacherless_modes,
+    )
+    cache_ready = cache_plan.cache_ready
+    teacher_required = cache_plan.teacher_required
+    teacher_rank0_only = cache_plan.teacher_rank0_only
+
+    force_rank0_teacher = (
+        teacher_required
+        and getattr(config, "ddp_offline", False)
+        and getattr(config, "ddp_world_size", 1) > 1
+    )
+    if force_rank0_teacher and not teacher_rank0_only:
+        cache_plan.teacher_rank0_only = True
+        teacher_rank0_only = True
+        if is_main_rank:
+            print("[device-planning] Hosting teacher on rank 0 only; other ranks will request logits via broadcast.")
+
+    if teacher_required:
+        will_load_teacher = (not teacher_rank0_only) or (ddp_rank == 0)
+        if will_load_teacher:
+            dedicated_candidates: list[int] = []
+            if len(local_avail) >= 2:
+                dedicated_candidates = [g for g in local_avail if g != student_local]
+            if dedicated_candidates:
+                if teacher_student_exclusion != student_local:
+                    teacher_student_exclusion = student_local
+                if teacher_locals != dedicated_candidates:
+                    teacher_locals = dedicated_candidates
+                    should_log_pref = (
+                        (teacher_rank0_only and ddp_rank == 0)
+                        or (not teacher_rank0_only and (is_main_rank or not config.ddp_offline))
+                    )
+                    if should_log_pref:
+                        print(
+                            f"[device-planning] Preferring dedicated teacher GPU(s) {teacher_locals} with student on {student_local}",
+                            flush=True,
+                        )
+
+    teacher = None
+    teacher_inputs_device = torch.device("cpu")
+    if teacher_required:
+        load_here = not teacher_rank0_only or is_rank0()
+        if load_here:
+            if is_main_rank or not config.ddp_offline:
+                print("Loading teacher with GPU-first fallback...", flush=True)
+            teacher, _, teacher_inputs_device = load_teacher_with_fallback(
+                model_name=config.teacher_model,
+                prefer_gpus=teacher_locals,
+                student_gpu=teacher_student_exclusion,
+            )
+        elif is_main_rank:
+            print("Teacher will be hosted on rank 0; skipping local load on this rank.")
+
+    # Optionally pre-build offline cache before loading students to free teacher VRAM
+    cache_result = execute_cache_plan(
+        cache_plan,
+        config=config,
+        tok=tok,
+        packed_dataset=packed_dataset,
+        collate_fn=collate,
+        teacher=teacher,
+        teacher_inputs_device=teacher_inputs_device,
+        seed_offset=seed_offset,
+        sanitize_logits_fn=AmpOomMixin._sanitize_logits,
+        is_main_rank=is_main_rank,
+        teacherless_modes=teacherless_modes,
+    )
+
+    teacher = cache_result.teacher
+    teacher_inputs_device = cache_result.teacher_inputs_device
+    cache_ready = cache_result.cache_ready
+    teacher_required = cache_result.teacher_required
+    teacher_rank0_only = cache_result.teacher_rank0_only
+    if force_rank0_teacher:
+        teacher_rank0_only = True
+
+
+    teacher_device_str = str(teacher_inputs_device)
+
+    if getattr(config, "ddp_offline", False):
+        if teacher_rank0_only:
+            obj = [teacher_device_str] if is_rank0() else [None]
+            obj = distributed_broadcast_object_list(obj, src=0)
+            teacher_device_str = obj[0] or teacher_device_str
+        teacher_inputs_device = torch.device(teacher_device_str)
+        distributed_barrier()
+    else:
+        teacher_inputs_device = torch.device(teacher_device_str)
+
+    setattr(config, "_teacher_device_str", teacher_device_str)
+    setattr(config, "_teacher_rank0_owner", teacher_rank0_only)
+    setattr(config, "_teacher_required", teacher_required)
+
+    print("Loading student on its own GPU...", flush=True)
+    student = load_model(
+        config.student_model,
+        device_map=student_local,
+        quant_bits=config.student_quant_bits,
+    )
+
+    if teacher is not None:
+        teacher.eval()
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        teacher.config.use_cache = False
+
+    student.train()
+    student.config.use_cache = False
+
+    if teacher is not None or teacher_required:
+        print(f"Teacher device: {teacher_inputs_device}")
+    else:
+        if is_main_rank:
+            print("Teacher load skipped; using offline cache exclusively for teacher signals.")
+    print(f"Student device: {student_device}")
+
+    if student_device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(student_device.index)} (device {student_device.index})")
+        print(f"GPU memory allocated: {torch.cuda.memory_allocated(student_device) / 1024**3:.2f} GB")
+        print(f"GPU memory reserved: {torch.cuda.memory_reserved(student_device) / 1024**3:.2f} GB")
+    else:
+        print(f"Using device: {student_device}")
+
     # Initialize logging with experiment name (built above)
     
     # Initialize combined logger (W&B + TensorBoard)
-    combined_logger = create_training_combined_logger(
-        config, experiment_name, tensorboard_dir=config.tensorboard_dir
-    )
+    combined_logger = None
+    if is_main_rank:
+        combined_logger = create_training_combined_logger(
+            config, experiment_name, tensorboard_dir=config.tensorboard_dir
+        )
 
     distiller = Distiller(
         teacher_model=teacher,
@@ -416,23 +625,32 @@ def main():
 
     distiller.train(epochs=config.epochs)
 
-    # Close logging  
-    if combined_logger:
+    if getattr(config, "ddp_offline", False):
+        distributed_barrier()
+
+    if is_main_rank:
+        if combined_logger:
+            try:
+                combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
+                combined_logger.finish()
+            except Exception:
+                pass
+
+        model_to_save = getattr(distiller, "student", student)
+        if hasattr(model_to_save, "module"):
+            model_to_save = model_to_save.module
+        print("Saving student to", config.output_dir)
+        model_to_save.save_pretrained(config.output_dir)
+        tok.save_pretrained(config.output_dir)
+
         try:
-            combined_logger.log_artifact(config.output_dir, f"student_model_{experiment_name}", "model")
-            combined_logger.finish()
-        except Exception:
-            pass
+            mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
+        except Exception as e:
+            print(f"[registry] Failed to mark trained: {e}")
 
-    print("Saving student to", config.output_dir)
-    student.save_pretrained(config.output_dir)
-    tok.save_pretrained(config.output_dir)
-
-    # Mark trained in registry
-    try:
-        mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
-    except Exception as e:
-        print(f"[registry] Failed to mark trained: {e}")
+    if getattr(config, "ddp_offline", False):
+        distributed_barrier()
+        destroy_distributed()
 
 
 if __name__ == "__main__":

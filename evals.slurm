@@ -142,6 +142,13 @@ SUITE=${2:-}
 MODE_ARG=${3:-}
 OUTPUT_DIR=${4:-"evaluation_json_results"}
 
+if [[ $# -gt 4 ]]; then
+  shift 4
+  EXTRA_EVAL_ARGS=("$@")
+else
+  EXTRA_EVAL_ARGS=()
+fi
+
 if [[ -z "$MODEL_PATH" || -z "$SUITE" ]]; then
   echo "Error: missing args. Usage: sbatch evals.slurm <MODEL_PATH> <SUITE: heavy|light> [from_hf|from_path] [OUTPUT_DIR]"
   exit 2
@@ -166,6 +173,9 @@ EVAL_ARGS=(
 # Forward optional mode flag to eval.py
 if [[ "$MODE_ARG" == "from_hf" ]]; then
   EVAL_ARGS+=( --from_hf )
+fi
+if [[ ${#EXTRA_EVAL_ARGS[@]} -gt 0 ]]; then
+  EVAL_ARGS+=( "${EXTRA_EVAL_ARGS[@]}" )
 fi
 LOG_BASENAME=$(echo "$MODEL_PATH" | sed 's#[/ ]#_#g')
 srun -u "$PY" sampledkd/evaluations/eval.py "$MODEL_PATH" "${EVAL_ARGS[@]}" | tee "eval_runs/${LOG_BASENAME}.${SLURM_JOB_ID}.${SUITE}.log"

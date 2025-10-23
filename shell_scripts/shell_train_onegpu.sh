@@ -78,7 +78,7 @@ export TORCH_HOME="$TMP/torch";              mkdir -p "$TORCH_HOME"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export ACCELERATE_LOG_LEVEL=info
 export TRANSFORMERS_VERBOSITY=info
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+# export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 
 # ---------- Weights & Biases ----------
 export WANDB_PROJECT=${WANDB_PROJECT:-selective-entropy-knowledge-distillation}
@@ -279,10 +279,12 @@ else
   echo "No eval suite provided → skipping eval."
 fi
 
-# Save a copy of the log with a descriptive filename
+# Save a copy of the log with a descriptive filename bucketed by run label
+RUN_LABEL="${AUTOPILOT_RUN_LABEL:-run0000}"
 SAFE_TYPE="$DISTILL_TYPE_DIR"
-RICH_LOG="results/logs/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${JOB_ID}.log"
-mkdir -p "$(dirname "$RICH_LOG")"
+RICH_LOG_DIR="results/logs/${RUN_LABEL}"
+mkdir -p "$RICH_LOG_DIR"
+RICH_LOG="${RICH_LOG_DIR}/train_${DATE_TAG}_${SAFE_TYPE}_k${K_PERCENT}_${JOB_ID}.log"
 if [[ -f "$LOG_FILE" ]]; then
   cp -f "$LOG_FILE" "$RICH_LOG" || true
   echo "Saved rich log copy to $RICH_LOG"

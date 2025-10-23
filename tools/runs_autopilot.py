@@ -34,9 +34,19 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+# Ensure repo root is on sys.path for direct script execution
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from pydantic import ValidationError
+
+from sampledkd.config import TrainingConfig
+from sampledkd.run_registry import compute_params_hash
 
 DEFAULT_REGISTRY = Path("results/runs.json")
 DEFAULT_STATE = Path("results/automation_state.json")
@@ -51,119 +61,554 @@ EVAL_JOB_PREFIX = "ekdE-"
 TRAIN_NAME_FALLBACKS = ("ekd-train", "ekd-trai")
 EVAL_NAME_FALLBACKS = ("ekd-eval",)
 
+COUNTER_FILE = REPO_ROOT / "results/.autopilot_serial"
+
+_DUMMY_OUTPUT_DIR = str(REPO_ROOT / "_autopilot_dummy_output")
+_DUMMY_TENSORBOARD_DIR = "tb/_autopilot_dummy"
+
+
+def _load_next_run_serial(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last = 0
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if raw:
+            last = int(raw)
+    except Exception:
+        last = 0
+    serial = last + 1
+    path.write_text(str(serial), encoding="utf-8")
+    return serial
+
 # Optional manual submission sequence. Each entry is consumed in order and can
 # override environment variables per training launch. The structure mirrors the
 # sbatch lines used in kd_sweep.sh so you can copy/paste the combos you care
 # about. Remove or comment out entries you don't need.
 CUSTOM_TRAIN_SEQUENCE = [
+    # RS-KD (distill all tokens) - to create the cache
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+            "NO_OFFLINE": "1",
+        },
+    },
+    # RS-KD with higher CE weight
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 20,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "5000000",
+    #         "ALPHA_CE": "0.3",
+    #     },
+    # },
+    # RS-KD no CE
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.0",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "1.0",
+        },
+    },
+    # RS-KD only CE
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.0",
+            "NO_OFFLINE": "1",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.1",
+            "NO_OFFLINE": "1",
+        },
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "1.0",
+        },
+    },
+    # Without offline cache (TSKD):
+    # RS-KD (distill all tokens)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "NO_OFFLINE": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-15%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 15,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-20%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-25%)
     {
         "distill_type": "top-k-tok",
         "k_percent": 25,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-30%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 30,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-75%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 75,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (bucket of 5%-20%)
+    {
+        "distill_type": "bucket",
+        "k_percent": 0,  # ignored by bucket; env below defines the band
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "BUCKET_LOWER_PERCENT": "5",
+            "BUCKET_UPPER_PERCENT": "20",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (random 20%)
+    {
+        "distill_type": "random",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "RANDOM_TOKEN_SELECTION": "1",  # your training script should read this flag
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (pos-rs-kd top-20%)
+    {
+        "distill_type": "pos-rs-kd",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (top-20%, GLS queue 50k, offline cache disabled)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "GLS_ENABLED": "1",
+            "GLS_QUEUE_SIZE": "50000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (top-k-tok top-20%, GLS queue 50k, offline cache enabled)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "GLS_ENABLED": "1",
+            "GLS_QUEUE_SIZE": "50000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # TSKD (entropy top-20%, GLS)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
             "GLS_ENABLED": "1",
-            "FINEWEB_TOKENS": "10000000",
+            "FINEWEB_TOKENS": "5000000",
+            "NO_OFFLINE": "1",
+            "ALPHA_CE": "0.3",
         },
     },
+
+    # TSKD (score top-20%)
+    # Combined score with z-normalization (entropy + CE + KL).
     {
         "distill_type": "top-k-tok",
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "SCORE_TOKEN_SELECTION": "1",
+            "SCORE_NORMALIZE": "z",
+            "SCORE_ENTROPY_WEIGHT": "1.0",
+            "SCORE_CE_WEIGHT": "1.0",
+            "SCORE_KL_WEIGHT": "1.0",
             "NO_OFFLINE": "1",
         },
     },
+
+    # TSKD (LinUCB)
     {
-        "distill_type": "top-k-tok",
-        "k_percent": 30,
+        "distill_type": "linucb",
+        "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
         },
     },
+
+    
+    
+    # # RS-KD (distill all tokens)
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 100,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "5000000",
+    #     },
+    # },
+
+    # Sampled KD (entropy top-15%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 15,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (entropy top-20%)
     {
         "distill_type": "top-k-tok",
         "k_percent": 20,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 30,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-        },
-    },
+
+    # Sampled KD (entropy top-25%)
     {
         "distill_type": "top-k-tok",
         "k_percent": 25,
         "env": {
             "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "SCORE_TOKEN_SELECTION": 1,
-            "SCORE_NORMALIZE": "z",
-            "SCORE_ENTROPY_WEIGHT": 1.0,
-            "SCORE_CE_WEIGHT": 1.0,
-            "SCORE_KL_WEIGHT": 1.0
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
         },
     },
+
+    # Sampled KD (entropy top-30%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 30,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (entropy top-75%)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 75,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (bucket of 5%-20%)
+    {
+        "distill_type": "bucket",
+        "k_percent": 0,  # ignored by bucket; env below defines the band
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "BUCKET_LOWER_PERCENT": "5",
+            "BUCKET_UPPER_PERCENT": "20",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (random 20%)
+    {
+        "distill_type": "random",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "RANDOM_TOKEN_SELECTION": "1",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (pos-rs-kd top-20%)
+    {
+        "distill_type": "pos-rs-kd",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (entropy top-20%, GLS)
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "GLS_ENABLED": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.3",
+        },
+    },
+
+    # Sampled KD (score top-20%)
+    # Combined score with z-normalization (entropy + CE + KL).
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "SCORE_TOKEN_SELECTION": "1",
+            "SCORE_NORMALIZE": "z",
+            "SCORE_ENTROPY_WEIGHT": "1.0",
+            "SCORE_CE_WEIGHT": "1.0",
+            "SCORE_KL_WEIGHT": "1.0",
+        },
+    },
+
+    # Sampled KD (LinUCB)
+    {
+        "distill_type": "linucb",
+        "k_percent": 20,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+        },
+    },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 100,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "4000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "GLS_ENABLED": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 30,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 20,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 30,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #     },
+    # },
     # {
     #     "distill_type": "top-k-tok",
     #     "k_percent": 25,
     #     "env": {
     #         "NO_ELIMINATE_SOFTMAX": "1",
     #         "NO_OFFLINE": "1",
-    #         "DATASETS": "gsm8k",
-    #         "DATASET_CONFIG": "main",
-    #         "PROMPT_COL": "question",
-    #         "ANSWER_COL": "answer",
+    #         "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
     #     },
     # },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "pos-rs-kd",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "NO_OFFLINE": "1",
-            "GLS_ENABLED": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "top-k-tok",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
-    {
-        "distill_type": "pos-rs-kd",
-        "k_percent": 25,
-        "env": {
-            "NO_ELIMINATE_SOFTMAX": "1",
-            "FINEWEB_TOKENS": "10000000",
-        },
-    },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "STUDENT_MODEL": "Qwen/Qwen3-1.7B",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "SCORE_TOKEN_SELECTION": 1,
+    #         "SCORE_NORMALIZE": "z",
+    #         "SCORE_ENTROPY_WEIGHT": 1.0,
+    #         "SCORE_CE_WEIGHT": 1.0,
+    #         "SCORE_KL_WEIGHT": 1.0
+    #     },
+    # },
+    # # {
+    # #     "distill_type": "top-k-tok",
+    # #     "k_percent": 25,
+    # #     "env": {
+    # #         "NO_ELIMINATE_SOFTMAX": "1",
+    # #         "NO_OFFLINE": "1",
+    # #         "DATASETS": "gsm8k",
+    # #         "DATASET_CONFIG": "main",
+    # #         "PROMPT_COL": "question",
+    # #         "ANSWER_COL": "answer",
+    # #     },
+    # # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "pos-rs-kd",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "NO_OFFLINE": "1",
+    #         "GLS_ENABLED": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "top-k-tok",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
+    # {
+    #     "distill_type": "pos-rs-kd",
+    #     "k_percent": 25,
+    #     "env": {
+    #         "NO_ELIMINATE_SOFTMAX": "1",
+    #         "FINEWEB_TOKENS": "10000000",
+    #     },
+    # },
 ]
 
 
@@ -311,7 +756,10 @@ def run_sbatch(
     cmd.extend(args)
     merged_env = os.environ.copy()
     if env:
-        merged_env.update(env)
+        for key, value in env.items():
+            if value is None:
+                continue
+            merged_env[key] = str(value)
     try:
         res = subprocess.run(cmd, check=True, capture_output=True, text=True, env=merged_env)
     except subprocess.CalledProcessError as exc:
@@ -341,6 +789,191 @@ class SchedulerContext:
     tag_default: str
     dry_run: bool
     train_sequence: List[dict]
+    sequence_only: bool
+    run_serial: int
+
+    def __post_init__(self) -> None:
+        self.completed_hashes = {
+            entry.get("id")
+            for entry in self.registry
+            if entry.get("id") and entry.get("completed_train") and entry.get("completed_eval")
+        }
+        self._dummy_output_dir = _DUMMY_OUTPUT_DIR
+        self._dummy_tensorboard_dir = _DUMMY_TENSORBOARD_DIR
+        self.run_label = f"run{self.run_serial:04d}"
+        if self.tag_default:
+            self.tag_with_run = f"{self.tag_default}-{self.run_label}"
+        else:
+            self.tag_with_run = self.run_label
+
+    @staticmethod
+    def _coerce_int(value: Optional[object]) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_float(value: Optional[object]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _coerce_bool(value: Optional[object]) -> Optional[bool]:
+        if value is None:
+            return None
+        val = str(value).strip().lower()
+        if val in {"0", "false", "off", "no", "none", ""}:
+            return False
+        if val in {"1", "true", "on", "yes"}:
+            return True
+        return None
+
+    @staticmethod
+    def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            ts = value.strip()
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is not None:
+                return dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            return None
+
+    def _apply_env_overrides(self, params: dict, env: Dict[str, str]) -> None:
+        if not env:
+            return
+        if "NO_OFFLINE" in env:
+            params["offline_cache"] = False
+        if "OFFLINE_CACHE" in env:
+            value = self._coerce_bool(env.get("OFFLINE_CACHE"))
+            if value is not None:
+                params["offline_cache"] = value
+        if "NO_DDP_OFFLINE" in env:
+            params["ddp_offline"] = False
+        if "DDP_OFFLINE" in env:
+            value = self._coerce_bool(env.get("DDP_OFFLINE"))
+            if value is not None:
+                params["ddp_offline"] = value
+        if "NO_ELIMINATE_SOFTMAX" in env:
+            params["eliminate_softmax"] = False
+        if "GLS_ENABLED" in env:
+            value = self._coerce_bool(env.get("GLS_ENABLED"))
+            if value is not None:
+                params["gls_enabled"] = value
+        if "SCORE_TOKEN_SELECTION" in env:
+            value = self._coerce_bool(env.get("SCORE_TOKEN_SELECTION"))
+            if value is not None:
+                params["score_token_selection"] = value
+        if "SCORE_NORMALIZE" in env:
+            params["score_normalize"] = str(env.get("SCORE_NORMALIZE"))
+        for key_env, key_param in (
+            ("SCORE_ENTROPY_WEIGHT", "score_entropy_weight"),
+            ("SCORE_CE_WEIGHT", "score_ce_weight"),
+            ("SCORE_KL_WEIGHT", "score_kl_weight"),
+            ("ALPHA_CE", "alpha_ce"),
+            ("RS_ALPHA", "rs_alpha"),
+            ("RS_EPSILON", "rs_epsilon"),
+            ("RS_FLOOR", "rs_floor"),
+            ("RS_VOCAB_BETA", "rs_vocab_beta"),
+        ):
+            value = self._coerce_float(env.get(key_env))
+            if value is not None:
+                params[key_param] = value
+        for key_env, key_param in (
+            ("FINEWEB_TOKENS", "fineweb_tokens"),
+            ("RS_VOCAB_SAMPLES", "rs_vocab_samples"),
+            ("SAMPLED_SOFTMAX_NEGATIVES", "sampled_softmax_negatives"),
+            ("BUCKET_LOWER_PERCENT", "bucket_lower_percent"),
+            ("BUCKET_UPPER_PERCENT", "bucket_upper_percent"),
+            ("GLS_QUEUE_SIZE", "gls_queue_size"),
+            ("SEED", "seed"),
+            ("EPOCHS", "epochs"),
+        ):
+            value = self._coerce_int(env.get(key_env))
+            if value is not None:
+                params[key_param] = value
+        if env.get("DATASETS"):
+            params["datasets"] = str(env.get("DATASETS")).split()
+        if env.get("DATASET_CONFIG"):
+            params["dataset_config"] = str(env.get("DATASET_CONFIG"))
+        if env.get("PROMPT_COL"):
+            params["prompt_col"] = str(env.get("PROMPT_COL"))
+        if env.get("ANSWER_COL"):
+            params["answer_col"] = str(env.get("ANSWER_COL"))
+
+    def _build_candidate_params(
+        self,
+        base_params: Optional[dict],
+        env: Dict[str, str],
+        distill_type: Optional[str],
+        k_percent: Optional[int],
+    ) -> dict:
+        params = dict(base_params or {})
+        if distill_type is not None:
+            params["distill_type"] = distill_type
+        if k_percent is not None:
+            params["k_percent"] = k_percent
+        self._apply_env_overrides(params, env)
+        return params
+
+    def _canonicalize_params(self, params: dict) -> dict:
+        if not params:
+            return {}
+        candidate = dict(params)
+        candidate.setdefault("output_dir", self._dummy_output_dir)
+        candidate.setdefault("tensorboard_dir", self._dummy_tensorboard_dir)
+        try:
+            cfg = TrainingConfig(**candidate)
+        except ValidationError:
+            return dict(params)
+        canonical = cfg.model_dump()
+        canonical.pop("output_dir", None)
+        canonical.pop("tensorboard_dir", None)
+        return canonical
+
+    def _params_already_completed(self, params: dict) -> bool:
+        if not params:
+            return False
+        hashes = set()
+
+        def _add_hash(variant: dict) -> None:
+            canonical = self._canonicalize_params(variant)
+            target = canonical if canonical else dict(variant)
+            try:
+                hashes.add(compute_params_hash(target))
+            except Exception:
+                pass
+
+        base = dict(params)
+        _add_hash(base)
+
+        if "ddp_offline" in base:
+            alt = dict(base)
+            alt["ddp_offline"] = not bool(base.get("ddp_offline"))
+            _add_hash(alt)
+            alt2 = dict(base)
+            alt2.pop("ddp_offline", None)
+            _add_hash(alt2)
+        else:
+            alt_true = dict(base)
+            alt_true["ddp_offline"] = True
+            _add_hash(alt_true)
+            alt_false = dict(base)
+            alt_false["ddp_offline"] = False
+            _add_hash(alt_false)
+
+        return any(h in self.completed_hashes for h in hashes if h)
 
     def active_train_jobs(self) -> Dict[str, JobInfo]:
         return {
@@ -363,6 +996,9 @@ class SchedulerContext:
         for run_id, meta in self.state.get("train_jobs", {}).items():
             job_id = str(meta.get("job_id", ""))
             if job_id and job_id in active_train_ids:
+                continue
+            if meta.get("pseudo"):
+                to_delete.append(run_id)
                 continue
             # Remove once training completed OR job disappeared and delay passed
             entry = next((r for r in self.registry if r.get("id") == run_id), None)
@@ -409,20 +1045,40 @@ class SchedulerContext:
         for run_id in to_delete:
             self.state["eval_jobs"].pop(run_id, None)
 
-    def consume_sequence_env(self, distill_type: str, k_percent: int) -> Dict[str, str]:
+    def consume_sequence_env(
+        self,
+        distill_type: Optional[str],
+        k_percent: Optional[object],
+    ) -> Tuple[Dict[str, str], Optional[str], Optional[int], bool]:
+        total_templates = len(self.train_sequence)
+        if total_templates == 0:
+            return {}, None, None, False
+
         cursor = int(self.state.get("train_sequence_idx", 0))
-        for idx in range(cursor, len(self.train_sequence)):
+        distill_hint = distill_type
+        k_hint = self._coerce_int(k_percent)
+        for offset in range(total_templates):
+            idx = (cursor + offset) % total_templates
             item = self.train_sequence[idx]
-            if item.get("distill_type") not in (None, distill_type):
+            item_distill = item.get("distill_type")
+            item_k = self._coerce_int(item.get("k_percent"))
+            if item_distill is not None and distill_hint is not None and item_distill != distill_hint:
                 continue
-            if item.get("k_percent") not in (None, k_percent):
+            if item_k is not None and k_hint is not None and item_k != k_hint:
                 continue
-            self.state["train_sequence_idx"] = idx + 1
-            env = item.get("env") or {}
+            self.state["train_sequence_idx"] = cursor + offset + 1
+            env_raw = dict(item.get("env") or {})
+            env = {key: str(value) for key, value in env_raw.items() if value is not None}
+            resolved_distill = item_distill or distill_hint
+            resolved_k = item_k if item_k is not None else k_hint
+            log_distill = resolved_distill or "default"
+            log_k = resolved_k if resolved_k is not None else "default"
             if env:
-                print(f"[sequence] Applying template #{idx+1}: {distill_type} k={k_percent} env={env}")
-            return dict(env)
-        return {}
+                print(f"[sequence] Applying template #{idx+1}: {log_distill} k={log_k} env={env}")
+            else:
+                print(f"[sequence] Applying template #{idx+1}: {log_distill} k={log_k}")
+            return env, resolved_distill, resolved_k, True
+        return {}, None, None, False
 
     def submit_training_if_needed(self) -> None:
         active_jobs = self.active_train_jobs()
@@ -431,6 +1087,7 @@ class SchedulerContext:
         if available_slots <= 0:
             return
 
+        base_params: dict = {}
         for entry in self.registry:
             run_id = entry.get("id")
             if not run_id:
@@ -446,25 +1103,45 @@ class SchedulerContext:
                 continue
 
             params = entry.get("params", {})
-            distill_type = params.get("distill_type", "top-k-tok")
-            k_percent = params.get("k_percent", 0)
-            datasets = ensure_list(params.get("datasets"))
-            if not datasets:
-                print(f"[warn] Run {run_id} missing datasets; skipping.")
-                continue
+            if not base_params:
+                base_params = params
+            distill_type_param = params.get("distill_type")
+            distill_type = distill_type_param or "top-k-tok"
+            k_param = params.get("k_percent")
+            k_percent = self._coerce_int(k_param)
 
             sweep_tag = infer_sweep_tag(train_meta.get("output_dir"))
             if not sweep_tag:
-                sweep_tag = self.tag_default
+                sweep_tag = self.tag_with_run
 
             env = self.build_training_env(params)
-            template_env = self.consume_sequence_env(distill_type, k_percent)
-            if template_env:
-                env.update(template_env)
-            job_name = f"{TRAIN_JOB_PREFIX}{run_id[:8]}"
+            template_env, template_distill, template_k, matched_template = self.consume_sequence_env(
+                distill_type_param,
+                k_param,
+            )
+            if matched_template:
+                if template_env:
+                    env.update(template_env)
+                if template_distill:
+                    distill_type = template_distill
+                if template_k is not None:
+                    k_percent = template_k
+            elif self.sequence_only:
+                prefix = "[dry-run skip]" if self.dry_run else "[skip]"
+                print(
+                    f"{prefix} Run {run_id[:8]} distill_type={distill_type} k={k_percent} not in custom sequence."
+                )
+                continue
+            job_name = f"{TRAIN_JOB_PREFIX}{self.run_label}-{run_id[:8]}"
+            final_k_percent = k_percent if k_percent is not None else 0
+            candidate_params = self._build_candidate_params(entry.get("params", {}), env, distill_type, k_percent)
+            if self._params_already_completed(candidate_params):
+                prefix = "[dry-run skip]" if self.dry_run else "[skip]"
+                print(f"{prefix} Run {run_id[:8]} already completed (registry hash match).")
+                continue
             args = [
                 distill_type,
-                str(k_percent),
+                str(final_k_percent),
                 self.eval_suite,
                 sweep_tag,
             ]
@@ -478,14 +1155,75 @@ class SchedulerContext:
                         "job_id": job_id,
                         "submitted_at": _now().isoformat(),
                         "distill_type": distill_type,
-                        "k_percent": k_percent,
+                        "k_percent": final_k_percent,
                     }
                     available_slots -= 1
                     if available_slots <= 0:
                         break
 
+        if available_slots <= 0:
+            return
+
+        if not base_params and self.registry:
+            base_params = self.registry[0].get("params", {})
+
+        base_env = self.build_training_env(base_params)
+        default_distill = base_params.get("distill_type", "top-k-tok") if base_params else "top-k-tok"
+        default_k = self._coerce_int(base_params.get("k_percent")) if base_params else None
+
+        while available_slots > 0:
+            template_env, template_distill, template_k, matched_template = self.consume_sequence_env(
+                None,
+                None,
+            )
+            if not matched_template:
+                break
+
+            distill_type = template_distill or default_distill or "top-k-tok"
+            k_percent = template_k if template_k is not None else (default_k if default_k is not None else 0)
+
+            env = dict(base_env)
+            env.update(template_env)
+
+            job_seq_idx = int(self.state.get("train_sequence_idx", 0)) - 1
+            job_name = f"{TRAIN_JOB_PREFIX}{self.run_label}-seq{job_seq_idx:05d}"
+            final_k_percent = k_percent if k_percent is not None else 0
+            candidate_params = self._build_candidate_params(base_params, env, distill_type, k_percent)
+            if self._params_already_completed(candidate_params):
+                prefix = "[dry-run skip]" if self.dry_run else "[skip]"
+                print(
+                    f"{prefix} Sequence template idx={job_seq_idx} already completed (registry hash match)."
+                )
+                continue
+            args = [
+                distill_type,
+                str(final_k_percent),
+                self.eval_suite,
+                self.tag_with_run,
+            ]
+            if self.dry_run:
+                print(f"[dry-run] Would submit sequence job idx={job_seq_idx} -> {job_name} env={env}")
+            else:
+                job_id = run_sbatch(self.train_script, args, env=env, job_name=job_name)
+                if job_id:
+                    print(f"[submit] Sequence job idx={job_seq_idx} job={job_id} ({distill_type} k={k_percent})")
+                    key = f"sequence::{job_id}"
+                    self.state["train_jobs"][key] = {
+                        "job_id": job_id,
+                        "submitted_at": _now().isoformat(),
+                        "distill_type": distill_type,
+                        "k_percent": final_k_percent,
+                        "template_idx": job_seq_idx,
+                        "pseudo": True,
+                    }
+                    available_slots -= 1
+                else:
+                    break
+
     def build_training_env(self, params: dict) -> dict:
         env: Dict[str, str] = {}
+        env["AUTOPILOT_RUN_SERIAL"] = str(self.run_serial)
+        env["AUTOPILOT_RUN_LABEL"] = self.run_label
         env["SEED"] = str(params.get("seed", 1337))
         env["EPOCHS"] = str(params.get("epochs", 1))
         env["FINEWEB_TOKENS"] = str(params.get("fineweb_tokens", 4000000))
@@ -500,10 +1238,19 @@ class SchedulerContext:
             env["ANSWER_COL"] = str(params["answer_col"])
         if not params.get("offline_cache", True):
             env["NO_OFFLINE"] = "1"
+        ddp_offline = params.get("ddp_offline")
+        if ddp_offline is True:
+            env["DDP_OFFLINE"] = "1"
+            env.pop("NO_DDP_OFFLINE", None)
+        elif ddp_offline is False:
+            env["NO_DDP_OFFLINE"] = "1"
+            env.pop("DDP_OFFLINE", None)
         if not params.get("eliminate_softmax", True):
             env["NO_ELIMINATE_SOFTMAX"] = "1"
         if params.get("gls_enabled"):
             env["GLS_ENABLED"] = "1"
+        if "gls_queue_size" in params:
+            env["GLS_QUEUE_SIZE"] = str(params["gls_queue_size"])
         if params.get("deterministic"):
             env["DETERMINISTIC"] = "1"
         if params.get("anneal_kd_temperature"):
@@ -557,9 +1304,19 @@ class SchedulerContext:
             out_dir = train_meta.get("output_dir")
             if not out_dir:
                 continue
+            completed_at_raw = train_meta.get("completed_at")
+            completed_at = self._parse_iso_timestamp(completed_at_raw)
+            if completed_at is None:
+                continue
+            age = _now() - completed_at
+            if age < timedelta(hours=9):
+                continue
             args = [out_dir, self.eval_suite, "from_path"]
-            env = {}
-            job_name = f"{EVAL_JOB_PREFIX}{run_id[:8]}"
+            env = {
+                "AUTOPILOT_RUN_SERIAL": str(self.run_serial),
+                "AUTOPILOT_RUN_LABEL": self.run_label,
+            }
+            job_name = f"{EVAL_JOB_PREFIX}{self.run_label}-{run_id[:8]}"
             if self.dry_run:
                 print(f"[dry-run] Would submit eval job for {run_id} -> {job_name}")
             else:
@@ -602,10 +1359,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train", type=int, default=4, help="Maximum concurrent train jobs (states R/PD) to allow")
     parser.add_argument("--max-eval", type=int, default=3, help="Maximum concurrent eval jobs")
     parser.add_argument("--interval", type=int, default=900, help="Polling interval in seconds (default 15 minutes)")
+    parser.add_argument(
+        "--min-interval",
+        type=int,
+        default=60,
+        help="Minimum interval to use when free slots are available (default 60 seconds)",
+    )
     parser.add_argument("--retry-minutes", type=int, default=30, help="Delay before requeueing a failed job")
     parser.add_argument("--tag", default=None, help="Fallback KD_SWEEP_TAG when none can be inferred")
     parser.add_argument("--user", default=os.environ.get("USER"), help="SLURM account/user to monitor (default: $USER)")
     parser.add_argument("--log-file", type=Path, default="logs/autopilot.log", help="Optional path to append all console output")
+    parser.add_argument(
+        "--allow-registry-fallback",
+        action="store_true",
+        help="Allow submitting registry entries that do not match the custom train sequence",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print intended actions without calling sbatch")
     parser.add_argument("--once", action="store_true", help="Run single iteration instead of looping")
     return parser.parse_args()
@@ -625,6 +1393,10 @@ def main() -> int:
     state_path = args.state_file.resolve()
 
     state = load_state(state_path)
+    sequence_only = not args.allow_registry_fallback
+
+    run_serial = _load_next_run_serial(COUNTER_FILE)
+    run_label = f"run{run_serial:04d}"
 
     original_stdout = sys.stdout
     original_stderr = sys.stderr
@@ -634,7 +1406,7 @@ def main() -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("a", encoding="utf-8", buffering=1)
         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        log_handle.write(f"\n[{timestamp}] runs_autopilot start -- tag={tag_default}\n")
+        log_handle.write(f"\n[{timestamp}] runs_autopilot start -- tag={tag_default} {run_label}\n")
         log_handle.flush()
         sys.stdout = TeeStream(original_stdout, log_handle)
         sys.stderr = TeeStream(original_stderr, log_handle)
@@ -654,6 +1426,8 @@ def main() -> int:
 
         atexit.register(_restore_streams)
         print(f"[log] teeing output to {log_path}")
+
+    print(f"[session] autopilot run serial={run_serial} ({run_label})")
 
     while True:
         try:
@@ -677,6 +1451,8 @@ def main() -> int:
             tag_default=tag_default,
             dry_run=args.dry_run,
             train_sequence=CUSTOM_TRAIN_SEQUENCE,
+            sequence_only=sequence_only,
+            run_serial=run_serial,
         )
         ctx.cleanup_state()
         ctx.emit_eval_summaries()
@@ -688,7 +1464,12 @@ def main() -> int:
 
         if args.once:
             break
-        time.sleep(args.interval)
+
+        sleep_seconds = args.interval
+        if (args.max_train - len(ctx.active_train_jobs()) > 0) or (args.max_eval - len(ctx.active_eval_jobs()) > 0):
+            sleep_seconds = min(args.interval, max(args.min_interval, 1))
+
+        time.sleep(sleep_seconds)
     return 0
 
 
