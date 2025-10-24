@@ -79,8 +79,15 @@ class TrainingConfig(BaseModel):
     wandb_project: str = "selective-entropy-knowledge-distillation"
     wandb_entity: str = "selective-entropy-knowledge-distillation"
     wandb_enabled: bool = True
-    # Unified runs registry
-    runs_registry: str = Field(default="results/runs.json", description="Path to the unified runs JSON registry")
+    # Unified runs registries (per split)
+    runs_registry_validation: str = Field(
+        default="results/runs_validation.json",
+        description="Path to the validation split runs JSON registry",
+    )
+    runs_registry_test: str = Field(
+        default="results/runs_test.json",
+        description="Path to the test split runs JSON registry",
+    )
     override: bool = Field(default=False, description="If true, run even if an identical-params hash exists in the registry")
     
     # Offline cache (teacher precomputation for entropy approx + RS-KD over vocab)

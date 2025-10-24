@@ -568,6 +568,22 @@ TASK_TIMEOUTS = {
 # Summarization (Lighteval)
 LIGHTEVAL_TASKS = ["helm|summarization:cnn_dailymail", "helm|summarization:xsum"]
 
+# Split overrides for lm-eval tasks when forcing validation/test passes
+LM_EVAL_VALIDATION_SPLITS: Dict[str, str] = {
+    "hellaswag": "validation",
+    "piqa": "validation",
+    "gsm8k": "train",  # dataset lacks a dedicated validation split
+    "lambada_openai": "test", # dataset lacks a dedicated train / validation split
+    "arc_easy": "validation",
+}
+LM_EVAL_TEST_SPLITS: Dict[str, str] = {
+    "hellaswag": "test",
+    "piqa": "test",
+    "gsm8k": "test",
+    "lambada_openai": "test",
+    "arc_easy": "test",
+}
+
 # ==========================================================
 #                  LM-Eval runner with suites
 # ==========================================================
@@ -590,12 +606,14 @@ def run_lmeval_suite(
     use_fsdp: bool = False,
     fsdp_layer_cls: Optional[str] = None,
     fsdp_policy: str = "full_shard auto_wrap",
+    phase: str = "default",
+    task_split_overrides: Optional[Dict[str, str]] = None,
 ) -> Tuple[Optional[Path], Dict[str, str], Dict[str, float]]:
     """Run the requested LM-Eval suite (light/heavy).
 
     Executes tasks across GPUs in waves; when share_gpu_pool is True, a single task uses the full pool.
     """
-    out_dir = results_dir / f"lmeval_{suite}_{tag}"
+    out_dir = results_dir / f"lmeval_{suite}_{phase}_{tag}"
     ensure_dir(out_dir)
 
     tasks_with_limits: List[Tuple[str, Optional[int]]] = list(
@@ -782,6 +800,11 @@ def run_lmeval_suite(
                 if not _warned_no_random_limit:
                     print("[lm-eval] Warning: CLI lacks a random subset flag; using first-N for --limit.")
                     _warned_no_random_limit = True
+        if task_split_overrides:
+            base_task = task.split(",", 1)[0]
+            override_split = task_split_overrides.get(task) or task_split_overrides.get(base_task)
+            if override_split:
+                cmd += ["--task_args", f"{base_task}:split={override_split}"]
         return cmd, batch_value, is_generate
 
     # Parallel across physical GPUs (mask each process to one GPU)
@@ -1483,8 +1506,10 @@ def main():
     parser.add_argument("--work_dir", type=str, default="eval_runs")
     parser.add_argument("--output_dir", type=str, default="evaluation_json_results")
     # Unified runs registry integration
-    parser.add_argument("--runs_registry", type=str, default="results/runs.json",
-                        help="Path to the unified runs JSON registry (shared with training).")
+    parser.add_argument("--runs_registry_validation", type=str, default="results/runs_validation.json",
+                        help="Path to the validation split runs JSON registry.")
+    parser.add_argument("--runs_registry_test", type=str, default="results/runs_test.json",
+                        help="Path to the test split runs JSON registry.")
     parser.add_argument("--params_json", type=str, default=None,
                         help="Optional path to a JSON file containing the original training parameters. If not provided, attempts to infer from model dir (config.json).")
     # Logging configuration (default project updated per request)
@@ -1575,6 +1600,27 @@ def main():
     ensure_dir(results_dir)
     ensure_dir(json_results_dir)
 
+    default_test_registry = Path("results/runs_test.json")
+    default_validation_registry = Path("results/runs_validation.json")
+    runs_registry_test = Path(args.runs_registry_test or default_test_registry)
+    runs_registry_validation = Path(args.runs_registry_validation or default_validation_registry)
+
+    if runs_registry_validation == default_validation_registry and runs_registry_test != default_test_registry:
+        runs_registry_validation = runs_registry_test.with_name("runs_validation.json")
+
+    evaluation_phases = [
+        {
+            "name": "validation",
+            "registry_path": runs_registry_validation,
+            "split_overrides": LM_EVAL_VALIDATION_SPLITS,
+        },
+        {
+            "name": "test",
+            "registry_path": runs_registry_test,
+            "split_overrides": LM_EVAL_TEST_SPLITS,
+        },
+    ]
+
     # Build GPU pool
     if args.gpu_ids:
         gpu_pool = [int(x) for x in args.gpu_ids.split(",") if x.strip() != ""]
@@ -1624,23 +1670,6 @@ def main():
         else:
             print(f"Error: provided model path is neither an HF directory nor a .pt file: {in_path}")
             sys.exit(2)
-    if WandBLogger is not None:
-        eval_run = WandBLogger(
-            project=args.wandb_project,
-            entity=os.getenv("WANDB_ENTITY"),
-            name=f"eval-{tag}",
-            config={
-                "suite": args.suite,
-                "model": str(base_model_dir),
-            },
-            tags=["evaluation", args.suite],
-            group=os.getenv("WANDB_GROUP"),
-            job_type="eval",
-            notes=os.getenv("WANDB_NOTES"),
-            resume=os.getenv("WANDB_RESUME", "allow"),
-            run_id=os.getenv("WANDB_RUN_ID"),
-        )
-
     if not model_specs:
         print("No models exported. Exiting.")
         sys.exit(1)
@@ -1655,296 +1684,310 @@ def main():
     if args.use_fsdp and not fsdp_layer_cls:
         print("[fsdp] Warning: unable to identify a transformer layer class; wrapping the full model may be slower.")
 
-    all_models_metrics: Dict[str, Dict[str, Dict[str, float]]] = {}
+    metrics_by_phase: Dict[str, Dict[str, Dict[str, float]]] = {
+        phase["name"]: {} for phase in evaluation_phases
+    }
 
-    overall_start = time.time()
     for tag, model_dir in model_specs:
-        print(f"\n=== Running benchmarks for {tag} (suite={args.suite}) ===")
+        for phase in evaluation_phases:
+            phase_name = phase["name"]
+            phase_registry_path = Path(phase["registry_path"])
+            phase_tag = f"{tag}-{phase_name}"
+            print(f"\n=== Running benchmarks for {tag} (suite={args.suite}, split={phase_name}) ===")
+            phase_start = time.time()
 
-        # LM-Eval (parallel across GPUs according to the chosen suite)
-        lmeval_start = time.time()
-        lmeval_root, task_status, task_durations = run_lmeval_suite(
-            model_dir=model_dir,
-            tag=tag,
-            results_dir=results_dir,
-            gpu_ids=gpu_pool,
-            suite=args.suite,
-            batch_size=args.lm_eval_batch_size,
-            generate_batch_size=args.lm_eval_generate_batch_size,
-            max_batch_size=args.lm_eval_max_batch_size,
-            generate_max_batch_size=args.lm_eval_generate_max_batch_size,
-            fallback_batch_size=args.lm_eval_fallback_batch_size,
-            model_dtype=args.lm_eval_model_dtype,
-            load_in_8bit=args.lm_eval_load_in_8bit,
-            load_in_4bit=args.lm_eval_load_in_4bit,
-            device_map=args.lm_eval_device_map,
-            share_gpu_pool=args.lm_eval_share_gpu_pool,
-            use_fsdp=args.use_fsdp,
-            fsdp_layer_cls=fsdp_layer_cls,
-            fsdp_policy=args.fsdp_policy,
-        )
-        lmeval_wall = time.time() - lmeval_start
-        lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
-        # Derive ECE from sample logs when available and align its task keys
-        raw_ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
-        ece_metrics = _map_ece_to_existing_tasks(raw_ece_metrics, lmeval_metrics)
+            phase_results_dir = results_dir / phase_name
+            phase_json_dir = json_results_dir / phase_name
+            ensure_dir(phase_results_dir)
+            ensure_dir(phase_json_dir)
 
-        # Summarization (HEAVY only)
-        lighteval_start = time.time()
-        lighteval_file = run_lighteval(model_dir, tag, results_dir, suite=args.suite)
-        lighteval_wall = time.time() - lighteval_start if lighteval_file else 0.0
-        lighteval_metrics = collect_lighteval_metrics(lighteval_file)
+            lmeval_start = time.time()
+            lmeval_root, task_status, task_durations = run_lmeval_suite(
+                model_dir=model_dir,
+                tag=tag,
+                results_dir=phase_results_dir,
+                gpu_ids=gpu_pool,
+                suite=args.suite,
+                batch_size=args.lm_eval_batch_size,
+                generate_batch_size=args.lm_eval_generate_batch_size,
+                max_batch_size=args.lm_eval_max_batch_size,
+                generate_max_batch_size=args.lm_eval_generate_max_batch_size,
+                fallback_batch_size=args.lm_eval_fallback_batch_size,
+                model_dtype=args.lm_eval_model_dtype,
+                load_in_8bit=args.lm_eval_load_in_8bit,
+                load_in_4bit=args.lm_eval_load_in_4bit,
+                device_map=args.lm_eval_device_map,
+                share_gpu_pool=args.lm_eval_share_gpu_pool,
+                use_fsdp=args.use_fsdp,
+                fsdp_layer_cls=fsdp_layer_cls,
+                fsdp_policy=args.fsdp_policy,
+                phase=phase_name,
+                task_split_overrides=phase["split_overrides"],
+            )
+            lmeval_wall = time.time() - lmeval_start
+            lmeval_metrics = collect_lmeval_metrics(lmeval_root) if lmeval_root else {}
+            raw_ece_metrics = collect_ece_from_lmeval_samples(lmeval_root) if lmeval_root else {}
+            ece_metrics = _map_ece_to_existing_tasks(raw_ece_metrics, lmeval_metrics)
 
-        # Code-gen (HEAVY only)
-        evalplus_start = time.time()
-        evalplus_roots = run_evalplus(model_dir, tag, ["humaneval", "mbpp"], suite=args.suite)
-        evalplus_wall = time.time() - evalplus_start if evalplus_roots else 0.0
-        he_metrics = collect_evalplus_metrics(evalplus_roots.get("humaneval"), "HumanEval+")
-        mbpp_metrics = collect_evalplus_metrics(evalplus_roots.get("mbpp"), "MBPP+")
+            lighteval_start = time.time()
+            lighteval_file = run_lighteval(model_dir, phase_tag, phase_results_dir, suite=args.suite)
+            lighteval_wall = time.time() - lighteval_start if lighteval_file else 0.0
+            lighteval_metrics = collect_lighteval_metrics(lighteval_file)
 
-        # Instruction following (HEAVY only, if available)
-        ifeval_start = time.time()
-        ifeval_dir = run_ifeval(model_dir, tag, results_dir, suite=args.suite)
-        ifeval_wall = time.time() - ifeval_start if ifeval_dir else 0.0
-        ifeval_metrics = collect_simple_json(ifeval_dir, "IF-Eval", "results.json")
+            evalplus_start = time.time()
+            evalplus_roots = run_evalplus(model_dir, phase_tag, ["humaneval", "mbpp"], suite=args.suite)
+            evalplus_wall = time.time() - evalplus_start if evalplus_roots else 0.0
+            he_metrics = collect_evalplus_metrics(evalplus_roots.get("humaneval"), "HumanEval+")
+            mbpp_metrics = collect_evalplus_metrics(evalplus_roots.get("mbpp"), "MBPP+")
 
-        # Instruction-following win-rate (HEAVY only, requires API key)
-        alpaca_start = time.time()
-        alpaca_dir = run_alpacaeval(model_dir, tag, results_dir, suite=args.suite)
-        alpaca_wall = time.time() - alpaca_start if alpaca_dir else 0.0
-        alpaca_metrics = collect_alpacaeval_metrics(alpaca_dir)
+            ifeval_start = time.time()
+            ifeval_dir = run_ifeval(model_dir, phase_tag, phase_results_dir, suite=args.suite)
+            ifeval_wall = time.time() - ifeval_start if ifeval_dir else 0.0
+            ifeval_metrics = collect_simple_json(ifeval_dir, "IF-Eval", "results.json")
 
-        # Safety (HEAVY only)
-        jbb_start = time.time()
-        jbb_dir = run_jailbreakbench(model_dir, tag, results_dir, suite=args.suite)
-        jbb_wall = time.time() - jbb_start if jbb_dir else 0.0
-        jbb_metrics = collect_simple_json(jbb_dir, "JailbreakBench", "jbb_results.json")
-        hb_start = time.time()
-        hb_dir = run_harmbench(model_dir, tag, results_dir, suite=args.suite)
-        hb_wall = time.time() - hb_start if hb_dir else 0.0
-        hb_metrics = collect_simple_json(hb_dir, "HarmBench", "harmbench_results.json")
+            alpaca_start = time.time()
+            alpaca_dir = run_alpacaeval(model_dir, phase_tag, phase_results_dir, suite=args.suite)
+            alpaca_wall = time.time() - alpaca_start if alpaca_dir else 0.0
+            alpaca_metrics = collect_alpacaeval_metrics(alpaca_dir)
 
-        merged = merge_model_results([
-            lmeval_metrics,
-            ece_metrics,
-            lighteval_metrics,
-            he_metrics,
-            mbpp_metrics,
-            ifeval_metrics,
-            alpaca_metrics,
-            jbb_metrics,
-            hb_metrics
-        ])
-        all_models_metrics[tag] = merged
+            jbb_start = time.time()
+            jbb_dir = run_jailbreakbench(model_dir, phase_tag, phase_results_dir, suite=args.suite)
+            jbb_wall = time.time() - jbb_start if jbb_dir else 0.0
+            jbb_metrics = collect_simple_json(jbb_dir, "JailbreakBench", "jbb_results.json")
 
-        # Timing summary
-        total_wall = time.time() - overall_start
-        print("\n=== Timing summary ===")
-        print(f"lm-eval total: {lmeval_wall:.1f}s")
-        if args.suite == "heavy":
-            print(f"lighteval: {lighteval_wall:.1f}s, evalplus: {evalplus_wall:.1f}s, ifeval: {ifeval_wall:.1f}s, alpaca: {alpaca_wall:.1f}s, jbb: {jbb_wall:.1f}s, harmbench: {hb_wall:.1f}s")
-        print(f"overall wall: {total_wall:.1f}s")
+            hb_start = time.time()
+            hb_dir = run_harmbench(model_dir, phase_tag, phase_results_dir, suite=args.suite)
+            hb_wall = time.time() - hb_start if hb_dir else 0.0
+            hb_metrics = collect_simple_json(hb_dir, "HarmBench", "harmbench_results.json")
 
-        # --- Save results to JSON for this model ---
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_result_file = json_results_dir / f"eval_{args.suite}_{tag}_{ts}.json"
-        averages = compute_averages(merged)
-        # Assemble payload, including calibration (ECE) and perplexity summaries
-        per_task_ece = {}
-        ece_values = []
-        per_task_perplexity = {}
-        perplexity_values = []
-        
-        for task, metrics in merged.items():
-            if isinstance(metrics, dict):
-                # Collect ECE
+            merged = merge_model_results([
+                lmeval_metrics,
+                ece_metrics,
+                lighteval_metrics,
+                he_metrics,
+                mbpp_metrics,
+                ifeval_metrics,
+                alpaca_metrics,
+                jbb_metrics,
+                hb_metrics,
+            ])
+            metrics_by_phase[phase_name][tag] = merged
+
+            total_wall = time.time() - phase_start
+            print(f"\n=== Timing summary ({phase_name}) ===")
+            print(f"lm-eval total: {lmeval_wall:.1f}s")
+            if args.suite == "heavy":
+                print(
+                    "lighteval: "
+                    f"{lighteval_wall:.1f}s, evalplus: {evalplus_wall:.1f}s, "
+                    f"ifeval: {ifeval_wall:.1f}s, alpaca: {alpaca_wall:.1f}s, "
+                    f"jbb: {jbb_wall:.1f}s, harmbench: {hb_wall:.1f}s"
+                )
+            print(f"overall wall ({phase_name}): {total_wall:.1f}s")
+
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            json_result_file = phase_json_dir / f"eval_{phase_name}_{args.suite}_{tag}_{ts}.json"
+            averages = compute_averages(merged)
+
+            per_task_ece: Dict[str, float] = {}
+            ece_values: List[float] = []
+            per_task_perplexity: Dict[str, float] = {}
+            perplexity_values: List[float] = []
+
+            for task, metrics in merged.items():
+                if not isinstance(metrics, dict):
+                    continue
                 if isinstance(metrics.get("ece"), (int, float)):
                     ece_val = float(metrics["ece"])
                     per_task_ece[task] = ece_val
                     ece_values.append(ece_val)
-                # Collect perplexity (check common variants)
                 for ppl_key in ("perplexity,none", "perplexity", "word_perplexity,none", "byte_perplexity,none"):
                     if isinstance(metrics.get(ppl_key), (int, float)):
                         ppl_val = float(metrics[ppl_key])
                         per_task_perplexity[task] = ppl_val
                         perplexity_values.append(ppl_val)
-                        break  # Only take first perplexity metric found
-        
-        # Compute average ECE across tasks (prefer computed avg_ece from averages, fallback to manual)
-        avg_ece_val = averages.get("avg_ece")
-        if avg_ece_val is None and ece_values:
-            avg_ece_val = sum(ece_values) / len(ece_values)
-        
-        # Compute average perplexity (prefer from averages, fallback to manual)
-        avg_ppl_val = averages.get("avg_perplexity,none") or averages.get("avg_perplexity")
-        if avg_ppl_val is None and perplexity_values:
-            avg_ppl_val = sum(perplexity_values) / len(perplexity_values)
-        
-        calibration = {
-            "avg_ece": avg_ece_val,
-            "per_task_ece": per_task_ece,
-            "avg_perplexity": avg_ppl_val,
-            "per_task_perplexity": per_task_perplexity,
-        }
-        
-        # Log summaries if available
-        if avg_ece_val is not None:
-            print(f"\n[ECE Summary] Average ECE across {len(ece_values)} tasks: {avg_ece_val:.4f}")
-            for task, ece in per_task_ece.items():
-                print(f"  {task}: {ece:.4f}")
-        
-        if avg_ppl_val is not None:
-            print(f"\n[Perplexity Summary] Average perplexity across {len(perplexity_values)} tasks: {avg_ppl_val:.2f}")
-            for task, ppl in per_task_perplexity.items():
-                print(f"  {task}: {ppl:.2f}")
-        timings = {
-            "lm_eval_total_sec": lmeval_wall,
-            "lm_eval_task_sec": task_durations,
-            "lighteval_sec": lighteval_wall,
-            "evalplus_sec": evalplus_wall,
-            "ifeval_sec": ifeval_wall,
-            "alpaca_sec": alpaca_wall,
-            "jailbreakbench_sec": jbb_wall,
-            "harmbench_sec": hb_wall,
-            "overall_wall_sec": total_wall,
-        }
-        payload = {
-            "tag": tag,
-            "suite": args.suite,
-            "results": merged,
-            "averages": averages,
-            "task_status": task_status,
-            "calibration": calibration,
-            "timings": timings,
-        }
-        save_json(payload, json_result_file)
+                        break
 
-        # Upsert into unified registry keyed by params hash
-        try:
-            params_blob: Optional[Dict[str, Any]] = None
-            # Prepare model_path for registry (use string representation)
-            model_path_str = str(model_dir) if not args.from_hf else base_model_dir
-            
-            if args.params_json and Path(args.params_json).exists():
-                with open(args.params_json, "r", encoding="utf-8") as f:
-                    params_candidate = json.load(f)
-                if isinstance(params_candidate, dict):
-                    params_blob = params_candidate.get("params") or params_candidate
-                    if isinstance(params_candidate.get("id"), str):
-                        params_hash = params_candidate["id"]
-                        upsert_eval_results(
-                            Path(args.runs_registry),
-                            params_hash,
-                            args.suite,
-                            merged,
-                            averages,
-                            task_status,
-                            model_path=model_path_str,
-                            calibration=calibration,
-                        )
-                        raise StopIteration
-            else:
-                # Preferred: run_params.json saved by training
-                rp = model_dir / "run_params.json"
-                if rp.exists():
-                    try:
-                        rp_blob = json.load(open(rp))
-                        if isinstance(rp_blob, dict):
-                            params_blob = rp_blob.get("params") or rp_blob
-                            # If file already contains id, prefer to trust it
-                            if isinstance(rp_blob.get("id"), str):
-                                params_hash = rp_blob["id"]
-                                upsert_eval_results(
-                                    Path(args.runs_registry),
-                                    params_hash,
-                                    args.suite,
-                                    merged,
-                                    averages,
-                                    task_status,
-                                    model_path=model_path_str,
-                                    calibration=calibration,
-                                )
-                                raise StopIteration  # already upserted; skip remainder
-                    except Exception:
-                        pass
-                # Try to derive from the HF model directory (if present)
-                cfg_path = model_dir / "config.json"
-                if cfg_path.exists():
-                    try:
-                        cfg_blob = json.load(open(cfg_path))
-                        # We only need a stable mapping of training-related fields; many HF fields are irrelevant.
-                        # Try to pass through fields that might have been stored by training code.
-                        probable = {}
-                        for k in [
-                            "teacher_model", "student_model", "distill_type", "k_percent",
-                            "enable_ce", "alpha_ce", "kd_temperature", "entropy_approx_temperature",
-                            "anneal_kd_temperature", "kd_temperature_start", "kd_temperature_end", "kd_hold_frac",
-                            "rs_alpha", "rs_floor", "bucket_lower_percent", "bucket_upper_percent",
-                            "score_token_selection", "score_normalize", "score_entropy_weight", "score_ce_weight", "score_kl_weight",
-                            "bandit_alpha", "bandit_lambda", "bandit_threshold", "bandit_min_tokens", "bandit_max_tokens", "bandit_device", "bandit_reward_clip",
-                            "datasets", "prompt_col", "answer_col", "dataset_config", "fineweb_tokens",
-                            "epochs", "batch_size", "gradient_accumulation_steps", "max_seq_len", "lr",
-                            "seed", "deterministic",
-                            "offline_cache", "entropy_approx_m", "rs_vocab_samples", "rs_vocab_beta", "H_hat_u8",
-                            "eliminate_softmax", "sampled_softmax_negatives",
-                        ]:
-                            if k in cfg_blob:
-                                probable[k] = cfg_blob[k]
-                        if probable:
-                            params_blob = probable
-                    except Exception:
-                        pass
-            if params_blob is None:
-                # As a last resort, attach an empty dict so the call still produces a stable id from empty params
-                params_blob = {}
-            params_hash = compute_params_hash(params_blob)
-            upsert_eval_results(
-                Path(args.runs_registry),
-                params_hash,
-                args.suite,
-                merged,
-                averages,
-                task_status,
-                model_path=model_path_str,
-                calibration=calibration,
-            )
-        except StopIteration:
-            pass
-        except Exception as e:
-            print(f"[registry] Failed to upsert eval results: {e}")
+            avg_ece_val = averages.get("avg_ece")
+            if avg_ece_val is None and ece_values:
+                avg_ece_val = sum(ece_values) / len(ece_values)
 
-        # Log results to W&B and TensorBoard
-        try:
-            if not args.disable_wandb:
-                # Prefer robust WandBLogger if available
-                if WandBLogger is not None:
-                    if getattr(eval_run, "enabled", False):
-                        flat = {}
-                        for task, metrics in merged.items():
-                            if isinstance(metrics, dict):
-                                for k, v in metrics.items():
-                                    if isinstance(v, (int, float)):
-                                        flat[f"{task}/{k}"] = float(v)
-                        # Add averages as top-level summary
-                        for k, v in averages.items():
-                            if isinstance(v, (int, float)):
-                                flat[f"avg/{k}"] = float(v)
-                        # Add counts for visibility
-                        flat["meta/num_tasks"] = float(len(merged))
-                        eval_run.log(flat)
-                        eval_run.finish()
-                    else:
-                        # Fallback to legacy helper (respects env in hardened version)
-                        log_evaluation_to_wandb(tag, merged, args.wandb_project)
+            avg_ppl_val = averages.get("avg_perplexity,none") or averages.get("avg_perplexity")
+            if avg_ppl_val is None and perplexity_values:
+                avg_ppl_val = sum(perplexity_values) / len(perplexity_values)
+
+            calibration = {
+                "avg_ece": avg_ece_val,
+                "per_task_ece": per_task_ece,
+                "avg_perplexity": avg_ppl_val,
+                "per_task_perplexity": per_task_perplexity,
+            }
+
+            if avg_ece_val is not None:
+                print(f"\n[ECE Summary] ({phase_name}) Average ECE across {len(ece_values)} tasks: {avg_ece_val:.4f}")
+                for task, ece in per_task_ece.items():
+                    print(f"  {task}: {ece:.4f}")
+
+            if avg_ppl_val is not None:
+                print(f"\n[Perplexity Summary] ({phase_name}) Average perplexity across {len(perplexity_values)} tasks: {avg_ppl_val:.2f}")
+                for task, ppl in per_task_perplexity.items():
+                    print(f"  {task}: {ppl:.2f}")
+
+            timings = {
+                "lm_eval_total_sec": lmeval_wall,
+                "lm_eval_task_sec": task_durations,
+                "lighteval_sec": lighteval_wall,
+                "evalplus_sec": evalplus_wall,
+                "ifeval_sec": ifeval_wall,
+                "alpaca_sec": alpaca_wall,
+                "jailbreakbench_sec": jbb_wall,
+                "harmbench_sec": hb_wall,
+                "overall_wall_sec": total_wall,
+            }
+            payload = {
+                "tag": tag,
+                "suite": args.suite,
+                "split": phase_name,
+                "results": merged,
+                "averages": averages,
+                "task_status": task_status,
+                "calibration": calibration,
+                "timings": timings,
+            }
+            save_json(payload, json_result_file)
+
+            try:
+                params_blob: Optional[Dict[str, Any]] = None
+                model_path_str = str(model_dir) if not args.from_hf else base_model_dir
+
+                if args.params_json and Path(args.params_json).exists():
+                    with open(args.params_json, "r", encoding="utf-8") as f:
+                        params_candidate = json.load(f)
+                    if isinstance(params_candidate, dict):
+                        params_blob = params_candidate.get("params") or params_candidate
+                        if isinstance(params_candidate.get("id"), str):
+                            params_hash = params_candidate["id"]
+                            upsert_eval_results(
+                                phase_registry_path,
+                                params_hash,
+                                args.suite,
+                                merged,
+                                averages,
+                                task_status,
+                                model_path=model_path_str,
+                                calibration=calibration,
+                            )
+                            raise StopIteration
                 else:
-                    log_evaluation_to_wandb(tag, merged, args.wandb_project)
-            if not args.disable_tensorboard:
-                log_evaluation_to_tensorboard(tag, merged, str(work_dir / "tb_logs"))
-        except Exception as e:
-            print(f"Error logging {tag} metrics: {e}")
+                    rp = model_dir / "run_params.json"
+                    if rp.exists():
+                        try:
+                            rp_blob = json.load(open(rp))
+                            if isinstance(rp_blob, dict):
+                                params_blob = rp_blob.get("params") or rp_blob
+                                if isinstance(rp_blob.get("id"), str):
+                                    params_hash = rp_blob["id"]
+                                    upsert_eval_results(
+                                        phase_registry_path,
+                                        params_hash,
+                                        args.suite,
+                                        merged,
+                                        averages,
+                                        task_status,
+                                        model_path=model_path_str,
+                                        calibration=calibration,
+                                    )
+                                    raise StopIteration
+                        except Exception:
+                            pass
+                    cfg_path = model_dir / "config.json"
+                    if cfg_path.exists():
+                        try:
+                            cfg_blob = json.load(open(cfg_path))
+                            probable = {}
+                            for k in [
+                                "teacher_model", "student_model", "distill_type", "k_percent",
+                                "enable_ce", "alpha_ce", "kd_temperature", "entropy_approx_temperature",
+                                "anneal_kd_temperature", "kd_temperature_start", "kd_temperature_end", "kd_hold_frac",
+                                "rs_alpha", "rs_floor", "bucket_lower_percent", "bucket_upper_percent",
+                                "score_token_selection", "score_normalize", "score_entropy_weight", "score_ce_weight", "score_kl_weight",
+                                "bandit_alpha", "bandit_lambda", "bandit_threshold", "bandit_min_tokens", "bandit_max_tokens", "bandit_device", "bandit_reward_clip",
+                                "datasets", "prompt_col", "answer_col", "dataset_config", "fineweb_tokens",
+                                "epochs", "batch_size", "gradient_accumulation_steps", "max_seq_len", "lr",
+                                "seed", "deterministic",
+                                "offline_cache", "entropy_approx_m", "rs_vocab_samples", "rs_vocab_beta", "H_hat_u8",
+                                "eliminate_softmax", "sampled_softmax_negatives",
+                            ]:
+                                if k in cfg_blob:
+                                    probable[k] = cfg_blob[k]
+                            if probable:
+                                params_blob = probable
+                        except Exception:
+                            pass
+                if params_blob is None:
+                    params_blob = {}
+                params_hash = compute_params_hash(params_blob)
+                upsert_eval_results(
+                    phase_registry_path,
+                    params_hash,
+                    args.suite,
+                    merged,
+                    averages,
+                    task_status,
+                    model_path=model_path_str,
+                    calibration=calibration,
+                )
+            except StopIteration:
+                pass
+            except Exception as e:
+                print(f"[registry] Failed to upsert eval results at {phase_registry_path}: {e}")
 
-    # Print LaTeX summary
-    print_latex_table(all_models_metrics)
+            try:
+                if not args.disable_wandb:
+                    if WandBLogger is not None:
+                        phase_run = WandBLogger(
+                            project=args.wandb_project,
+                            entity=os.getenv("WANDB_ENTITY"),
+                            name=f"eval-{phase_tag}",
+                            config={
+                                "suite": args.suite,
+                                "split": phase_name,
+                                "model": str(base_model_dir) if base_model_dir else str(model_dir),
+                            },
+                            tags=["evaluation", args.suite, phase_name],
+                            group=os.getenv("WANDB_GROUP"),
+                            job_type=f"eval-{phase_name}",
+                            notes=os.getenv("WANDB_NOTES"),
+                            resume=os.getenv("WANDB_RESUME", "allow"),
+                            run_id=None,
+                        )
+                        if getattr(phase_run, "enabled", False):
+                            flat = {}
+                            for task, metrics in merged.items():
+                                if isinstance(metrics, dict):
+                                    for k, v in metrics.items():
+                                        if isinstance(v, (int, float)):
+                                            flat[f"{task}/{k}"] = float(v)
+                            for k, v in averages.items():
+                                if isinstance(v, (int, float)):
+                                    flat[f"avg/{k}"] = float(v)
+                            flat["meta/num_tasks"] = float(len(merged))
+                            flat["meta/split"] = phase_name
+                            phase_run.log(flat)
+                            phase_run.finish()
+                        else:
+                            log_evaluation_to_wandb(phase_tag, merged, args.wandb_project)
+                    else:
+                        log_evaluation_to_wandb(phase_tag, merged, args.wandb_project)
+                if not args.disable_tensorboard:
+                    log_evaluation_to_tensorboard(phase_tag, merged, str(work_dir / "tb_logs"))
+            except Exception as e:
+                print(f"Error logging {phase_tag} metrics: {e}")
+
+    for phase in evaluation_phases:
+        phase_name = phase["name"]
+        print(f"\n=== Summary table ({phase_name}) ===")
+        print_latex_table(metrics_by_phase[phase_name])
 
 if __name__ == "__main__":
     main()

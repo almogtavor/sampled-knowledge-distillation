@@ -18,7 +18,8 @@ EXCLUDED_KEYS = {
     "keep_checkpoints",
     # cache location (but keep offline_cache flag itself)
     "offline_cache_dir",
-    "runs_registry",
+    "runs_registry_validation",
+    "runs_registry_test",
     "override",
 }
 

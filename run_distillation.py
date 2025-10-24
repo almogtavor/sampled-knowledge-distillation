@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import List, Set
 
 import numpy as np
 import torch
@@ -194,8 +195,10 @@ def parse_args_to_config() -> TrainingConfig:
     parser.add_argument("--gls_log_threshold", action="store_true", default=False,
                         help="Log the GLS threshold each time it's computed")
     # Unified upsert registry controls
-    parser.add_argument("--runs_registry", type=str, default="results/runs.json",
-                        help="Path to the unified runs JSON registry (a JSON list).")
+    parser.add_argument("--runs_registry_validation", type=str, default="results/runs_validation.json",
+                        help="Path to the validation split runs JSON registry.")
+    parser.add_argument("--runs_registry_test", type=str, default="results/runs_test.json",
+                        help="Path to the test split runs JSON registry.")
     parser.add_argument("--override", action="store_true", default=False,
                         help="If set, run even if an identical-params hash already exists in the registry.")
     # Reproducibility
@@ -283,16 +286,34 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # ----------------- runs registry preflight -----------------
-    registry_path = Path(getattr(config, "runs_registry", "results/runs.json"))
+    default_test_path = Path("results/runs_test.json")
+    default_validation_path = Path("results/runs_validation.json")
+    registry_path_test = Path(getattr(config, "runs_registry_test", str(default_test_path)))
+    registry_path_validation = Path(getattr(config, "runs_registry_validation", str(default_validation_path)))
+
+    if registry_path_validation == default_validation_path and registry_path_test != default_test_path:
+        registry_path_validation = registry_path_test.with_name("runs_validation.json")
+
+    registry_paths_to_update: List[Path] = []
+    seen_paths: Set[str] = set()
+    for candidate in (registry_path_validation, registry_path_test):
+        resolved = Path(candidate).resolve()
+        key = str(resolved)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        registry_paths_to_update.append(resolved)
+
     try:
         params_dict = config.model_dump()
     except Exception:
         params_dict = vars(config)
     params_hash = compute_params_hash(params_dict)
+    primary_registry_path = Path(registry_path_test).resolve()
 
     if is_main_rank:
-        if registry_exists(registry_path, params_hash) and not getattr(config, "override", False):
-            entry = get_entry(registry_path, params_hash)
+        if registry_exists(primary_registry_path, params_hash) and not getattr(config, "override", False):
+            entry = get_entry(primary_registry_path, params_hash)
             completed_eval = bool(entry and entry.get("completed_eval"))
             runs_info = entry.get("runs", {}) if entry else {}
             existing_output_dir = (runs_info.get("train") or {}).get("output_dir") if runs_info else None
@@ -311,14 +332,15 @@ def main():
             experiment_name += f"_bucket={config.bucket_lower_percent}-{config.bucket_upper_percent}"
 
         cli_args = " ".join(shlex.quote(arg) for arg in sys.argv)
-        upsert_run_start(
-            registry_path,
-            params_dict,
-            experiment_name=experiment_name,
-            job_id=job_id,
-            model_output_dir=config.output_dir,
-            launch_args=cli_args,
-        )
+        for reg_path in registry_paths_to_update:
+            upsert_run_start(
+                reg_path,
+                params_dict,
+                experiment_name=experiment_name,
+                job_id=job_id,
+                model_output_dir=config.output_dir,
+                launch_args=cli_args,
+            )
     else:
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
         job_id = os.getenv("SLURM_JOB_ID", "local")
@@ -643,10 +665,11 @@ def main():
         model_to_save.save_pretrained(config.output_dir)
         tok.save_pretrained(config.output_dir)
 
-        try:
-            mark_trained(registry_path, params_hash, model_output_dir=config.output_dir)
-        except Exception as e:
-            print(f"[registry] Failed to mark trained: {e}")
+        for reg_path in registry_paths_to_update:
+            try:
+                mark_trained(reg_path, params_hash, model_output_dir=config.output_dir)
+            except Exception as e:
+                print(f"[registry] Failed to mark trained at {reg_path}: {e}")
 
     if getattr(config, "ddp_offline", False):
         distributed_barrier()

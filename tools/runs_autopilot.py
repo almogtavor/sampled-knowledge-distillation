@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple SLURM orchestration loop driven by results/runs.json.
+"""Simple SLURM orchestration loop driven by results/runs_test.json.
 
 This utility keeps a small number of distillation runs active by:
 - Inspecting the registry for runs that still need training or evaluation.
@@ -48,7 +48,7 @@ from pydantic import ValidationError
 from sampledkd.config import TrainingConfig
 from sampledkd.run_registry import compute_params_hash
 
-DEFAULT_REGISTRY = Path("results/runs.json")
+DEFAULT_REGISTRY = Path("results/runs_test.json")
 DEFAULT_STATE = Path("results/automation_state.json")
 DEFAULT_TRAIN_SLURM = Path("train.slurm")
 DEFAULT_EVAL_SLURM = Path("evals.slurm")
@@ -1351,7 +1351,7 @@ class SchedulerContext:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Automation loop for KD runs registry")
-    parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY, help="Path to runs.json registry")
+    parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY, help="Path to runs_test.json registry")
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE, help="Path to persist small scheduling state")
     parser.add_argument("--train-script", type=Path, default=DEFAULT_TRAIN_SLURM, help="Path to train.slurm (or wrapper)")
     parser.add_argument("--eval-script", type=Path, default=DEFAULT_EVAL_SLURM, help="Path to evals.slurm script")
