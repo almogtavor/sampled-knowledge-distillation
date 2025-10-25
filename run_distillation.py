@@ -73,7 +73,7 @@ def parse_args_to_config() -> TrainingConfig:
         "--atkd_easy_weight",
         type=float,
         default=0.2,
-        help="For AT-KD: λ in L_all = λ*L_easy + (1-λ)*L_hard (paper default 0.2).",
+        help="For AT-KD: λ in L_all = λ*L_easy + (1-λ)*L_hard, λ weight on easy-token KL when combining easy and hard losses (paper default 0.2).",
     )
     parser.add_argument(
         "--normalize_topk_by_length",
