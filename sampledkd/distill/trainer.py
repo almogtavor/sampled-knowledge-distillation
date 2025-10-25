@@ -1296,17 +1296,17 @@ class Distiller(
                 device_t = t_log_probs.device
                 b_idx_t = b_idx.to(device_t)
                 t_idx_t = t_idx.to(device_t)
-                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
-                s_rows = s_log_probs[b_idx, t_idx, :]
+                if t_pred is None:
+                    raise RuntimeError("AT-KD requires teacher logits for T=1 probability computation.")
+                t_rows_logits = t_pred[b_idx_t, t_idx_t, :].to(self.student_device)
+                s_rows_logits = s_pred[b_idx, t_idx, :].to(self.student_device)
 
-                P_total = t_rows.size(0)
-                t_rows = t_rows.float()
-                s_rows = s_rows.float()
+                P_total = t_rows_logits.size(0)
+                t_rows_T1 = torch.log_softmax(t_rows_logits.float(), dim=-1)
+                s_rows_T1 = torch.log_softmax(s_rows_logits.float(), dim=-1)
 
-                teacher_probs = torch.exp(t_rows)
-                student_probs = torch.exp(s_rows)
-                teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-                student_probs = student_probs / student_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                teacher_probs = torch.exp(t_rows_T1)
+                student_probs = torch.exp(s_rows_T1)
 
                 row_indices = torch.arange(P_total, device=self.student_device)
                 top_idx = torch.argmax(teacher_probs, dim=-1)
