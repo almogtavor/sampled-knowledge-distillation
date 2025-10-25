@@ -60,8 +60,21 @@ def parse_args_to_config() -> TrainingConfig:
         "bucket",
         "pos-rs-kd",
         "linucb",
+        "atkd",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
+    parser.add_argument(
+        "--atkd_hard_percent",
+        type=float,
+        default=50.0,
+        help="For AT-KD: percentage of tokens (by highest teacher uncertainty) treated as hard tokens per batch (default 50%).",
+    )
+    parser.add_argument(
+        "--atkd_easy_weight",
+        type=float,
+        default=0.2,
+        help="For AT-KD: λ in L_all = λ*L_easy + (1-λ)*L_hard, λ weight on easy-token KL when combining easy and hard losses (paper default 0.2).",
+    )
     parser.add_argument(
         "--normalize_topk_by_length",
         action="store_true",
@@ -169,6 +182,12 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Disable offline caching mode (use online teacher forward pass).")
     parser.add_argument("--offline_cache_dir", type=str, default=None,
                         help="Where to store/read the offline teacher cache (defaults under output_dir).")
+    parser.add_argument(
+        "--offline_cache_mode",
+        choices=["entropy_approx", "entropy", "unc"],
+        default="entropy",
+        help="Offline cache mode: entropy_approx (truncated), entropy (exact), or unc (store target probabilities).",
+    )
     parser.add_argument("--entropy_approx_m", type=int, default=12,
                         help="Top-k for truncated-entropy approximation, m=12 by default.")
     parser.add_argument("--rs_vocab_samples", type=int, default=12,
@@ -304,6 +323,9 @@ def main():
         seen_paths.add(key)
         registry_paths_to_update.append(resolved)
 
+    display_name_raw = os.getenv("RUN_DISPLAY_NAME")
+    display_name = display_name_raw.strip() if display_name_raw else None
+
     try:
         params_dict = config.model_dump()
     except Exception:
@@ -340,6 +362,7 @@ def main():
                 job_id=job_id,
                 model_output_dir=config.output_dir,
                 launch_args=cli_args,
+                display_name=display_name,
             )
     else:
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
@@ -357,10 +380,13 @@ def main():
             params_out = Path(config.output_dir) / "run_params.json"
             with open(params_out, "w", encoding="utf-8") as f:
                 import json as _json
-                _json.dump({
+                payload = {
                     "id": params_hash,
                     "params": normalize_params(params_dict),
-                }, f, indent=2, ensure_ascii=False)
+                }
+                if display_name:
+                    payload["display_name"] = display_name
+                _json.dump(payload, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"[registry] Warning: failed to write run_params.json: {e}")
 

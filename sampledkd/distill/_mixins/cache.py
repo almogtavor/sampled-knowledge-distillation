@@ -17,6 +17,15 @@ class CacheMixin:
             items.append(self.cache.read_item(key))
         return items
 
+    def _cache_mode(self) -> Optional[str]:
+        if not self.cache:
+            return None
+        sig = self.cache.manifest.get("signature", {})
+        mode = sig.get("cache_mode")
+        if mode is None:
+            return "entropy_approx"
+        return str(mode)
+
     def compute_cache_signature(self) -> Dict[str, Any]:
         """Compute a stable signature for the logits cache based on teacher/tokenizer/settings/dataset."""
         override = getattr(self.config, "_expected_cache_signature", None)
@@ -35,5 +44,6 @@ class CacheMixin:
             "entropy_approx_temperature": float(
                 getattr(self.config, "entropy_approx_temperature", getattr(self.config, "cache_temperature", 1.0))
             ),
+            "cache_mode": getattr(self.config, "offline_cache_mode", "entropy"),
             "dataset_len": int(len(self.dataloader.dataset)) if hasattr(self.dataloader, "dataset") else -1,
         }

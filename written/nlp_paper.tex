@@ -124,6 +124,16 @@ Concretely, we present two variants:
 \end{itemize}
 
 Empirically, we compare against a range of baselines: (a) no KD, (b) full online KD on all tokens with KL divergence, (c) random token selection baselines, (d) token-selective KD, and (e) SampledKD.
+
+AT-KD baseline. We also include Adaptive Teaching KD (AT-KD; \citealt{zhong2024atkd}) as a strong routing baseline.
+Per mini-batch, AT-KD ranks tokens by the teacher's uncertainty coefficient \(\mathrm{UnC}=p_{t\setminus g}=1-p_{tg}\) and splits them into easy \(\mathcal{D}_e\) and hard \(\mathcal{D}_h\).
+With binary top-vs-rest probabilities \(p_b=[p_{tg},p_{t\setminus g}]\) and non-target distribution \(\hat p\), the objective is
+\(\;\;\mathcal{L}^{e}_{\mathrm{KL}}=\sum_{t\in\mathcal{D}_e}\!\mathrm{KL}(\hat p^t\|\hat q^t),\;\;
+\mathcal{L}^{h}_{\mathrm{KL}}=\sum_{t\in\mathcal{D}_h}\!\big[\mathrm{KL}(p^t_b\|q^t_b)+\mathrm{KL}(\hat p^t\|\hat q^t)\big],\;\;
+\mathcal{L}^{\mathrm{all}}_{\mathrm{KL}}=\lambda\,\mathcal{L}^{e}_{\mathrm{KL}}+(1-\lambda)\,\mathcal{L}^{h}_{\mathrm{KL}}\) with \(\lambda{=}0.2\).
+We report two variants: (i) online-teacher AT-KD (no cache) and (ii) cached AT-KD that reuses our RS-KD over classes while keeping AT-KD's token routing.
+
+Relation to our setup. Our entropy \(H(p_t)\) and AT-KD's \(\mathrm{UnC}=1-p_{tg}\) both quantify token-level uncertainty (they are often monotone when the distribution is peaked), while AT-KD's DKD term (\(\mathrm{KL}(\hat p\|\hat q)\)) corresponds to the "dark knowledge" over non-target classes that we also model; the target/binary term (TKD) aligns with our standard CE/target supervision.
 Our main experiments apply token selection by teacher entropy---testing top $k\%$ thresholds across a broad sweep ($k \in \{1,2,5,10,20,\ldots,90,100\}$), as well as bucketed ranges (e.g.\ 5--15\%).
 We also evaluate Top-$m$+Tail entropy approximations to reduce the computational cost of full softmax when scoring, and use the Gumbel-Max trick to sample directly from cached logits, eliminating the need to compute softmax normalization during teacher forwards.
 Beyond entropy, we score tokens by alternative signals (student CE, teacher--student KL, mixtures thereof) and test curriculum schedules.
@@ -430,6 +440,8 @@ In a control experiment with boundary masking vs. none, results were indistingui
 		Token-selective KD (entropy top-20\%, norm)& ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Token-selective KD (score (equal) top-20\%)& 66.2    & 46.8                  & 36.5                      & 67.6                 & 33.7                        & 41.4                    & 51.0          \\
 		Token-selective KD (LinUCB)			       & 67.1    & 40.6                  & 38.2                      & 68.2                 & 47.8                        & 14.6                    & 55.3          \\
+		AT-KD (online teacher, full tokens)      & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		AT-KD (offline cache, RS-KD coupling)     & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		\midrule
 		RS-KD (distill all tokens)	               & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Sampled KD (entropy top-15\%)              & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
@@ -458,6 +470,8 @@ In a control experiment with boundary masking vs. none, results were indistingui
 		Token-selective KD (random 25\%)           & ----    & 31.6                  & 34.5                      & 65.3                 & 40.6                        & 69.4                    & 46.8          \\
 		Token-selective KD (pos-rs-kd 25\%)        & ----    & 32.5                  & 34.4                      & 65.5                 & 41.6                        & 69.0                    & 47.1          \\
 		Token-selective KD (entropy top-25\%, GLS) & ----    & 37.9                  & 36.9                      & 67.1                 & \textbf{43.0}               & \textbf{21.8}           & \textbf{49.0} \\
+		AT-KD (online teacher, full tokens)      & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
+		AT-KD (offline cache, RS-KD coupling)     & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Token-selective KD (entropy top-25\%, norm)& ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Token-selective KD (score top-25\%)        & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\
 		Token-selective KD (LinUCB)			       & ----    & ----                  & ----                      & ----                 & ----                        & ----                    & ----          \\

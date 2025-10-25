@@ -477,32 +477,53 @@ def _build_cache_pass(
 
                 # Decide format from signature; always store Ĥ
                 sig = cache.manifest.get('signature', {})
-                use_u8 = bool(sig.get('H_hat_u8', True))
-
-                # Preallocate and compute per-position truncated entropy only for valid positions
-                H_arr = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
-                for pos_t in pos_idx:
-                    pos = int(pos_t.item())
-                    H_val = truncated_entropy_topk_tail_midpoint(pred_i[pos], k=k_approx)
-                    H_arr[pos] = H_val
-                if use_u8:
-                    # Quantize to uint8 using cap = ln(V) (natural units), monotonic for selection tasks
-                    H_cap = max(1e-6, math.log(max(2, V)))
-                    H_norm = (H_arr.clamp(min=0.0, max=H_cap) / H_cap) * 255.0
-                    H_stored = torch.round(H_norm).to(torch.uint8).cpu()  # [L-1]
+                cache_mode = sig.get("cache_mode", "entropy")
+                pos_idx_device = pos_idx.to(pred_i.device)
+                rows_logits = (
+                    pred_i.index_select(0, pos_idx_device) if pos_idx.numel() > 0 else pred_i.new_empty((0, pred_i.size(-1)))
+                )
+                item_payload: Dict[str, Any] = {}
+                if cache_mode == "entropy_approx":
+                    use_u8 = bool(sig.get('H_hat_u8', True))
+                    H_arr = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
+                    for pos_t in pos_idx:
+                        pos = int(pos_t.item())
+                        H_val = truncated_entropy_topk_tail_midpoint(pred_i[pos], k=k_approx)
+                        H_arr[pos] = H_val
+                    if use_u8:
+                        H_cap = max(1e-6, math.log(max(2, V)))
+                        H_norm = (H_arr.clamp(min=0.0, max=H_cap) / H_cap) * 255.0
+                        item_payload["H_hat_u8"] = torch.round(H_norm).to(torch.uint8).cpu()
+                    else:
+                        item_payload["H_hat"] = H_arr.to(torch.float16).cpu()
+                elif cache_mode == "entropy":
+                    entropy_full = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
+                    if rows_logits.numel() > 0:
+                        log_probs_rows = torch.log_softmax(rows_logits.float(), dim=-1)
+                        ent_vals = -(log_probs_rows.exp() * log_probs_rows).sum(dim=-1)
+                        entropy_full[pos_idx_device] = ent_vals.to(entropy_full.dtype)
+                    item_payload["entropy_fp16"] = entropy_full.to(torch.float16).cpu()
+                elif cache_mode == "unc":
+                    target_prob_full = torch.zeros(valid_i.numel(), device=pred_i.device, dtype=torch.float32)
+                    if rows_logits.numel() > 0:
+                        log_probs_rows = torch.log_softmax(rows_logits.float(), dim=-1)
+                        targets_full = input_ids[i, 1:].to(pred_i.device, non_blocking=True)
+                        targets = targets_full[pos_idx_device]
+                        target_prob_vals = torch.exp(log_probs_rows.gather(1, targets.view(-1, 1)).squeeze(1))
+                        target_prob_full[pos_idx_device] = target_prob_vals.to(target_prob_full.dtype)
+                    item_payload["target_prob_fp16"] = target_prob_full.to(torch.float16).cpu()
                 else:
-                    H_stored = H_arr.to(torch.float16).cpu()
+                    raise ValueError(f"Unsupported cache_mode '{cache_mode}' for offline cache build.")
+
                 # Build fixed-U packed rows with Gumbel sampling (batched over valid rows)
                 tau_target = float(sig.get('kd_temperature', 1.0))
-                U_max = int(sig.get('rs_vocab_samples', 12))  # number of unique tokens to store per position for the subsequent sampling
+                U_max = int(sig.get('rs_vocab_samples', 12))
                 N_samples = int(sig.get('rs_samples', S_SAMPLES_DEFAULT))
 
-                if pos_idx.numel() > 0:
-                    # rows_logits: [P, V] gathered in one shot
-                    rows_logits = pred_i.index_select(0, pos_idx.to(pred_i.device))
+                if rows_logits.numel() > 0:
                     samples = sample_with_replacement_from_logits(rows_logits, N=N_samples, tau=tau_target)
                     ids_list, cnts_list = topU_unique_counts_per_row(samples, U=U_max)
-                    packed_rows = build_fixedU_packed_rows(ids_list, cnts_list, U=U_max, N=N_samples, V=V)  # [P*U*3]
+                    packed_rows = build_fixedU_packed_rows(ids_list, cnts_list, U=U_max, N=N_samples, V=V)
                 else:
                     packed_rows = torch.empty(0, dtype=torch.uint8)
 
@@ -517,7 +538,7 @@ def _build_cache_pass(
                     "key": key,
                     "valid_mask": valid_i.cpu(),
                     "topk_m": k_approx,
-                    ("H_hat_u8" if use_u8 else "H_hat"): H_stored,
+                    "cache_mode": cache_mode,
                     "rs": {
                         "U": int(U_max),
                         "N": int(N_samples),
@@ -527,6 +548,7 @@ def _build_cache_pass(
                         "packed": rs_packed,
                     },
                 }
+                item.update(item_payload)
                 cache.write_item(key, item)
                 maybe_cache += 1
                 # periodic progress print every 100 items
@@ -664,7 +686,12 @@ def plan_offline_cache(
         "dataset_len": expected_items,
         "H_hat_u8": bool(getattr(config, "H_hat_u8", True)),
         "packing_enabled": bool(getattr(config, "enable_packing", True)),
+        "cache_mode": getattr(config, "offline_cache_mode", "entropy"),
     }
+
+    cache_mode = signature["cache_mode"]
+    if cache_mode == "unc" and getattr(config, "distill_type", "") != "atkd":
+        raise ValueError("offline_cache_mode='unc' is currently only supported with distill_type='atkd'.")
 
     cache = init_offline_cache_for_trainer(
         getattr(config, "offline_cache_dir", None),
