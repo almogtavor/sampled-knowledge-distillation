@@ -182,6 +182,12 @@ def parse_args_to_config() -> TrainingConfig:
                         help="Disable offline caching mode (use online teacher forward pass).")
     parser.add_argument("--offline_cache_dir", type=str, default=None,
                         help="Where to store/read the offline teacher cache (defaults under output_dir).")
+    parser.add_argument(
+        "--offline_cache_mode",
+        choices=["entropy_approx", "entropy", "unc"],
+        default="entropy",
+        help="Offline cache mode: entropy_approx (truncated), entropy (exact), or unc (store target probabilities).",
+    )
     parser.add_argument("--entropy_approx_m", type=int, default=12,
                         help="Top-k for truncated-entropy approximation, m=12 by default.")
     parser.add_argument("--rs_vocab_samples", type=int, default=12,

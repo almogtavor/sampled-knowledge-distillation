@@ -101,6 +101,10 @@ class TrainingConfig(BaseModel):
     # Offline cache (teacher precomputation for entropy approx + RS-KD over vocab)
     offline_cache: bool = True
     offline_cache_dir: Optional[str] = None  # if None, defaults to f"{output_dir}/teacher_offline_cache"
+    offline_cache_mode: Literal["entropy_approx", "entropy", "unc"] = Field(
+        default="entropy",
+        description="Offline cache mode: entropy_approx (truncated entropy), entropy (exact), or unc (store target probabilities).",
+    )
     # Params used by the offline cache builder
     entropy_approx_m: int = Field(default=20, description="Top-m used in truncated entropy approximation")
     rs_vocab_samples: int = Field(default=64, description="Number of vocab samples per position for RS-KD")

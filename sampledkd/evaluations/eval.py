@@ -498,14 +498,14 @@ def detect_fsdp_layer_cls(model_identifier: Union[str, Path]) -> Optional[str]:
 # we fall back to the harness default (typically first-N) and print a warning.
 LIGHT_LMEVAL_TASKS: List[Tuple[str, Optional[int]]] = [
     # accuracy (percentage of correct answers)
+    ("arc_easy", None),
+    ("gsm8k", None),
     ("hellaswag", None),
     ("piqa", None),
-    ("gsm8k", None),
     # ("svamp", 250),
     ("lambada_openai", None), 
     # normalized accuracy - multiple-choice datasets.raw accuracy can mislead so normalization accounts for imbalanced choices
     # ("arc_challenge", None),
-    ("arc_easy", None),
     # exact-match
     # ("aime25", None),
     # ("ifeval", None)

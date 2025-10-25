@@ -26,6 +26,7 @@ from ._mixins.gls import GLSMixin
 from ._mixins.kd_core import KDCoreMixin
 from ._mixins.selection_scoring import SelectionScoringMixin
 from ._mixins.rs_vocab import kl_from_vocab_samples
+from .atkd import ATKDCacheBundle, compute_atkd_loss
 from .ce_estimators import ce_is_estimator
 from .kd_temperature_schedule import KDTemperatureSchedule
 from .oom_setup_helper import OOMSetupHelper
@@ -182,6 +183,12 @@ class Distiller(
 
         # Decide path: cached RS-KD with softmax elimination vs. fallback
         cached_items = self._lookup_cache_batch(input_ids) if bool(getattr(self.config, "offline_cache", False)) else None
+        cache_mode = self._cache_mode() or "entropy"
+        cached_target_probs: Optional[torch.Tensor] = None
+        ids_U: Optional[torch.Tensor] = None
+        probs_U: Optional[torch.Tensor] = None
+        rs_batch_idx: Optional[torch.Tensor] = None
+        rs_pos_idx: Optional[torch.Tensor] = None
         if not self.teacher_available:
             if not bool(getattr(self.config, "offline_cache", False)):
                 raise RuntimeError("Teacher-less training requires offline_cache=True.")
@@ -243,20 +250,35 @@ class Distiller(
         # then replace vocab-sum with RS-KD estimator when enabled.
         extra_metrics: Optional[Dict[str, float]] = None
         if not use_vocab_rs_kd:
-            if s_log_probs is None: # compute softmax if cache not rs-kd
-                s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
-            kd_loss, kd_extra = self._compute_kd_loss(
-                t_pred,
-                t_log_probs,
-                s_pred,
-                s_log_probs,
-                valid_next,
-                input_ids,
-                attn_mask,
-                T,
-            )
-            if kd_extra:
-                extra_metrics = kd_extra
+            ce_loss_override = None
+            if distill_type == "atkd":
+                cache_bundle = ATKDCacheBundle(cache_mode="none")
+                kd_loss, atkd_metrics = compute_atkd_loss(
+                    config=self.config,
+                    student_device=self.student_device,
+                    input_ids_s=input_ids_s,
+                    valid_next=valid_next,
+                    student_logits=s_pred,
+                    teacher_logits=t_pred,
+                    cache_bundle=cache_bundle,
+                )
+                if self.logger and atkd_metrics:
+                    self.logger.log(atkd_metrics, self.global_step)
+            else:
+                if s_log_probs is None:  # compute softmax if cache not rs-kd
+                    s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
+                kd_loss, kd_extra = self._compute_kd_loss(
+                    t_pred,
+                    t_log_probs,
+                    s_pred,
+                    s_log_probs,
+                    valid_next,
+                    input_ids,
+                    attn_mask,
+                    T,
+                )
+                if kd_extra:
+                    extra_metrics = kd_extra
         else:
             # Replace vocab-sum with RS-KD estimator. Two paths:
             # 1) cached_items available: decode precomputed per-position samples (keep existing per-position loop)
@@ -296,6 +318,18 @@ class Distiller(
                         packed_by_b.append(torch.as_tensor(rs["packed"], device=self.student_device, dtype=torch.uint8))
                         U_by_b.append(int(rs["U"]))
                         sen_by_b.append(int(rs["sentinel_id"]))
+
+                    if cache_mode == "unc":
+                        target_prob_tensors = []
+                        for b in range(B):
+                            entry = cached_items[b].get("target_prob_fp16")
+                            if entry is None:
+                                raise RuntimeError("Cache item missing target_prob_fp16 in UNC mode.")
+                            target_prob_tensors.append(
+                                torch.as_tensor(entry, dtype=torch.float16).to(self.student_device).float()
+                            )
+                        if target_prob_tensors:
+                            cached_target_probs = torch.stack(target_prob_tensors, dim=0)
 
                     # Pad to U_max to allow a single dense gather
                     U_max = max(U_by_b) if len(U_by_b) > 0 else 0
@@ -356,7 +390,35 @@ class Distiller(
                     kd_pos_proxy[batch_idx, pos_idx] = kd_pos_proxy_rows.float()
                     ce_pos_proxy[batch_idx, pos_idx] = ce_pos_proxy_rows.float()
 
-                    if not do_elim:
+                    rs_batch_idx = batch_idx
+                    rs_pos_idx = pos_idx
+
+                    if distill_type == "atkd":
+                        if t_pred is None and cache_mode != "unc":
+                            raise RuntimeError(
+                                "AT-KD with offline cache requires offline_cache_mode='unc' or a live teacher."
+                            )
+                        cache_bundle = ATKDCacheBundle(
+                            cache_mode=cache_mode,
+                            target_probs=cached_target_probs,
+                            rs_ids=ids_U,
+                            rs_probs=probs_U,
+                            rs_batch_idx=batch_idx,
+                            rs_pos_idx=pos_idx,
+                        )
+                        kd_loss, atkd_metrics = compute_atkd_loss(
+                            config=self.config,
+                            student_device=self.student_device,
+                            input_ids_s=input_ids_s,
+                            valid_next=valid_next,
+                            student_logits=s_pred,
+                            teacher_logits=t_pred,
+                            cache_bundle=cache_bundle,
+                        )
+                        ce_loss_override = None
+                        if self.logger and atkd_metrics:
+                            self.logger.log(atkd_metrics, self.global_step)
+                    elif not do_elim:
                         if s_log_probs is None:
                             s_log_probs = torch.log_softmax((s_pred.float() / T), dim=-1)
                         s_rows_logp = s_log_probs[batch_idx, pos_idx]          # [P_total, V]
@@ -960,6 +1022,9 @@ class Distiller(
             Tuple containing the KD loss tensor and optional auxiliary info (for LinUCB).
         """
         extra: Optional[Dict[str, Any]] = None
+
+        if self.config.distill_type == "atkd":
+            raise RuntimeError("AT-KD loss should be computed via compute_atkd_loss.")
 
         if self.config.distill_type == "vanilla":
             kl_pos = self._kl_loss(t_log_probs.to(self.student_device), s_log_probs)
