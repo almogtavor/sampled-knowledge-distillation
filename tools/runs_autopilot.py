@@ -94,6 +94,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "RS-KD (distill all tokens)",
     },
     {
         "distill_type": "top-k-tok",
@@ -104,6 +105,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "ALPHA_CE": "0.3",
             "NO_OFFLINE": "1",
         },
+        "display_name": "RS-KD (distill all tokens, offline disabled)",
     },
     # RS-KD with higher CE weight
     # {
@@ -124,6 +126,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.0",
         },
+        "display_name": "RS-KD (top-20%, CE=0.0)",
     },
     {
         "distill_type": "top-k-tok",
@@ -133,6 +136,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "1.0",
         },
+        "display_name": "RS-KD (top-20%, CE=1.0)",
     },
     # RS-KD only CE
     {
@@ -144,6 +148,18 @@ CUSTOM_TRAIN_SEQUENCE = [
             "ALPHA_CE": "0.0",
             "NO_OFFLINE": "1",
         },
+        "display_name": "RS-KD (all tokens, CE=0.0, offline disabled)",
+    },
+    {
+        "distill_type": "top-k-tok",
+        "k_percent": 100,
+        "env": {
+            "NO_ELIMINATE_SOFTMAX": "1",
+            "FINEWEB_TOKENS": "5000000",
+            "ALPHA_CE": "0.0001",
+            "NO_OFFLINE": "1",
+        },
+        "display_name": "RS-KD (all tokens, CE=0.0001, offline disabled)",
     },
     {
         "distill_type": "top-k-tok",
@@ -154,6 +170,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "ALPHA_CE": "0.1",
             "NO_OFFLINE": "1",
         },
+        "display_name": "Full KD (all tokens, full softmax, CE=0.1)",
     },
     {
         "distill_type": "top-k-tok",
@@ -163,6 +180,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "1.0",
         },
+        "display_name": "RS-KD (all tokens, CE=1.0)",
     },
     # Without offline cache (TSKD):
     # RS-KD (distill all tokens)
@@ -175,6 +193,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (distill all tokens, CE=0.3)",
     },
 
     # TSKD (entropy top-15%)
@@ -187,6 +206,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-15%)",
     },
 
     # TSKD (entropy top-20%)
@@ -199,6 +219,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-20%, CE=0.3)",
     },
 
     # TSKD (entropy top-25%)
@@ -211,6 +232,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-25%)",
     },
 
     # TSKD (entropy top-30%)
@@ -223,6 +245,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-30%)",
     },
 
     # TSKD (entropy top-75%)
@@ -235,6 +258,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-75%)",
     },
 
     # TSKD (bucket of 5%-20%)
@@ -249,6 +273,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (bucket of 5%-20%)",
     },
 
     # TSKD (random 20%)
@@ -262,6 +287,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (random 20%)",
     },
 
     # TSKD (pos-rs-kd top-20%)
@@ -274,6 +300,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (pos-rs-kd 20%, CE=0.3)",
     },
 
     # TSKD (top-20%, GLS queue 50k, offline cache disabled)
@@ -288,6 +315,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "GLS_QUEUE_SIZE": "50000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-20%, GLS 50K, offline disabled)",
     },
 
     # TSKD (top-k-tok top-20%, GLS queue 50k, offline cache enabled)
@@ -301,6 +329,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "GLS_QUEUE_SIZE": "50000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-20%, GLS 50K)",
     },
 
     # TSKD (entropy top-20%, GLS)
@@ -314,6 +343,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_OFFLINE": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Token-selective KD (entropy top-20%, GLS)",
     },
 
     # TSKD (score top-20%)
@@ -331,6 +361,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "SCORE_KL_WEIGHT": "1.0",
             "NO_OFFLINE": "1",
         },
+        "display_name": "Token-selective KD (score (equal) top-20%)",
     },
 
     # TSKD (LinUCB)
@@ -342,6 +373,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "NO_OFFLINE": "1",
         },
+        "display_name": "Token-selective KD (LinUCB)",
     },
 
     
@@ -365,6 +397,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-15%)",
     },
 
     # Sampled KD (entropy top-20%)
@@ -376,6 +409,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-20%)",
     },
 
     # Sampled KD (entropy top-25%)
@@ -387,6 +421,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-25%)",
     },
 
     # Sampled KD (entropy top-30%)
@@ -398,6 +433,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-30%)",
     },
 
     # Sampled KD (entropy top-75%)
@@ -409,6 +445,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-75%)",
     },
 
     # Sampled KD (bucket of 5%-20%)
@@ -422,6 +459,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "BUCKET_UPPER_PERCENT": "20",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (bucket of 5%-20%)",
     },
 
     # Sampled KD (random 20%)
@@ -434,6 +472,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "RANDOM_TOKEN_SELECTION": "1",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (random 20%)",
     },
 
     # Sampled KD (pos-rs-kd top-20%)
@@ -445,6 +484,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (pos-rs-kd 20%)",
     },
 
     # Sampled KD (entropy top-20%, GLS)
@@ -457,6 +497,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "FINEWEB_TOKENS": "5000000",
             "ALPHA_CE": "0.3",
         },
+        "display_name": "Sampled KD (entropy top-20%, GLS)",
     },
 
     # Sampled KD (score top-20%)
@@ -473,6 +514,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "SCORE_CE_WEIGHT": "1.0",
             "SCORE_KL_WEIGHT": "1.0",
         },
+        "display_name": "Sampled KD (score top-20%)",
     },
 
     # Sampled KD (LinUCB)
@@ -483,6 +525,7 @@ CUSTOM_TRAIN_SEQUENCE = [
             "NO_ELIMINATE_SOFTMAX": "1",
             "FINEWEB_TOKENS": "5000000",
         },
+        "display_name": "Sampled KD (LinUCB)",
     },
     # {
     #     "distill_type": "top-k-tok",
@@ -1069,6 +1112,9 @@ class SchedulerContext:
             self.state["train_sequence_idx"] = cursor + offset + 1
             env_raw = dict(item.get("env") or {})
             env = {key: str(value) for key, value in env_raw.items() if value is not None}
+            display_name = item.get("display_name")
+            if isinstance(display_name, str) and display_name.strip():
+                env.setdefault("RUN_DISPLAY_NAME", display_name.strip())
             resolved_distill = item_distill or distill_hint
             resolved_k = item_k if item_k is not None else k_hint
             log_distill = resolved_distill or "default"
@@ -1115,6 +1161,9 @@ class SchedulerContext:
                 sweep_tag = self.tag_with_run
 
             env = self.build_training_env(params)
+            entry_display_name = entry.get("display_name")
+            if isinstance(entry_display_name, str) and entry_display_name.strip():
+                env.setdefault("RUN_DISPLAY_NAME", entry_display_name.strip())
             template_env, template_distill, template_k, matched_template = self.consume_sequence_env(
                 distill_type_param,
                 k_param,
@@ -1168,6 +1217,7 @@ class SchedulerContext:
             base_params = self.registry[0].get("params", {})
 
         base_env = self.build_training_env(base_params)
+        base_env.pop("RUN_DISPLAY_NAME", None)
         default_distill = base_params.get("distill_type", "top-k-tok") if base_params else "top-k-tok"
         default_k = self._coerce_int(base_params.get("k_percent")) if base_params else None
 
@@ -1316,6 +1366,9 @@ class SchedulerContext:
                 "AUTOPILOT_RUN_SERIAL": str(self.run_serial),
                 "AUTOPILOT_RUN_LABEL": self.run_label,
             }
+            display_name = entry.get("display_name")
+            if isinstance(display_name, str) and display_name.strip():
+                env["RUN_DISPLAY_NAME"] = display_name.strip()
             job_name = f"{EVAL_JOB_PREFIX}{self.run_label}-{run_id[:8]}"
             if self.dry_run:
                 print(f"[dry-run] Would submit eval job for {run_id} -> {job_name}")

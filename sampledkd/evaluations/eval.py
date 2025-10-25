@@ -1441,6 +1441,31 @@ def save_json(obj: dict, path: Path) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
     print(f"[json] Wrote {path}")
 
+DISPLAY_NAME_ENV_VARS = (
+    "RUN_DISPLAY_NAME",
+    "EVAL_DISPLAY_NAME",
+    "DISPLAY_NAME",
+    "METHOD_NAME",
+)
+
+LIGHT_TASK_HEADERS = {
+    "arc_easy": "Arc-E",
+    "gsm8k": "GSM8K (%)",
+    "hellaswag": "HellaSwag (%)",
+    "piqa": "PIQA (%)",
+    "lambada_openai_acc": "LAMBADA OAI acc. (%)",
+    "lambada_openai_ppl": "LAMBADA OAI perplexity",
+    "avg": "avg.",
+}
+
+PERPLEXITY_KEYS = (
+    "perplexity,none",
+    "perplexity",
+    "word_perplexity,none",
+    "byte_perplexity,none",
+)
+
+
 def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     """Compute macro-averages across tasks for each numeric metric.
 
@@ -1484,6 +1509,79 @@ def compute_averages(merged: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     if primary_per_task:
         averages["avg_all"] = sum(primary_per_task) / len(primary_per_task)
     return averages
+
+
+def _extract_primary_metric(metrics: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(metrics, dict):
+        return None
+    for key in ("exact_match,none", "acc,none", "acc_norm,none", "accuracy", "acc"):
+        val = metrics.get(key)
+        if isinstance(val, (int, float)):
+            val_f = float(val)
+            if math.isfinite(val_f):
+                return val_f
+    return None
+
+
+def _extract_perplexity(metrics: Dict[str, Any]) -> Optional[float]:
+    if not isinstance(metrics, dict):
+        return None
+    for key in PERPLEXITY_KEYS:
+        val = metrics.get(key)
+        if isinstance(val, (int, float)):
+            val_f = float(val)
+            if math.isfinite(val_f):
+                return val_f
+    return None
+
+
+def _format_table_value(value: Optional[float]) -> str:
+    if value is None:
+        return "---"
+    if not math.isfinite(value):
+        return "---"
+    return f"{value:.1f}"
+
+
+def _ensure_table_header(path: Path, tasks: List[Tuple[str, Optional[int]]]) -> None:
+    needs_header = not path.exists() or path.stat().st_size == 0
+    if not needs_header:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = ["Method"]
+    for task_name, _ in tasks:
+        if task_name == "lambada_openai":
+            columns.append(LIGHT_TASK_HEADERS["lambada_openai_acc"])
+            columns.append(LIGHT_TASK_HEADERS["lambada_openai_ppl"])
+        else:
+            columns.append(LIGHT_TASK_HEADERS.get(task_name, task_name))
+    columns.append(LIGHT_TASK_HEADERS["avg"])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(" & ".join(columns) + " \\\\\n")
+
+
+def append_table_row(
+    path: Path,
+    method: str,
+    tasks: List[Tuple[str, Optional[int]]],
+    merged: Dict[str, Dict[str, float]],
+    averages: Dict[str, float],
+) -> None:
+    _ensure_table_header(path, tasks)
+    columns: List[str] = [method]
+    for task_name, _ in tasks:
+        task_metrics = merged.get(task_name, {})
+        if task_name == "lambada_openai":
+            acc_val = _extract_primary_metric(task_metrics)
+            ppl_val = _extract_perplexity(task_metrics)
+            columns.append(_format_table_value(acc_val))
+            columns.append(_format_table_value(ppl_val))
+        else:
+            val = _extract_primary_metric(task_metrics)
+            columns.append(_format_table_value(val))
+    columns.append(_format_table_value(averages.get("avg_all")))
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(" & ".join(columns) + " \\\\\n")
 
 # ---------- Main pipeline ----------
 def main():
@@ -1592,6 +1690,13 @@ def main():
     print("=" * 80)
     print()
 
+    resolved_display_name: Optional[str] = None
+    for env_key in DISPLAY_NAME_ENV_VARS:
+        candidate = os.getenv(env_key)
+        if candidate and candidate.strip():
+            resolved_display_name = candidate.strip()
+            break
+
     work_dir = Path(args.work_dir)
     exports_dir = work_dir / "exports"
     results_dir = work_dir / "results"
@@ -1689,6 +1794,7 @@ def main():
     }
 
     for tag, model_dir in model_specs:
+        model_display_name = resolved_display_name
         for phase in evaluation_phases:
             phase_name = phase["name"]
             phase_registry_path = Path(phase["registry_path"])
@@ -1788,6 +1894,7 @@ def main():
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             json_result_file = phase_json_dir / f"eval_{phase_name}_{args.suite}_{tag}_{ts}.json"
             averages = compute_averages(merged)
+            method_label = model_display_name or tag
 
             per_task_ece: Dict[str, float] = {}
             ece_values: List[float] = []
@@ -1801,7 +1908,7 @@ def main():
                     ece_val = float(metrics["ece"])
                     per_task_ece[task] = ece_val
                     ece_values.append(ece_val)
-                for ppl_key in ("perplexity,none", "perplexity", "word_perplexity,none", "byte_perplexity,none"):
+                for ppl_key in PERPLEXITY_KEYS:
                     if isinstance(metrics.get(ppl_key), (int, float)):
                         ppl_val = float(metrics[ppl_key])
                         per_task_perplexity[task] = ppl_val
@@ -1853,6 +1960,7 @@ def main():
                 "task_status": task_status,
                 "calibration": calibration,
                 "timings": timings,
+                "display_name": method_label,
             }
             save_json(payload, json_result_file)
 
@@ -1865,6 +1973,9 @@ def main():
                         params_candidate = json.load(f)
                     if isinstance(params_candidate, dict):
                         params_blob = params_candidate.get("params") or params_candidate
+                        name_candidate = params_candidate.get("display_name")
+                        if isinstance(name_candidate, str) and name_candidate.strip():
+                            model_display_name = name_candidate.strip()
                         if isinstance(params_candidate.get("id"), str):
                             params_hash = params_candidate["id"]
                             upsert_eval_results(
@@ -1876,6 +1987,7 @@ def main():
                                 task_status,
                                 model_path=model_path_str,
                                 calibration=calibration,
+                                display_name=model_display_name,
                             )
                             raise StopIteration
                 else:
@@ -1885,6 +1997,9 @@ def main():
                             rp_blob = json.load(open(rp))
                             if isinstance(rp_blob, dict):
                                 params_blob = rp_blob.get("params") or rp_blob
+                                name_candidate = rp_blob.get("display_name")
+                                if isinstance(name_candidate, str) and name_candidate.strip():
+                                    model_display_name = name_candidate.strip()
                                 if isinstance(rp_blob.get("id"), str):
                                     params_hash = rp_blob["id"]
                                     upsert_eval_results(
@@ -1896,6 +2011,7 @@ def main():
                                         task_status,
                                         model_path=model_path_str,
                                         calibration=calibration,
+                                        display_name=model_display_name,
                                     )
                                     raise StopIteration
                         except Exception:
@@ -1936,11 +2052,19 @@ def main():
                     task_status,
                     model_path=model_path_str,
                     calibration=calibration,
+                    display_name=model_display_name,
                 )
             except StopIteration:
                 pass
             except Exception as e:
                 print(f"[registry] Failed to upsert eval results at {phase_registry_path}: {e}")
+
+            if args.suite == "light":
+                table_path = phase_registry_path.with_name(f"table_{phase_name}.txt")
+                append_table_row(table_path, method_label, LIGHT_LMEVAL_TASKS, merged, averages)
+
+            if not resolved_display_name and model_display_name:
+                resolved_display_name = model_display_name
 
             try:
                 if not args.disable_wandb:

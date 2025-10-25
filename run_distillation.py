@@ -323,6 +323,9 @@ def main():
         seen_paths.add(key)
         registry_paths_to_update.append(resolved)
 
+    display_name_raw = os.getenv("RUN_DISPLAY_NAME")
+    display_name = display_name_raw.strip() if display_name_raw else None
+
     try:
         params_dict = config.model_dump()
     except Exception:
@@ -359,6 +362,7 @@ def main():
                 job_id=job_id,
                 model_output_dir=config.output_dir,
                 launch_args=cli_args,
+                display_name=display_name,
             )
     else:
         current_date = datetime.now().strftime("%Y%m%d_%H%M")
@@ -376,10 +380,13 @@ def main():
             params_out = Path(config.output_dir) / "run_params.json"
             with open(params_out, "w", encoding="utf-8") as f:
                 import json as _json
-                _json.dump({
+                payload = {
                     "id": params_hash,
                     "params": normalize_params(params_dict),
-                }, f, indent=2, ensure_ascii=False)
+                }
+                if display_name:
+                    payload["display_name"] = display_name
+                _json.dump(payload, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"[registry] Warning: failed to write run_params.json: {e}")
 

@@ -108,11 +108,16 @@ def get_entry(registry_path: Path, params_hash: str) -> Optional[Dict[str, Any]]
     return items[idx]
 
 
-def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
-                     experiment_name: Optional[str] = None,
-                     job_id: Optional[str] = None,
-                     model_output_dir: Optional[str] = None,
-                     launch_args: Optional[str] = None) -> Dict[str, Any]:
+def upsert_run_start(
+    registry_path: Path,
+    params: Dict[str, Any],
+    *,
+    experiment_name: Optional[str] = None,
+    job_id: Optional[str] = None,
+    model_output_dir: Optional[str] = None,
+    launch_args: Optional[str] = None,
+    display_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """Upsert a run entry at training start. Returns the entry dict.
 
     Schema:
@@ -165,6 +170,8 @@ def upsert_run_start(registry_path: Path, params: Dict[str, Any], *,
         items[idx].setdefault("evals", {})
         # Do not override status here; caller can change later
         entry = items[idx]
+    if display_name:
+        entry["display_name"] = display_name
     _save_registry(registry_path, items)
     return entry
 
@@ -192,6 +199,7 @@ def upsert_eval_results(
     task_status: Dict[str, str],
     model_path: Optional[str] = None,
     calibration: Optional[Dict[str, Any]] = None,
+    display_name: Optional[str] = None,
 ) -> None:
     items = _load_registry(registry_path)
     idx = find_entry(items, params_hash)
@@ -206,6 +214,8 @@ def upsert_eval_results(
             eval_entry["model_evaluated"] = model_path
         if calibration is not None:
             eval_entry["calibration"] = calibration
+        if display_name:
+            eval_entry["display_name"] = display_name
         items.append({
             "id": params_hash,
             "params": {},
@@ -214,6 +224,7 @@ def upsert_eval_results(
             "completed_eval": True,
             "runs": {},
             "evals": {suite: eval_entry},
+            **({"display_name": display_name} if display_name else {}),
         })
     else:
         eval_entry = {
@@ -225,10 +236,14 @@ def upsert_eval_results(
             eval_entry["model_evaluated"] = model_path
         if calibration is not None:
             eval_entry["calibration"] = calibration
+        if display_name:
+            eval_entry["display_name"] = display_name
         items[idx].setdefault("evals", {})[suite] = eval_entry
         items[idx]["status"] = "evaluated"
         items[idx].setdefault("completed_train", False)
         items[idx]["completed_eval"] = True
+        if display_name:
+            items[idx]["display_name"] = display_name
     _save_registry(registry_path, items)
 
 
