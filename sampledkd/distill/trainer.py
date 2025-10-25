@@ -1285,6 +1285,120 @@ class Distiller(
                 t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
                 s_rows = s_log_probs[b_idx, t_idx, :]
                 kd_loss = self._kl_loss(t_rows, s_rows).mean()
+        elif self.config.distill_type == "atkd":
+            if t_log_probs is None:
+                raise RuntimeError("AT-KD requires teacher log-probs; disable offline cache or ensure teacher is available.")
+            rows = valid_next.nonzero(as_tuple=False)
+            if rows.numel() == 0:
+                kd_loss = s_pred.sum() * 0.0
+            else:
+                b_idx, t_idx = rows[:, 0], rows[:, 1]
+                device_t = t_log_probs.device
+                b_idx_t = b_idx.to(device_t)
+                t_idx_t = t_idx.to(device_t)
+                t_rows = t_log_probs[b_idx_t, t_idx_t, :].to(self.student_device)
+                s_rows = s_log_probs[b_idx, t_idx, :]
+
+                P_total = t_rows.size(0)
+                t_rows = t_rows.float()
+                s_rows = s_rows.float()
+
+                teacher_probs = torch.exp(t_rows)
+                student_probs = torch.exp(s_rows)
+                teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                student_probs = student_probs / student_probs.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+
+                row_indices = torch.arange(P_total, device=self.student_device)
+                top_idx = torch.argmax(teacher_probs, dim=-1)
+                teacher_top = teacher_probs[row_indices, top_idx]
+                student_top = student_probs[row_indices, top_idx]
+                uncertainty = 1.0 - teacher_top
+
+                hard_pct = float(getattr(self.config, "atkd_hard_percent", getattr(self.config, "k_percent", 50)))
+                hard_pct = max(0.0, min(100.0, hard_pct))
+                if P_total == 0 or hard_pct <= 0.0:
+                    hard_count_req = 0
+                elif hard_pct >= 100.0:
+                    hard_count_req = P_total
+                else:
+                    hard_count_req = int(math.ceil((hard_pct / 100.0) * P_total))
+                    hard_count_req = max(1, min(P_total, hard_count_req))
+
+                hard_mask = torch.zeros(P_total, dtype=torch.bool, device=self.student_device)
+                if hard_count_req >= P_total:
+                    hard_mask[:] = True
+                elif hard_count_req > 0:
+                    _, hard_idx = torch.topk(uncertainty, hard_count_req, largest=True, sorted=False)
+                    hard_mask[hard_idx] = True
+                easy_mask = ~hard_mask
+                hard_count = int(hard_mask.sum().item())
+                easy_count = int(easy_mask.sum().item())
+
+                teacher_rest = (1.0 - teacher_top).clamp_min(0.0)
+                student_rest = (1.0 - student_top).clamp_min(0.0)
+                teacher_bin = torch.stack([teacher_top, teacher_rest], dim=-1)
+                student_bin = torch.stack([student_top, student_rest], dim=-1)
+                teacher_bin = teacher_bin / teacher_bin.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                student_bin = student_bin / student_bin.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+                log_teacher_bin = torch.log(teacher_bin.clamp_min(1e-9))
+                log_student_bin = torch.log(student_bin.clamp_min(1e-9))
+                kl_bin = F.kl_div(log_student_bin, log_teacher_bin, log_target=True, reduction="none").sum(-1).to(s_pred.dtype)
+
+                teacher_off = teacher_probs.clone()
+                teacher_off[row_indices, top_idx] = 0.0
+                student_off = student_probs.clone()
+                student_off[row_indices, top_idx] = 0.0
+                teacher_off_sum = teacher_off.sum(dim=-1)
+                student_off_sum = student_off.sum(dim=-1)
+
+                kl_off = torch.zeros(P_total, device=self.student_device, dtype=s_pred.dtype)
+                valid_off = teacher_off_sum > 1e-8
+                if valid_off.any():
+                    idx_valid = valid_off.nonzero(as_tuple=False).squeeze(-1)
+                    t_hat = teacher_off[idx_valid] / teacher_off_sum[idx_valid].unsqueeze(-1)
+                    s_hat = student_off[idx_valid] / student_off_sum[idx_valid].unsqueeze(-1).clamp_min(1e-8)
+                    log_t_hat = torch.log(t_hat.clamp_min(1e-9))
+                    log_s_hat = torch.log(s_hat.clamp_min(1e-9))
+                    kl_vals = F.kl_div(log_s_hat, log_t_hat, log_target=True, reduction="none").sum(-1).to(s_pred.dtype)
+                    kl_off[idx_valid] = kl_vals
+
+                lambda_easy = float(getattr(self.config, "atkd_easy_weight", 0.2))
+                lambda_easy = float(min(max(lambda_easy, 0.0), 1.0))
+
+                zero_like = s_pred.sum() * 0.0
+                easy_sum = zero_like
+                hard_sum = zero_like
+                easy_avg = None
+                hard_avg = None
+                if easy_count > 0:
+                    easy_values = kl_off[easy_mask]
+                    easy_sum = easy_values.sum()
+                    easy_avg = easy_values.mean()
+                if hard_count > 0:
+                    hard_values = kl_bin[hard_mask] + kl_off[hard_mask]
+                    hard_sum = hard_values.sum()
+                    hard_avg = hard_values.mean()
+
+                total_tokens = easy_count + hard_count
+                if total_tokens == 0:
+                    kd_loss = zero_like
+                else:
+                    kd_loss = (lambda_easy * easy_sum + (1.0 - lambda_easy) * hard_sum) / float(total_tokens)
+
+                if self.logger:
+                    metrics = {
+                        "train/atkd_easy_tokens": float(easy_count),
+                        "train/atkd_hard_tokens": float(hard_count),
+                        "train/atkd_lambda_easy": lambda_easy,
+                        "train/atkd_hard_percent": hard_pct,
+                    }
+                    if hard_count > 0:
+                        metrics["train/atkd_unc_threshold"] = float(uncertainty[hard_mask].min().item())
+                    if easy_avg is not None:
+                        metrics["train/atkd_easy_loss"] = float(easy_avg.item())
+                    if hard_avg is not None:
+                        metrics["train/atkd_hard_loss"] = float(hard_avg.item())
+                    self.logger.log(metrics, self.global_step)
         elif self.config.distill_type == "pos-rs-kd":
             # RS-KD over POSITIONS: sample K% positions by distribution q(i)
             # Select positions FIRST with importance weights, then compute KL only on selected rows

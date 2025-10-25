@@ -60,8 +60,21 @@ def parse_args_to_config() -> TrainingConfig:
         "bucket",
         "pos-rs-kd",
         "linucb",
+        "atkd",
     ], default="vanilla")
     parser.add_argument("--k_percent", type=int, default=20, help="for top-k-tok and random")
+    parser.add_argument(
+        "--atkd_hard_percent",
+        type=float,
+        default=50.0,
+        help="For AT-KD: percentage of tokens (by highest teacher uncertainty) treated as hard tokens per batch (default 50%).",
+    )
+    parser.add_argument(
+        "--atkd_easy_weight",
+        type=float,
+        default=0.2,
+        help="For AT-KD: λ weight on easy-token KL when combining easy and hard losses (paper default 0.2).",
+    )
     parser.add_argument(
         "--normalize_topk_by_length",
         action="store_true",

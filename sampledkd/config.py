@@ -11,8 +11,16 @@ class TrainingConfig(BaseModel):
     student_model: str
     teacher_quant_bits: Optional[int] = None  # 4 or 8 to enable bitsandbytes quant for teacher
     student_quant_bits: Optional[int] = None  # optional quant for student (usually None for training)
-    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb"] = "vanilla"
+    distill_type: Literal["vanilla", "top-k-tok", "random", "bucket", "pos-rs-kd", "linucb", "atkd"] = "vanilla"
     k_percent: int = Field(default=20, description="for top-k-tok and random")
+    atkd_hard_percent: float = Field(
+        default=50.0,
+        description="Percentage of tokens treated as hard (highest uncertainty) in AT-KD mode.",
+    )
+    atkd_easy_weight: float = Field(
+        default=0.2,
+        description="λ weight applied to easy-token KL in AT-KD (L_all = λL^e + (1-λ)L^h).",
+    )
     normalize_topk_by_length: bool = Field(
         default=False,
         description="When true, top-k selection uses a shared quota derived from the batch average length",
